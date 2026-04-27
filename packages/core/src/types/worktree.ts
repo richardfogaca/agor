@@ -586,6 +586,53 @@ export interface WorktreeEnvironmentInstance {
   last_error?: string;
 }
 
+export type EnvironmentReuseRecommendation = 'reuse' | 'recommend_fresh';
+
+export type WorktreeEnvironmentHealthStatus = 'healthy' | 'unhealthy' | 'unknown';
+
+export type EnvironmentSnapshotReasonCode =
+  | 'current_worktree_only'
+  | 'missing_rendered_snapshot'
+  | 'missing_runtime_instance'
+  | 'runtime_not_running'
+  | 'health_check_not_configured'
+  | 'health_unknown'
+  | 'health_unhealthy'
+  | 'eligible_for_reuse';
+
+export interface EnvironmentSnapshotFacts {
+  worktree_id: string;
+  environment_variant: string | null;
+  has_rendered_snapshot: boolean;
+  has_health_check_url: boolean;
+  runtime_status: WorktreeEnvironmentInstance['status'] | null;
+  health_status: WorktreeEnvironmentHealthStatus | null;
+  health_timestamp: string | null;
+  health_message: string | null;
+  app_url: string | null;
+  same_worktree: boolean;
+}
+
+export interface EnvironmentSnapshotResult {
+  worktree_id: string;
+  environment_variant: string | null;
+  environment_status: WorktreeEnvironmentInstance['status'] | null;
+  health_check: {
+    status: EnvironmentSnapshotFacts['health_status'];
+    timestamp: string | null;
+    message: string | null;
+  };
+  app_url: string | null;
+  provenance: {
+    same_worktree: boolean;
+    has_rendered_snapshot: boolean;
+    has_runtime_instance: boolean;
+  };
+  reason_codes: EnvironmentSnapshotReasonCode[];
+  recommendation: EnvironmentReuseRecommendation;
+  summary: string;
+}
+
 /**
  * Legacy (v1) repository environment configuration — single flat command set.
  *

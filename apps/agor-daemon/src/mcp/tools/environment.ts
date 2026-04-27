@@ -1,7 +1,7 @@
 import type { WorktreeID } from '@agor/core/types';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { WorktreesServiceImpl } from '../../declarations.js';
+import type { SessionsServiceImpl, WorktreesServiceImpl } from '../../declarations.js';
 import type { McpContext } from '../server.js';
 import { coerceString, textResult } from '../server.js';
 
@@ -106,7 +106,35 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
     }
   );
 
-  // Tool 4: agor_environment_logs
+  // Tool 4: agor_environment_snapshot
+  server.registerTool(
+    'agor_environment_snapshot',
+    {
+      description:
+        'Recommend whether the current worktree should reuse its existing environment or create a fresh one based on same-worktree provenance and live runtime health.',
+      annotations: { readOnlyHint: true, idempotentHint: true },
+      inputSchema: z.object({
+        worktreeId: z.string().describe('Worktree ID (UUIDv7 or short ID)'),
+      }),
+    },
+    async (args) => {
+      const worktreeId = coerceString(args.worktreeId)!;
+      const sessionsService = ctx.app.service('sessions') as unknown as SessionsServiceImpl;
+      const worktreesService = ctx.app.service('worktrees') as unknown as WorktreesServiceImpl;
+      const currentSession = await sessionsService.get(
+        ctx.sessionId,
+        ctx.baseServiceParams as Parameters<SessionsServiceImpl['get']>[1]
+      );
+      const result = await worktreesService.getEnvironmentSnapshotRecommendation(
+        worktreeId as WorktreeID,
+        { currentWorktreeId: currentSession.worktree_id ?? null },
+        ctx.baseServiceParams
+      );
+      return textResult(result);
+    }
+  );
+
+  // Tool 5: agor_environment_logs
   server.registerTool(
     'agor_environment_logs',
     {
@@ -127,7 +155,7 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
     }
   );
 
-  // Tool 5: agor_environment_open_app
+  // Tool 6: agor_environment_open_app
   server.registerTool(
     'agor_environment_open_app',
     {
@@ -158,7 +186,7 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
     }
   );
 
-  // Tool 6: agor_environment_nuke
+  // Tool 7: agor_environment_nuke
   server.registerTool(
     'agor_environment_nuke',
     {

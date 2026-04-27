@@ -10,6 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { evaluateEnvironmentSnapshotFacts } from '@agor/core';
 import { ENVIRONMENT, isWorktreeRbacEnabled, loadConfig, PAGINATION } from '@agor/core/config';
 import { type Database, WorktreeRepository, type WorktreeWithZoneAndSessions } from '@agor/core/db';
 import { renderWorktreeSnapshot } from '@agor/core/environment/render-snapshot';
@@ -17,6 +18,7 @@ import type { Application } from '@agor/core/feathers';
 import type {
   AuthenticatedParams,
   BoardID,
+  EnvironmentSnapshotResult,
   QueryParams,
   Repo,
   UserID,
@@ -1436,6 +1438,36 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
         params
       );
     }
+  }
+
+  async getEnvironmentSnapshotRecommendation(
+    id: WorktreeID,
+    options?: { currentWorktreeId?: WorktreeID | null },
+    params?: WorktreeParams
+  ): Promise<EnvironmentSnapshotResult> {
+    const worktree = await this.get(id, params);
+    const sameWorktree =
+      options?.currentWorktreeId === undefined ||
+      options.currentWorktreeId === worktree.worktree_id;
+    const currentStatus = worktree.environment_instance?.status;
+    const worktreeWithFreshHealth =
+      sameWorktree && (currentStatus === 'running' || currentStatus === 'starting')
+        ? await this.checkHealth(id, params)
+        : worktree;
+    const lastHealthCheck = worktreeWithFreshHealth.environment_instance?.last_health_check;
+
+    return evaluateEnvironmentSnapshotFacts({
+      worktree_id: worktreeWithFreshHealth.worktree_id,
+      environment_variant: worktreeWithFreshHealth.environment_variant ?? null,
+      has_rendered_snapshot: Boolean(worktreeWithFreshHealth.environment_variant),
+      has_health_check_url: Boolean(worktreeWithFreshHealth.health_check_url),
+      runtime_status: worktreeWithFreshHealth.environment_instance?.status ?? null,
+      health_status: lastHealthCheck?.status ?? null,
+      health_timestamp: lastHealthCheck?.timestamp ?? null,
+      health_message: lastHealthCheck?.message ?? null,
+      app_url: worktreeWithFreshHealth.app_url ?? null,
+      same_worktree: sameWorktree,
+    });
   }
 
   /**

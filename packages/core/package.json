@@ -90,6 +90,11 @@
       "import": "./dist/environment/render-snapshot.js",
       "require": "./dist/environment/render-snapshot.cjs"
     },
+    "./environment/environment-snapshot-recommendation": {
+      "types": "./dist/environment/environment-snapshot-recommendation.d.ts",
+      "import": "./dist/environment/environment-snapshot-recommendation.js",
+      "require": "./dist/environment/environment-snapshot-recommendation.cjs"
+    },
     "./utils/errors": {
       "types": "./dist/utils/errors.d.ts",
       "import": "./dist/utils/errors.js",

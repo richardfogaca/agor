@@ -19,6 +19,8 @@ export default defineConfig({
     'templates/session-context': 'src/templates/session-context.ts', // Agor system prompt rendering
     'environment/variable-resolver': 'src/environment/variable-resolver.ts', // Environment variable resolution
     'environment/render-snapshot': 'src/environment/render-snapshot.ts', // v2 worktree env snapshot rendering
+    'environment/environment-snapshot-recommendation':
+      'src/environment/environment-snapshot-recommendation.ts', // Environment snapshot recommendation evaluator
     'utils/errors': 'src/utils/errors.ts', // Error handling and formatting utilities
     'utils/url': 'src/utils/url.ts', // Shared URL validation helpers
     'utils/permission-mode-mapper': 'src/utils/permission-mode-mapper.ts', // Permission mode mapping for cross-agent compatibility

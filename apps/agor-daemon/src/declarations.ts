@@ -14,6 +14,7 @@ import type {
   AuthenticatedUser as CoreAuthenticatedUser,
   CreateHookContext as CoreCreateHookContext,
   HookContext as CoreHookContext,
+  EnvironmentSnapshotResult,
   Params as FeathersParams,
   Message,
   Repo,
@@ -212,6 +213,11 @@ export interface WorktreesServiceImpl extends Service<Worktree, Partial<Worktree
     params?: FeathersParams
   ): Promise<Worktree>;
   checkHealth(id: WorktreeID, params?: FeathersParams): Promise<Worktree>;
+  getEnvironmentSnapshotRecommendation(
+    id: WorktreeID,
+    options?: { currentWorktreeId?: WorktreeID | null },
+    params?: FeathersParams
+  ): Promise<EnvironmentSnapshotResult>;
   getLogs(
     id: WorktreeID,
     params?: FeathersParams
