@@ -38,6 +38,11 @@
  *    reachable via REST/MCP/UI).
  */
 
+import { BadRequest } from '@agor/core/feathers';
+import {
+  formatUnsupportedCodexChatGptModelMessage,
+  isUnsupportedCodexChatGptModel,
+} from '@agor/core/models';
 import { resolveSessionDefaults } from '@agor/core/sessions';
 import type { AgenticToolName, HookContext, Session, User } from '@agor/core/types';
 
@@ -68,10 +73,19 @@ export function applySessionConfigDefaults(opts: ApplySessionConfigDefaultsOpts 
 
     const hasPermission = data.permission_config != null;
     const hasModel = !!data.model_config?.model;
-    if (hasPermission && hasModel) return context; // nothing to fill
 
     const agenticTool = data.agentic_tool as AgenticToolName | undefined;
     if (!agenticTool) return context; // can't resolve defaults without a tool
+
+    if (
+      agenticTool === 'codex' &&
+      data.model_config?.model &&
+      isUnsupportedCodexChatGptModel(data.model_config.model)
+    ) {
+      throw new BadRequest(formatUnsupportedCodexChatGptModelMessage(data.model_config.model));
+    }
+
+    if (hasPermission && hasModel) return context; // nothing to fill
 
     // Identify the user whose defaults to apply. External calls go through
     // injectCreatedBy() first, which stamps `data.created_by` from
@@ -101,6 +115,13 @@ export function applySessionConfigDefaults(opts: ApplySessionConfigDefaultsOpts 
       user,
       overrides: { modelConfig: data.model_config ?? undefined },
     });
+    if (
+      resolved.model_config?.model &&
+      agenticTool === 'codex' &&
+      isUnsupportedCodexChatGptModel(resolved.model_config.model)
+    ) {
+      throw new BadRequest(formatUnsupportedCodexChatGptModelMessage(resolved.model_config.model));
+    }
 
     if (!hasPermission) {
       data.permission_config = resolved.permission_config;
