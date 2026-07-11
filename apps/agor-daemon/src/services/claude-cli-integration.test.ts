@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildClaudeCliSpawn } from '@agor/core/claude-cli';
+import { resolveProviderConnection } from '@agor/core/config';
 import type { Application } from '@agor/core/feathers';
 import type { Session } from '@agor/core/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -9,6 +10,7 @@ import {
   buildClaudeCliAgorMcpConfig,
   buildSpawnConfigForSession,
   resolveClaudeCliMcpConfigTargetUnixUser,
+  resolveClaudeCliProviderSpawn,
   writeClaudeCliMcpConfigFile,
   writeClaudeCliMcpConfigForSession,
 } from './claude-cli-integration';
@@ -17,12 +19,18 @@ vi.mock('../mcp/tokens.js', () => ({
   generateSessionToken: vi.fn(async () => 'tok_test'),
 }));
 
+vi.mock('@agor/core/config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@agor/core/config')>()),
+  resolveProviderConnection: vi.fn(),
+}));
+
 const generatedPaths: string[] = [];
 
 function makeApp(
   config: {
     daemon?: { mcpEnabled?: boolean };
     execution?: { unix_user_mode?: string; executor_unix_user?: string | null };
+    multitenancy?: { mode?: 'static' | 'required_from_auth' };
   } = {}
 ): Application {
   return {
@@ -151,5 +159,50 @@ describe('Claude CLI Agor MCP config', () => {
         targetUnixUser: 'bad user',
       })
     ).toThrow('invalid target Unix username');
+  });
+});
+
+describe('Claude CLI provider boundary', () => {
+  it('wraps the CLI with only the scoped Claude connection', async () => {
+    vi.mocked(resolveProviderConnection).mockResolvedValue({
+      tool: 'claude-code',
+      connection: {
+        ANTHROPIC_API_KEY: 'scoped-claude-canary',
+        ANTHROPIC_BASE_URL: 'https://scoped-claude.invalid',
+      },
+      source: 'user',
+      useNativeAuth: false,
+    });
+    const built = await resolveClaudeCliProviderSpawn(
+      makeApp({ multitenancy: { mode: 'required_from_auth' } }),
+      makeSession(),
+      { bin: 'claude', args: ['--session-id', 'session-1'] }
+    );
+
+    expect(built?.bin).toBe('/bin/sh');
+    expect(built?.args).toContain('claude');
+    const envPath = built?.args.find((arg) => arg.includes('agor-claude-cli-provider-'));
+    expect(envPath).toBeTruthy();
+    const contents = fs.readFileSync(envPath as string, 'utf8');
+    expect(contents).toContain('scoped-claude-canary');
+    expect(contents).toContain('https://scoped-claude.invalid');
+    fs.rmSync(envPath as string, { force: true });
+  });
+
+  it('does not spawn into shared native auth when hosted scope has no credential', async () => {
+    vi.mocked(resolveProviderConnection).mockResolvedValue({
+      tool: 'claude-code',
+      connection: {},
+      source: 'none',
+      useNativeAuth: false,
+    });
+
+    await expect(
+      resolveClaudeCliProviderSpawn(
+        makeApp({ multitenancy: { mode: 'required_from_auth' } }),
+        makeSession(),
+        { bin: 'claude', args: [] }
+      )
+    ).resolves.toBeNull();
   });
 });

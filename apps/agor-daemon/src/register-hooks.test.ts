@@ -53,6 +53,19 @@ describe('tenant-owned service registration', () => {
     expect(TENANT_OWNED_SERVICE_PATHS).toContain('gateway');
   });
 
+  it('wraps provider configuration storage in tenant database scope', () => {
+    expect(TENANT_OWNED_SERVICE_PATHS).toEqual(
+      expect.arrayContaining([
+        'config',
+        'config/resolve-api-key',
+        'check-auth',
+        'claude-models',
+        'copilot-models',
+        'cursor-models',
+      ])
+    );
+  });
+
   it('wraps MCP OAuth/session helper services in tenant database scope', () => {
     expect(TENANT_OWNED_SERVICE_PATHS).toEqual(
       expect.arrayContaining([

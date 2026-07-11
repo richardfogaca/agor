@@ -4,15 +4,14 @@ import { select } from '../db/database-wrapper';
 import { decryptApiKey } from '../db/encryption';
 import { SessionEnvSelectionRepository } from '../db/repositories/session-env-selections';
 import { users } from '../db/schema';
-import type {
-  AgenticToolName,
-  GatewayEnvVar,
-  SessionID,
-  StoredAgenticTools,
-  UserID,
-} from '../types';
+import type { AgenticToolName, GatewayEnvVar, SessionID, UserID } from '../types';
+import { canonicalProviderConnectionTool } from '../types';
 import { filterEnv } from './env-blocklist';
 import { normalizeStoredEnvMap, type StoredEnvVar } from './env-vars';
+import {
+  resolveProviderConnection,
+  stripProviderCredentialEnvironment,
+} from './provider-connection-resolver';
 
 /**
  * SECURITY: Allowlisted environment variable names that are safe to pass
@@ -201,7 +200,6 @@ export async function resolveUserEnvironment(
     if (row) {
       const data = row.data as {
         env_vars?: Record<string, string | StoredEnvVar>;
-        agentic_tools?: StoredAgenticTools;
       };
 
       // Normalize legacy + v0.5 shapes into StoredEnvVar records with scopes.
@@ -243,29 +241,6 @@ export async function resolveUserEnvironment(
           console.error(`Failed to decrypt env var ${key} for user ${userId}:`, err);
         }
       }
-
-      // 2. Decrypt and merge ONLY this tool's per-SDK credentials (higher precedence).
-      //    Without `options.tool`, no tool config is merged — this is the fix for the
-      //    cross-SDK credential leak: a Codex spawn never sees ANTHROPIC_API_KEY.
-      if (tool) {
-        const toolFields = data.agentic_tools?.[tool];
-        if (toolFields) {
-          for (const [key, encryptedValue] of Object.entries(toolFields)) {
-            if (!encryptedValue) continue;
-            try {
-              const decryptedValue = decryptApiKey(encryptedValue);
-              if (decryptedValue && decryptedValue.trim() !== '') {
-                env[key] = decryptedValue;
-              }
-            } catch (err) {
-              console.error(
-                `Failed to decrypt agentic_tools.${tool}.${key} for user ${userId}:`,
-                err
-              );
-            }
-          }
-        }
-      }
     }
   } catch (err) {
     console.error(`Failed to resolve environment for user ${userId}:`, err);
@@ -283,7 +258,28 @@ export async function resolveUserEnvironment(
     );
   }
 
-  return safeEnv;
+  // Generic user env must not carry provider credentials into terminals,
+  // managed commands, git helpers, or another SDK. A tool-scoped spawn gets
+  // exactly one atomically resolved connection overlaid below.
+  const providerSafeEnv = stripProviderCredentialEnvironment(safeEnv);
+  if (tool) {
+    try {
+      const resolved = await resolveProviderConnection(tool, { userId, db });
+      if (!resolved.decryptionFailed) {
+        if (resolved.tool === 'copilot') {
+          delete providerSafeEnv.GH_TOKEN;
+          delete providerSafeEnv.GITHUB_TOKEN;
+        }
+        for (const [key, value] of Object.entries(resolved.connection)) {
+          if (value?.trim()) providerSafeEnv[key] = value;
+        }
+      }
+    } catch (err) {
+      console.error(`Failed to resolve provider connection for ${tool} and user ${userId}:`, err);
+    }
+  }
+
+  return providerSafeEnv;
 }
 
 /**
@@ -291,7 +287,7 @@ export async function resolveUserEnvironment(
  * SECURITY: Does not return full process.env.
  */
 export function resolveSystemEnvironment(): Record<string, string> {
-  return buildAllowlistedEnv();
+  return stripProviderCredentialEnvironment(buildAllowlistedEnv());
 }
 
 /**
@@ -393,7 +389,7 @@ export async function createUserProcessEnvironment(
   tool?: AgenticToolName
 ): Promise<Record<string, string>> {
   // SECURITY: Start with allowlisted env vars only — never inherit full process.env
-  const env = buildAllowlistedEnv();
+  const env = stripProviderCredentialEnvironment(buildAllowlistedEnv());
 
   // For impersonation, strip user-identity vars so sudo -u can set them
   const USER_IDENTITY_VARS = ['HOME', 'USER', 'LOGNAME', 'SHELL'];
@@ -420,10 +416,11 @@ export async function createUserProcessEnvironment(
 
   // 2. Resolve and merge user environment variables (if userId provided)
   // Only override if values are non-empty — takes precedence over gateway fallback vars.
-  // When `tool` is set, only THAT tool's per-SDK credentials are folded in;
-  // other tools' credentials are excluded (cross-SDK credential isolation).
+  // Provider fields stay out of this generic merge. The selected tool's
+  // complete connection is resolved and overlaid once, after every generic
+  // source, so gateway/additional env cannot replace half of the connection.
   if (userId && db) {
-    const userEnv = await resolveUserEnvironment(userId, db, { sessionId, tool });
+    const userEnv = await resolveUserEnvironment(userId, db, { sessionId });
     for (const [key, value] of Object.entries(userEnv)) {
       if (value && value.trim() !== '') {
         env[key] = value;
@@ -484,11 +481,35 @@ export async function createUserProcessEnvironment(
     );
   }
 
-  // Set AGOR_USER_ENV_KEYS to communicate user-defined var keys to child processes
-  // This is used by MCP template resolver to restrict context to user-scoped vars only
-  if (userEnvKeys.length > 0) {
-    env[AGOR_USER_ENV_KEYS_VAR] = userEnvKeys.join(',');
+  // Generic sources can contain provider-looking fields (notably gateway or
+  // additional env). Strip them all, then overlay exactly one resolver-owned
+  // connection for the selected capability.
+  const childEnv = stripProviderCredentialEnvironment(env);
+  const providerTool = tool ? canonicalProviderConnectionTool(tool) : null;
+  if (providerTool && db) {
+    const resolved = await resolveProviderConnection(providerTool, { userId, db });
+    if (!resolved.decryptionFailed) {
+      if (resolved.tool === 'copilot') {
+        delete childEnv.GH_TOKEN;
+        delete childEnv.GITHUB_TOKEN;
+      }
+      for (const [key, value] of Object.entries(resolved.connection)) {
+        if (value?.trim()) childEnv[key] = value;
+      }
+    }
   }
 
-  return env;
+  // Set AGOR_USER_ENV_KEYS to communicate generic user-defined keys to child
+  // processes. Provider connection fields are deliberately absent so template
+  // expansion cannot turn credentials into prompt text.
+  const visibleUserEnvKeys = Object.keys(
+    stripProviderCredentialEnvironment(
+      Object.fromEntries(userEnvKeys.map((key) => [key, 'configured']))
+    )
+  ).filter((key) => Object.hasOwn(childEnv, key));
+  if (visibleUserEnvKeys.length > 0) {
+    childEnv[AGOR_USER_ENV_KEYS_VAR] = visibleUserEnvKeys.join(',');
+  }
+
+  return childEnv;
 }

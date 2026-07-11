@@ -64,6 +64,16 @@ describe('spawn-executor log hygiene (source-level)', () => {
     // under sticky /tmp where the daemon cannot unlink files owned by asUser.
     expect(source).toMatch(/attachEnvFileCleanup\s*\(/);
   });
+
+  it('sanitizes inherited provider credentials for every default child path', () => {
+    expect(source).toMatch(
+      /function defaultExecutorEnv\(\): Record<string, string> \{\s*return stripProviderCredentialEnvironment\(process\.env\);/s
+    );
+    expect(source).not.toMatch(/env\s*=\s*process\.env/);
+    expect(source).not.toMatch(/options\.env\s*\?\?\s*process\.env/);
+    expect(source).toMatch(/env\s*=\s*defaultExecutorEnv\(\)/);
+    expect(source).toMatch(/options\.env\s*\?\?\s*defaultExecutorEnv\(\)/);
+  });
 });
 
 describe('isSecretEnvKey matches the keys spawn-executor cares about', () => {

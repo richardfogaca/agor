@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const configMocks = vi.hoisted(() => ({
-  resolveApiKey: vi.fn(),
+  resolveProviderConnection: vi.fn(),
 }));
 
 const cursorMocks = vi.hoisted(() => ({
@@ -25,7 +25,11 @@ describe('CursorModelsService', () => {
   });
 
   it('returns the live model list with the server-reported default', async () => {
-    configMocks.resolveApiKey.mockResolvedValue({ apiKey: 'cursor-key', source: 'user' });
+    configMocks.resolveProviderConnection.mockResolvedValue({
+      tool: 'cursor',
+      connection: { CURSOR_API_KEY: 'cursor-key' },
+      source: 'user',
+    });
     cursorMocks.modelsList.mockResolvedValue([
       { id: 'other-model', displayName: 'Other Model' },
       { id: 'composer-latest', displayName: 'Composer Latest' },
@@ -40,7 +44,11 @@ describe('CursorModelsService', () => {
   });
 
   it('falls back to the static model list when the SDK call fails', async () => {
-    configMocks.resolveApiKey.mockResolvedValue({ apiKey: 'cursor-key', source: 'user' });
+    configMocks.resolveProviderConnection.mockResolvedValue({
+      tool: 'cursor',
+      connection: { CURSOR_API_KEY: 'cursor-key' },
+      source: 'user',
+    });
     cursorMocks.modelsList.mockRejectedValue(new Error('boom'));
 
     const service = new CursorModelsService({} as never);

@@ -15,16 +15,19 @@
  *     immediately and upgrades when the dynamic list arrives. Avoiding
  *     persistent state also eliminates the cross-tenant cache-keying bug
  *     class.
- *   - **Per-user token resolution** via `resolveApiKey` — picks up the
+ *   - **Scoped token resolution** via the provider-connection resolver — picks up the
  *     calling user's `data.agentic_tools.copilot.COPILOT_GITHUB_TOKEN` first,
- *     then falls back to config.yaml, then `process.env`. Each user sees
- *     their own account's BYOK lineup; no leakage between users.
+ *     then the tenant default. Static mode alone retains system fallback.
  *   - **Static fallback on any failure.** No token, decrypt failure, SDK
  *     throws, CLI binary missing — all degrade silently to the static list
  *     the UI already has bundled. The picker stays usable.
  */
 
-import { resolveApiKey } from '@agor/core/config';
+import {
+  type AgorConfig,
+  type ProviderResolutionMode,
+  resolveProviderConnection,
+} from '@agor/core/config';
 import { shortId, type TenantScopeAwareDatabase } from '@agor/core/db';
 import { COPILOT_MODEL_METADATA, DEFAULT_COPILOT_MODEL } from '@agor/core/models';
 import type { Params, UserID } from '@agor/core/types';
@@ -70,20 +73,25 @@ interface AuthenticatedParams extends Params {
 }
 
 export class CopilotModelsService {
-  constructor(private db: TenantScopeAwareDatabase) {}
+  constructor(
+    private db: TenantScopeAwareDatabase,
+    private providerContext: { mode: ProviderResolutionMode; config: AgorConfig } = {
+      mode: 'static',
+      config: {},
+    }
+  ) {}
 
   async find(params?: AuthenticatedParams): Promise<CopilotModelsResult> {
     const userId = params?.user?.user_id;
 
-    // Resolve the GitHub token. Precedence: per-user > config.yaml > env.
-    // Falls through to static if nothing is configured anywhere.
-    const resolution = await resolveApiKey('COPILOT_GITHUB_TOKEN', {
+    const resolution = await resolveProviderConnection('copilot', {
       userId,
       db: this.db,
-      tool: 'copilot',
+      ...this.providerContext,
     });
+    const apiKey = resolution.connection.COPILOT_GITHUB_TOKEN;
 
-    if (!resolution.apiKey) {
+    if (!apiKey) {
       console.log(
         `[Copilot Models] No GitHub token for user ${userId ? shortId(userId) : 'unknown'} — returning static list`
       );
@@ -94,7 +102,7 @@ export class CopilotModelsService {
     try {
       client = new CopilotClient({
         useStdio: true,
-        githubToken: resolution.apiKey,
+        githubToken: apiKey,
         env: { HOME: process.env.HOME || '' },
       });
       await client.start();
@@ -134,6 +142,9 @@ export class CopilotModelsService {
   }
 }
 
-export function createCopilotModelsService(db: TenantScopeAwareDatabase): CopilotModelsService {
-  return new CopilotModelsService(db);
+export function createCopilotModelsService(
+  db: TenantScopeAwareDatabase,
+  providerContext?: { mode: ProviderResolutionMode; config: AgorConfig }
+): CopilotModelsService {
+  return new CopilotModelsService(db, providerContext);
 }

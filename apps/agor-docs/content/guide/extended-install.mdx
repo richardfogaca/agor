@@ -58,16 +58,17 @@ If pgvector is missing or the Agor DB user cannot enable it, semantic search ret
 
 ## Authentication
 
-Agor supports Claude Code, Codex, Gemini, OpenCode, and GitHub Copilot. The [onboarding wizard](/guide/getting-started#meet-your-first-ai-teammate) handles the simple case — paste an API key, done. This section covers the alternatives: subscription tokens, machine-level CLI auth, workspace-wide fallbacks, and how Agor resolves them when several are present.
+Agor supports Claude Code, Codex, Gemini, OpenCode, and GitHub Copilot. The [onboarding wizard](/guide/getting-started#meet-your-first-ai-teammate) handles the simple case — paste an API key, done. This section covers the alternatives: subscription tokens, tenant defaults, machine-level CLI auth, and how Agor resolves them when several are present.
 
 ### Credential resolution order
 
-When a session starts, Agor looks for credentials in this order and uses the first one it finds:
+When a session starts, Agor resolves the provider connection in this order:
 
-1. **Per-user credentials** — encrypted in the DB, scoped to the user. Set via the wizard or **Settings → Agentic Tools → _tool_**. Claude Code accepts either `ANTHROPIC_API_KEY` (pay-as-you-go) or `CLAUDE_CODE_OAUTH_TOKEN` (subscription token from `claude setup-token`). Codex accepts `OPENAI_API_KEY`.
-2. **Instance/global credentials** — `credentials.*` in `~/.agor/config.yaml`, or the admin **Settings → Agentic Tools** global fallback.
-3. **Daemon environment variables** — for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` in the daemon process environment.
-4. **Machine-level CLI auth** — if no key is found, supported tools fall back to local CLI auth available to the Unix user running the session. For Codex this is `~/.codex/auth.json` from `codex login --device-auth`; for Claude Code this includes Claude CLI subscription login state.
+1. **Per-user connection** — encrypted in the DB and scoped to the user. Set via the wizard or **User Settings → Agentic Tools → _tool_**. Claude Code accepts either `ANTHROPIC_API_KEY` (pay-as-you-go) or `CLAUDE_CODE_OAUTH_TOKEN` (subscription token from `claude setup-token`). Codex accepts `OPENAI_API_KEY`.
+2. **Tenant default connection** — encrypted in the DB and scoped to the active tenant. Tenant administrators set it in **Settings → Agentic Tools**.
+3. **Static-instance fallbacks only** — a self-hosted instance using static tenancy may then use `credentials.*` from `~/.agor/config.yaml`, daemon provider environment variables, or supported machine-level CLI auth. For Codex, machine auth is `~/.codex/auth.json` from `codex login --device-auth`; for Claude Code it includes Claude CLI subscription login state.
+
+In hosted `required_from_auth` mode, resolution stops after the tenant default. Provider credentials from YAML, the daemon environment, or daemon-native CLI login are never inherited by a tenant session. A custom provider endpoint and its credential are also resolved as one connection from one scope; Agor does not combine an endpoint from one user or tenant with a key from another.
 
 Agor uses these credentials only to authenticate the agent runtime with the provider SDK/CLI. Stored secrets are encrypted at rest and are not written into the prompt transcript or intentionally sent to the model as text.
 
@@ -119,9 +120,9 @@ The wizard's default. Each user pastes their own key in **Settings → Agentic T
 
 Choose raw API keys when you want explicit usage/billing through API-provider accounts, shared automation, or a setup that does not depend on local CLI login state.
 
-### Workspace env vars (global fallback)
+### Static-instance provider env vars
 
-For instances where everyone intentionally shares one set of credentials:
+For a static self-hosted instance where everyone intentionally shares one set of credentials:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -129,7 +130,7 @@ export OPENAI_API_KEY="sk-..."
 export GEMINI_API_KEY="..."
 ```
 
-Or use the admin **Settings → Agentic Tools** global fallback fields. These credentials are available as a fallback for every user on the instance — pick this only if that's intentional.
+Tenant administrators can instead use **Settings → Agentic Tools** to store an encrypted tenant default. Hosted multi-tenant deployments must use per-user or tenant-scoped database credentials; daemon environment variables are not a tenant fallback.
 
 ---
 

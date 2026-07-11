@@ -7,7 +7,11 @@
  * the SDK call fails.
  */
 
-import { resolveApiKey } from '@agor/core/config';
+import {
+  type AgorConfig,
+  type ProviderResolutionMode,
+  resolveProviderConnection,
+} from '@agor/core/config';
 import { shortId, type TenantScopeAwareDatabase } from '@agor/core/db';
 import { CURSOR_MODEL_METADATA, DEFAULT_CURSOR_MODEL } from '@agor/core/models';
 import type { Params, UserID } from '@agor/core/types';
@@ -69,17 +73,24 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 }
 
 export class CursorModelsService {
-  constructor(private db: TenantScopeAwareDatabase) {}
+  constructor(
+    private db: TenantScopeAwareDatabase,
+    private providerContext: { mode: ProviderResolutionMode; config: AgorConfig } = {
+      mode: 'static',
+      config: {},
+    }
+  ) {}
 
   async find(params?: AuthenticatedParams): Promise<CursorModelsResult> {
     const userId = params?.user?.user_id;
-    const resolution = await resolveApiKey('CURSOR_API_KEY', {
+    const resolution = await resolveProviderConnection('cursor', {
       userId,
       db: this.db,
-      tool: 'cursor',
+      ...this.providerContext,
     });
+    const apiKey = resolution.connection.CURSOR_API_KEY;
 
-    if (!resolution.apiKey) {
+    if (!apiKey) {
       console.log(
         `[Cursor Models] No Cursor API key for user ${userId ? shortId(userId) : 'unknown'} — returning static list`
       );
@@ -88,7 +99,7 @@ export class CursorModelsService {
 
     try {
       const dynamic = await withTimeout(
-        Cursor.models.list({ apiKey: resolution.apiKey }),
+        Cursor.models.list({ apiKey }),
         CURSOR_MODELS_TIMEOUT_MS,
         'Cursor.models.list() timed out'
       );
@@ -110,6 +121,9 @@ export class CursorModelsService {
   }
 }
 
-export function createCursorModelsService(db: TenantScopeAwareDatabase): CursorModelsService {
-  return new CursorModelsService(db);
+export function createCursorModelsService(
+  db: TenantScopeAwareDatabase,
+  providerContext?: { mode: ProviderResolutionMode; config: AgorConfig }
+): CursorModelsService {
+  return new CursorModelsService(db, providerContext);
 }

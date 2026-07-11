@@ -13,13 +13,11 @@
  *   credential class with no server-probeable path (gemini Google-login, cursor,
  *   copilot native). Callers must FAIL SAFE and treat this as "possibly connected".
  *
- * Credential resolution mirrors what the executor sees at session-start: the
- * primary per-tool credential (DB `agentic_tools` > config.yaml > OS env, via
- * `resolveApiKey`), then the tool's user `env_vars` and a Claude subscription
- * token, then the native filesystem path (claude via the SDK's `accountInfo()`
- * reading `~/.claude/.credentials.json`; codex reading `~/.codex/auth.json`).
+ * Credential resolution mirrors what the executor sees at session-start: one
+ * atomic user/tenant provider connection, followed by explicit static-instance
+ * compatibility sources. Hosted mode never probes shared native filesystem auth.
  *
- * Residual: in insulated/strict Unix modes the probe runs as the DAEMON Unix user,
+ * Static-mode residual: in insulated/strict Unix modes the native probe runs as the DAEMON Unix user,
  * whose `~/.claude` / `~/.codex` may diverge from the executor user's. The full
  * `sudo -u <session user>` probe is a follow-up; here we still FAIL SAFE (a
  * divergence surfaces as `unknown`, never a false "not connected").
@@ -28,7 +26,11 @@
 import { promises as fs } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { resolveApiKey, resolveUserEnvironment } from '@agor/core/config';
+import {
+  type AgorConfig,
+  type ProviderResolutionMode,
+  resolveProviderConnection,
+} from '@agor/core/config';
 import type { TenantScopeAwareDatabase } from '@agor/core/db';
 import type { SDKUserMessage } from '@agor/core/sdk';
 import { Claude } from '@agor/core/sdk';
@@ -248,7 +250,11 @@ async function probeCodexAuth(): Promise<AuthCheckResult> {
  * `unauthenticated` only on a real 401/403 rejection; everything else (timeout,
  * 5xx, network error) is `unknown` — a failure to VERIFY is not proof of invalidity.
  */
-async function validateApiKey(tool: string, key: string): Promise<AuthCheckStatus> {
+async function validateApiKey(
+  tool: string,
+  key: string,
+  baseUrl?: string
+): Promise<AuthCheckStatus> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -258,13 +264,13 @@ async function validateApiKey(tool: string, key: string): Promise<AuthCheckStatu
 
     switch (tool) {
       case 'claude-code': {
-        url = 'https://api.anthropic.com/v1/models';
+        url = `${(baseUrl || 'https://api.anthropic.com').replace(/\/$/, '')}/v1/models`;
         headers['x-api-key'] = key;
         headers['anthropic-version'] = '2023-06-01';
         break;
       }
       case 'codex': {
-        url = 'https://api.openai.com/v1/models';
+        url = `${(baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '')}/models`;
         headers.Authorization = `Bearer ${key}`;
         break;
       }
@@ -313,7 +319,13 @@ function resultFromKeyStatus(status: AuthCheckStatus, rejectedHint: string): Aut
   return unknown('Could not reach the provider to verify this key.');
 }
 
-export function createCheckAuthService(db: TenantScopeAwareDatabase) {
+export function createCheckAuthService(
+  db: TenantScopeAwareDatabase,
+  providerContext: { mode: ProviderResolutionMode; config: AgorConfig } = {
+    mode: 'static',
+    config: {},
+  }
+) {
   return {
     async create(
       data: { tool: string; apiKey?: string },
@@ -356,13 +368,16 @@ export function createCheckAuthService(db: TenantScopeAwareDatabase) {
         );
       }
 
-      // Otherwise resolve from stored credentials (user > config.yaml > env > native).
+      // Otherwise resolve one atomic user/tenant connection. Hosted mode never
+      // falls through to shared YAML, process credentials, or native auth.
       const toolName = tool as AgenticToolName;
-      const { apiKey, useNativeAuth, decryptionFailed } = await resolveApiKey(keyName, {
+      const resolution = await resolveProviderConnection(toolName, {
         userId,
         db,
-        tool: toolName,
+        ...providerContext,
       });
+      const apiKey = (resolution.connection as Record<string, string | undefined>)[keyName];
+      const { useNativeAuth, decryptionFailed } = resolution;
 
       if (decryptionFailed) {
         return unauthenticated(
@@ -371,56 +386,28 @@ export function createCheckAuthService(db: TenantScopeAwareDatabase) {
         );
       }
 
-      let effectiveUserEnv: Record<string, string> | undefined;
-      const getEffectiveUserEnv = async () => {
-        if (!userId) return {};
-        effectiveUserEnv ??= await resolveUserEnvironment(userId, db, { tool: toolName });
-        return effectiveUserEnv;
-      };
-
       if (apiKey) {
+        const baseUrl =
+          resolution.tool === 'claude-code'
+            ? resolution.connection.ANTHROPIC_BASE_URL
+            : resolution.tool === 'codex'
+              ? resolution.connection.OPENAI_BASE_URL
+              : undefined;
         return resultFromKeyStatus(
-          await validateApiKey(tool, apiKey),
+          await validateApiKey(tool, apiKey, baseUrl),
           'Stored key was rejected by provider — update it in Settings → Agent Setup.'
         );
       }
 
-      // User Settings → Env Vars is not the recommended credential home, but executors
-      // do receive those values. Validate that setup through the same user/tool env
-      // resolver used to spawn sessions.
-      const userEnv = await getEffectiveUserEnv();
-      const userEnvApiKey = userEnv[keyName];
-      if (userEnvApiKey) {
-        return resultFromKeyStatus(
-          await validateApiKey(tool, userEnvApiKey),
-          'Stored env var key was rejected by provider — update it in Settings → Env Vars.'
-        );
-      }
-
       if (tool === 'claude-code') {
-        const subscriptionResolution = await resolveApiKey('CLAUDE_CODE_OAUTH_TOKEN', {
-          userId,
-          db,
-          tool: 'claude-code',
-        });
-
-        if (subscriptionResolution.decryptionFailed) {
-          return unauthenticated(
-            'none',
-            'Stored Claude subscription token could not be decrypted (master-secret mismatch). Re-enter it in Settings → Agent Setup.'
-          );
-        }
-
-        const subscriptionToken = subscriptionResolution.apiKey || userEnv.CLAUDE_CODE_OAUTH_TOKEN;
+        const subscriptionToken = resolution.connection.CLAUDE_CODE_OAUTH_TOKEN;
         if (subscriptionToken) {
           const status = await validateClaudeSubscriptionToken(subscriptionToken);
           if (status === 'authenticated') return authed('oauth');
           if (status === 'unauthenticated') {
             return unauthenticated(
               'none',
-              subscriptionResolution.apiKey
-                ? 'Stored Claude subscription token was rejected — update it in Settings → Agent Setup.'
-                : 'Claude subscription token env var was rejected — update CLAUDE_CODE_OAUTH_TOKEN in Settings → Env Vars.'
+              'Stored Claude subscription token was rejected — update it in Settings → Agent Setup.'
             );
           }
           return unknown('Could not verify the Claude subscription token — try again.');

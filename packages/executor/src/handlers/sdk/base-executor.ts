@@ -5,7 +5,12 @@
  * Claude, Codex, Gemini, and OpenCode executors.
  */
 
-import { type ApiKeyName, resolveApiKey } from '@agor/core/config';
+import {
+  type ApiKeyName,
+  PROVIDER_RESOLUTION_MODE_ENV_VAR,
+  resolveApiKey,
+  stripProviderCredentialEnvironment,
+} from '@agor/core/config';
 import { generateId, shortId } from '@agor/core/db';
 import type {
   AgenticToolName,
@@ -373,7 +378,49 @@ export async function resolveApiKeyForTask(
 
     console.warn(`[API Key Resolution] Falling back to local resolution: ${message}`);
     // Fall back to sync resolution (config + env only, no per-user keys)
-    return resolveApiKey(keyName, {});
+    const inheritedMode = process.env[PROVIDER_RESOLUTION_MODE_ENV_VAR];
+    return resolveApiKey(keyName, {
+      mode: inheritedMode === 'required_from_auth' ? 'required_from_auth' : 'static',
+    });
+  }
+}
+
+export function installProviderConnectionSnapshot(
+  connection: Record<string, string | undefined>
+): void {
+  const sanitized = stripProviderCredentialEnvironment(process.env);
+  for (const key of Object.keys(process.env)) {
+    if (!Object.hasOwn(sanitized, key)) delete process.env[key];
+  }
+  for (const [key, value] of Object.entries(connection)) {
+    if (value?.trim()) process.env[key] = value;
+  }
+}
+
+function hasExplicitProviderCredential(
+  tool: AgenticToolName,
+  connection: Record<string, string | undefined>
+): boolean {
+  const credentialFields: Partial<Record<AgenticToolName, readonly string[]>> = {
+    'claude-code': ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
+    'claude-code-cli': ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
+    codex: ['OPENAI_API_KEY'],
+    gemini: ['GEMINI_API_KEY'],
+    copilot: ['COPILOT_GITHUB_TOKEN'],
+    cursor: ['CURSOR_API_KEY'],
+  };
+  return (credentialFields[tool] ?? []).some((field) => connection[field]?.trim());
+}
+
+export function assertProviderAuthenticationBoundary(
+  tool: AgenticToolName,
+  connection: Record<string, string | undefined>,
+  useNativeAuth: boolean
+): void {
+  if (!useNativeAuth && !hasExplicitProviderCredential(tool, connection)) {
+    throw new Error(
+      `No scoped ${tool} provider credential is configured; native authentication is disabled for this deployment.`
+    );
   }
 }
 
@@ -413,11 +460,20 @@ export async function executeToolTask(params: {
   // executor-mediated git work.
   await stampGitStateAtTaskStart(client, sessionId, taskId);
 
-  // Resolve API key with proper precedence (user → config → env → native auth).
-  // Pass `toolName` so the daemon scopes the per-user lookup to this tool's
-  // credential bucket — prevents cross-SDK leak (e.g. Codex picking up an
-  // ANTHROPIC_API_KEY stored under claude-code).
+  // Resolve through the daemon's atomic user/tenant provider connection policy.
+  // Static instances retain explicit system/native compatibility fallbacks;
+  // hosted mode fails closed after user and tenant storage.
   const resolution = await resolveApiKeyForTask(apiKeyEnvVar, client, taskId, toolName);
+  const connection = {
+    ...(resolution.connection ?? {}),
+    ...(resolution.apiKey ? { [apiKeyEnvVar]: resolution.apiKey } : {}),
+  } as Record<string, string | undefined>;
+
+  // This is the final SDK/CLI auth boundary. Replace every inherited provider
+  // alias with the daemon's one task-owner snapshot before any tool process is
+  // constructed. Hosted no-credential results stop here instead of letting an
+  // SDK rediscover shared HOME/token state.
+  installProviderConnectionSnapshot(connection);
 
   // Fail fast if stored key can't be decrypted (e.g. master secret changed)
   if (resolution.decryptionFailed) {
@@ -428,13 +484,17 @@ export async function executeToolTask(params: {
     );
   }
 
+  assertProviderAuthenticationBoundary(toolName, connection, resolution.useNativeAuth);
+
   // Log resolution result
   if (resolution.apiKey) {
     sdkDebug(`[${toolName}] Using API key from ${resolution.source} level for ${apiKeyEnvVar}`);
-  } else {
+  } else if (resolution.useNativeAuth) {
     sdkDebug(
       `[${toolName}] No API key found - SDK will use native authentication (OAuth/CLI login)`
     );
+  } else {
+    sdkDebug(`[${toolName}] No provider credential is available in the active scope`);
   }
 
   // Create execution context

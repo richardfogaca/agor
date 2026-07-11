@@ -51,7 +51,11 @@ import {
   permissionModeForCli,
   slugForCwd,
 } from '@agor/core/claude-cli';
-import { type AgorConfig, resolveMultiTenancyConfig } from '@agor/core/config';
+import {
+  type AgorConfig,
+  resolveMultiTenancyConfig,
+  resolveProviderConnection,
+} from '@agor/core/config';
 import {
   generateId,
   getCurrentTenantId,
@@ -97,6 +101,64 @@ import {
 function getDb(app: Application): TenantScopeAwareDatabase | null {
   const db = (app.get('database') ?? app.get('db')) as TenantScopeAwareDatabase | undefined;
   return db ?? null;
+}
+
+function claudeCliProviderEnvPath(sessionId: SessionID): string {
+  return path.join(os.tmpdir(), `agor-claude-cli-provider-${sessionId}.sh`);
+}
+
+/**
+ * Overlay only this CLI session owner's resolved Claude connection. Generic
+ * terminal tabs stay provider-free; hosted no-credential sessions never reach
+ * the machine's shared Claude login.
+ */
+export async function resolveClaudeCliProviderSpawn(
+  app: Application,
+  session: Session,
+  built: { bin: string; args: string[] }
+): Promise<{ bin: string; args: string[] } | null> {
+  const config = (app.get('config') as AgorConfig | undefined) ?? {};
+  const mode = resolveMultiTenancyConfig(config).mode;
+  const db = getDb(app) ?? undefined;
+  const resolved = await resolveProviderConnection('claude-code', {
+    userId: session.created_by ?? undefined,
+    db,
+    mode,
+    config,
+  });
+  const connection = resolved.connection as Record<string, string | undefined>;
+  const hasCredential = [
+    'ANTHROPIC_API_KEY',
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
+  ].some((field) => connection[field]?.trim());
+  if (resolved.decryptionFailed || (!resolved.useNativeAuth && !hasCredential)) return null;
+  if (Object.keys(connection).length === 0) return built;
+
+  const envPath = claudeCliProviderEnvPath(session.session_id);
+  const exports = Object.entries(connection).map(([key, value]) => {
+    const escaped = (value ?? '').replace(/'/g, "'\\''");
+    return `export ${key}='${escaped}'`;
+  });
+  fs.writeFileSync(envPath, `#!/bin/sh\n${exports.join('\n')}\n`, { mode: 0o600 });
+  if (session.unix_username) {
+    try {
+      childProcess.execFileSync('sudo', ['-n', 'chown', session.unix_username, envPath], {
+        stdio: 'pipe',
+        timeout: 2000,
+      });
+    } catch (error) {
+      fs.rmSync(envPath, { force: true });
+      throw new Error(
+        `Failed to prepare scoped Claude CLI credentials for ${session.unix_username}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  return {
+    bin: '/bin/sh',
+    args: ['-c', '. "$1"; shift; exec "$@"', 'agor-claude-cli', envPath, built.bin, ...built.args],
+  };
 }
 
 const cliWatcherTenantBySession = new Map<string, string>();
@@ -1386,7 +1448,7 @@ export async function onCliSessionCreated(
   const jsonlPath = claudeSessionJsonlPath(homeDir, branchCwd, session.session_id);
   const mcpConfigPath = await writeClaudeCliMcpConfigForSession(app, session);
   const spawnCfg = buildSpawnConfigForSession(session, branchCwd, { mcpConfigPath });
-  const built = buildClaudeCliSpawn(spawnCfg);
+  const built = await resolveClaudeCliProviderSpawn(app, session, buildClaudeCliSpawn(spawnCfg));
   const tabName = spawnCfg.displayName ?? `cli-${shortId(session.session_id)}`;
 
   // 1) Persist cli_state for diagnostics + restart recovery.
@@ -1451,14 +1513,9 @@ export async function onCliSessionCreated(
   //    Best-effort — drops silently if the user hasn't opened the terminal
   //    modal yet. Log the attempt either way so we can see it in the
   //    daemon logs while testing.
-  const dispatched = dispatchZellijClaudeTab(
-    app,
-    session.created_by,
-    tabName,
-    branchCwd,
-    built.bin,
-    built.args
-  );
+  const dispatched = built
+    ? dispatchZellijClaudeTab(app, session.created_by, tabName, branchCwd, built.bin, built.args)
+    : false;
   console.log(
     JSON.stringify({
       layer: 'claude-cli-integration.onCliSessionCreated',
@@ -1466,7 +1523,7 @@ export async function onCliSessionCreated(
       slug,
       jsonl_path: jsonlPath,
       tab_dispatched: dispatched,
-      spawn: { bin: built.bin, args: built.args },
+      spawn: built ? { bin: built.bin, args: built.args } : { blocked: 'scoped-auth-required' },
     })
   );
 }
@@ -1484,6 +1541,7 @@ export async function onCliSessionEnded(app: Application, sessionId: SessionID):
   stopTaskWatchdog(sessionId);
   activeCliTurn.delete(sessionId);
   cliWatcherTenantBySession.delete(sessionId);
+  fs.rmSync(claudeCliProviderEnvPath(sessionId), { force: true });
 }
 
 /**

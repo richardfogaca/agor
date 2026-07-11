@@ -953,6 +953,7 @@ export enum CredentialKey {
   ANTHROPIC_AUTH_TOKEN = 'ANTHROPIC_AUTH_TOKEN',
   ANTHROPIC_BASE_URL = 'ANTHROPIC_BASE_URL',
   OPENAI_API_KEY = 'OPENAI_API_KEY',
+  OPENAI_BASE_URL = 'OPENAI_BASE_URL',
   GEMINI_API_KEY = 'GEMINI_API_KEY',
   COPILOT_GITHUB_TOKEN = 'COPILOT_GITHUB_TOKEN',
   CURSOR_API_KEY = 'CURSOR_API_KEY',
@@ -975,6 +976,9 @@ export interface AgorCredentials {
 
   /** OpenAI API key for Codex */
   OPENAI_API_KEY?: string;
+
+  /** Custom OpenAI-compatible API base URL for Codex */
+  OPENAI_BASE_URL?: string;
 
   /** Google Gemini API key */
   GEMINI_API_KEY?: string;

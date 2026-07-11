@@ -7,9 +7,11 @@
 
 import {
   type AgorConfig,
+  PROVIDER_RESOLUTION_MODE_ENV_VAR,
   PublicBaseUrlNotConfiguredError,
   requirePublicBaseUrl,
   resolveExecutionSecurityMode,
+  resolveMultiTenancyConfig,
 } from '@agor/core/config';
 import {
   and,
@@ -180,6 +182,10 @@ export interface RegisteredServices {
 export async function registerServices(ctx: RegisterServicesContext): Promise<RegisteredServices> {
   const { db, app, config, svcEnabled, jwtSecret, daemonUrl, branchRbacEnabled, allowSuperadmin } =
     ctx;
+  const providerContext = {
+    mode: resolveMultiTenancyConfig(config).mode,
+    config,
+  } as const;
 
   const _superadminOpts = { allowSuperadmin };
 
@@ -513,7 +519,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Config, context, file, files, terminals
   // ============================================================================
 
-  const configService = createConfigService(db);
+  const configService = createConfigService(db, providerContext);
   configService.app = app;
   app.use('/admin/local-actions', createLocalActionsService());
 
@@ -531,26 +537,26 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     },
   });
 
-  app.use('/check-auth', createCheckAuthService(db));
+  app.use('/check-auth', createCheckAuthService(db, providerContext));
   app.service('/check-auth').hooks({ before: { create: [ctx.requireAuth] } });
 
   // Claude dynamic model discovery via @anthropic-ai/sdk's models.list().
-  // Resolves ANTHROPIC_API_KEY per-user (with config.yaml + env fallback)
-  // and falls back to AVAILABLE_CLAUDE_MODEL_ALIASES if no key or API failure.
-  app.use('/claude-models', createClaudeModelsService(db));
+  // Resolves the complete Anthropic connection through the shared scoped
+  // resolver and falls back to aliases if no usable key or API failure.
+  app.use('/claude-models', createClaudeModelsService(db, providerContext));
   app.service('/claude-models').hooks({ before: { find: [ctx.requireAuth] } });
 
   // Copilot dynamic model discovery via @github/copilot-sdk's listModels().
-  // Resolves the GitHub token per-user (with config.yaml + env fallback)
-  // and falls back to the static list at @agor/core/models/copilot if no
+  // Resolves the GitHub token through the shared scoped resolver and falls
+  // back to the static list at @agor/core/models/copilot if no
   // token is configured or the SDK call fails.
-  app.use('/copilot-models', createCopilotModelsService(db));
+  app.use('/copilot-models', createCopilotModelsService(db, providerContext));
   app.service('/copilot-models').hooks({ before: { find: [ctx.requireAuth] } });
 
   // Cursor dynamic model discovery via @cursor/sdk's Cursor.models.list().
-  // Resolves CURSOR_API_KEY per-user (with config.yaml + env fallback) and
-  // falls back to composer-latest if no key is configured or the SDK call fails.
-  app.use('/cursor-models', createCursorModelsService(db));
+  // Resolves CURSOR_API_KEY through the shared scoped resolver and falls back
+  // to composer-latest if no key is configured or the SDK call fails.
+  app.use('/cursor-models', createCursorModelsService(db, providerContext));
   app.service('/cursor-models').hooks({ before: { find: [ctx.requireAuth] } });
 
   const branchRepository = new BranchRepository(db);
@@ -854,16 +860,19 @@ function createExecuteHandler(
       }
     }
 
-    // SDK spawn: scope per-tool credentials to the session's agentic_tool, so
-    // an Anthropic key on the user never leaks into a Codex/Gemini executor.
+    // SDK spawn gets only generic user environment plus the authoritative
+    // provider mode. The task-owner connection is resolved once at task time;
+    // using the request caller here would split endpoint ownership for queued
+    // or service-account initiated tasks.
     const executorEnv = await createUserProcessEnvironment(
       userId,
       db,
-      undefined,
+      {
+        [PROVIDER_RESOLUTION_MODE_ENV_VAR]: resolveMultiTenancyConfig(config).mode,
+      },
       !!executorUnixUser,
       gatewayEnv,
-      sessionId as SessionID,
-      session.agentic_tool
+      sessionId as SessionID
     );
 
     // Validate required user environment variables

@@ -1,6 +1,10 @@
-import { resolveApiKey } from '@agor/core/config';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolveApiKeyForTask } from './base-executor.js';
+import { PROVIDER_RESOLUTION_MODE_ENV_VAR, resolveApiKey } from '@agor/core/config';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  assertProviderAuthenticationBoundary,
+  installProviderConnectionSnapshot,
+  resolveApiKeyForTask,
+} from './base-executor.js';
 
 vi.mock('@agor/core/config', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@agor/core/config')>();
@@ -45,6 +49,7 @@ function makeSuccessfulClient(capture: { data?: unknown }) {
 describe('resolveApiKeyForTask', () => {
   beforeEach(() => {
     vi.mocked(resolveApiKey).mockReset();
+    delete process.env[PROVIDER_RESOLUTION_MODE_ENV_VAR];
   });
 
   it('sends the executor session token as explicit task-scoped proof', async () => {
@@ -100,6 +105,78 @@ describe('resolveApiKeyForTask', () => {
       )
     ).resolves.toMatchObject({ apiKey: 'local-key', source: 'env' });
 
-    expect(resolveApiKey).toHaveBeenCalledWith('OPENAI_API_KEY', {});
+    expect(resolveApiKey).toHaveBeenCalledWith('OPENAI_API_KEY', { mode: 'static' });
+  });
+
+  it('keeps hosted local fallback from enabling shared native authentication', async () => {
+    process.env[PROVIDER_RESOLUTION_MODE_ENV_VAR] = 'required_from_auth';
+    vi.mocked(resolveApiKey).mockReturnValue({
+      apiKey: undefined,
+      source: 'none',
+      useNativeAuth: false,
+    });
+
+    await expect(
+      resolveApiKeyForTask(
+        'OPENAI_API_KEY',
+        makeClient(new Error('fetch failed')),
+        'task-1' as never,
+        'codex' as never
+      )
+    ).resolves.toMatchObject({ source: 'none', useNativeAuth: false });
+
+    expect(resolveApiKey).toHaveBeenCalledWith('OPENAI_API_KEY', {
+      mode: 'required_from_auth',
+    });
+  });
+});
+
+describe('final provider authentication boundary', () => {
+  beforeEach(() => {
+    process.env.GH_TOKEN = 'shared-gh-canary';
+    process.env.GITHUB_TOKEN = 'shared-github-canary';
+    process.env.OPENAI_API_KEY = 'stale-key-canary';
+    process.env.OPENAI_BASE_URL = 'https://stale.invalid/v1';
+  });
+
+  afterEach(() => {
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_BASE_URL;
+  });
+
+  it('replaces inherited aliases with one key and endpoint snapshot', () => {
+    installProviderConnectionSnapshot({
+      OPENAI_API_KEY: 'task-owner-key',
+      OPENAI_BASE_URL: 'https://task-owner.invalid/v1',
+    });
+
+    expect(process.env.OPENAI_API_KEY).toBe('task-owner-key');
+    expect(process.env.OPENAI_BASE_URL).toBe('https://task-owner.invalid/v1');
+    expect(process.env.GH_TOKEN).toBeUndefined();
+    expect(process.env.GITHUB_TOKEN).toBeUndefined();
+  });
+
+  it('rejects hosted no-credential resolution before an SDK can discover HOME auth', () => {
+    expect(() => assertProviderAuthenticationBoundary('claude-code', {}, false)).toThrow(
+      /native authentication is disabled/
+    );
+    expect(() => assertProviderAuthenticationBoundary('codex', {}, false)).toThrow(
+      /native authentication is disabled/
+    );
+    expect(() => assertProviderAuthenticationBoundary('copilot', {}, false)).toThrow(
+      /native authentication is disabled/
+    );
+  });
+
+  it('allows a scoped Claude subscription token without enabling shared native auth', () => {
+    expect(() =>
+      assertProviderAuthenticationBoundary(
+        'claude-code',
+        { CLAUDE_CODE_OAUTH_TOKEN: 'scoped-oauth-canary' },
+        false
+      )
+    ).not.toThrow();
   });
 });

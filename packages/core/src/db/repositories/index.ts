@@ -19,6 +19,7 @@ export * from './groups';
 export * from './knowledge';
 export * from './mcp-servers';
 export * from './messages';
+export * from './provider-connections';
 export * from './repos';
 export * from './schedules';
 export * from './serialized-sessions';

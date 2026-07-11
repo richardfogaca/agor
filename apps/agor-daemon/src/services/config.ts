@@ -9,16 +9,21 @@ import {
   type AgorConfig,
   type ApiKeyName,
   loadConfig,
-  resolveApiKey,
+  type ProviderResolutionMode,
+  resolveProviderConnection,
+  resolveProviderCredentialStatus,
   saveConfig,
 } from '@agor/core/config';
-import type { TenantScopeAwareDatabase } from '@agor/core/db';
+import { ProviderConnectionRepository, type TenantScopeAwareDatabase } from '@agor/core/db';
 import { type Application, BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import {
+  type AgenticToolConfigField,
   type AgenticToolName,
   type AuthenticatedParams,
   type Params,
+  providerToolForField,
   type TaskID,
+  TENANT_PROVIDER_CONNECTION_FIELDS,
   TOOL_API_KEY_NAMES,
   type UserID,
 } from '@agor/core/types';
@@ -92,33 +97,6 @@ function getExecutorTokenPayload(params?: Params): ExecutorTokenPayload | undefi
 }
 
 /**
- * Mask API keys for secure display
- */
-function maskApiKey(key: string | undefined): string | undefined {
-  if (!key || typeof key !== 'string') return undefined;
-  if (key.length <= 10) return '***';
-  return `${key.substring(0, 10)}...`;
-}
-
-/**
- * Mask all credentials in config
- */
-function maskCredentials(config: AgorConfig): AgorConfig {
-  if (!config.credentials) return config;
-
-  return {
-    ...config,
-    credentials: {
-      ANTHROPIC_API_KEY: maskApiKey(config.credentials.ANTHROPIC_API_KEY),
-      ANTHROPIC_AUTH_TOKEN: maskApiKey(config.credentials.ANTHROPIC_AUTH_TOKEN),
-      ANTHROPIC_BASE_URL: config.credentials.ANTHROPIC_BASE_URL,
-      OPENAI_API_KEY: maskApiKey(config.credentials.OPENAI_API_KEY),
-      GEMINI_API_KEY: maskApiKey(config.credentials.GEMINI_API_KEY),
-    },
-  };
-}
-
-/**
  * Config service class
  */
 export class ConfigService {
@@ -126,38 +104,39 @@ export class ConfigService {
   /** App reference injected after registration for cross-service calls */
   app?: Application;
 
-  constructor(db: TenantScopeAwareDatabase) {
+  constructor(
+    db: TenantScopeAwareDatabase,
+    private providerContext: { mode: ProviderResolutionMode; config: AgorConfig } = {
+      mode: 'static',
+      config: {},
+    }
+  ) {
     this.db = db;
   }
 
-  /**
-   * Get full config (masked)
-   */
-  async find(_params?: Params): Promise<AgorConfig> {
+  private async safeFacade() {
     const config = await loadConfig();
-    return maskCredentials(config);
+    return {
+      credentials: await resolveProviderCredentialStatus(this.db, this.providerContext),
+      opencode: config.opencode,
+      onboarding: config.onboarding,
+    };
+  }
+
+  /** Public-safe compatibility view; never returns raw application config. */
+  async find(_params?: Params) {
+    return this.safeFacade();
   }
 
   /**
    * Get specific config section or value
    */
   async get(id: string, _params?: Params): Promise<unknown> {
-    const config = await loadConfig();
-    const masked = maskCredentials(config);
-
-    // Support dot notation (e.g., "credentials.ANTHROPIC_API_KEY")
-    const parts = id.split('.');
-    let value: unknown = masked;
-
-    for (const part of parts) {
-      if (value && typeof value === 'object' && part in value) {
-        value = (value as Record<string, unknown>)[part];
-      } else {
-        return undefined;
-      }
-    }
-
-    return value;
+    const facade = await this.safeFacade();
+    if (id === 'credentials') return facade.credentials;
+    if (id === 'opencode') return facade.opencode;
+    if (id === 'onboarding') return facade.onboarding;
+    throw new BadRequest('Unsupported configuration section');
   }
 
   /**
@@ -190,7 +169,9 @@ export class ConfigService {
     params?: Params
   ): Promise<{
     apiKey: string | null;
-    source: 'user' | 'config' | 'env' | 'native';
+    connection: import('@agor/core/types').ProviderConnection;
+    tool: import('@agor/core/types').ProviderConnectionTool;
+    source: 'user' | 'tenant' | 'config' | 'env' | 'none';
     useNativeAuth: boolean;
     decryptionFailed?: boolean;
   }> {
@@ -283,17 +264,26 @@ export class ConfigService {
       }
     }
 
-    // Use core resolveApiKey with database access
-    const result = await resolveApiKey(keyName, {
+    if (!tool) {
+      throw new BadRequest('Tool is required for provider connection resolution');
+    }
+
+    // Resolve exactly once for the task owner. The returned key and endpoint
+    // are one same-scope snapshot, so queued/service-account execution cannot
+    // combine spawn-caller state with task-owner state or observe two versions.
+    const result = await resolveProviderConnection(tool, {
       userId,
       db: this.db,
-      tool,
+      ...this.providerContext,
     });
+    const apiKey = (result.connection as Record<string, string | undefined>)[keyName];
 
     // Map KeyResolutionResult to service response type
     return {
-      apiKey: result.apiKey ?? null,
-      source: result.source === 'none' ? 'native' : result.source,
+      apiKey: apiKey ?? null,
+      connection: result.connection,
+      tool: result.tool,
+      source: result.source,
       useNativeAuth: result.useNativeAuth,
       ...(result.decryptionFailed && { decryptionFailed: true }),
     };
@@ -302,35 +292,55 @@ export class ConfigService {
   /**
    * Update config values
    *
-   * SECURITY: Only allow updating credentials and opencode sections from UI
+   * Provider credentials are tenant-owned database state. The two remaining
+   * compatibility sections retain their existing local YAML behavior.
    */
-  async patch(_id: null, data: Partial<AgorConfig>, _params?: Params): Promise<AgorConfig> {
+  async patch(_id: null, data: Partial<AgorConfig>, params?: Params) {
     // Log patch keys without values to avoid leaking secrets
     const patchSections = Object.keys(data);
     const credentialKeys = data.credentials ? Object.keys(data.credentials) : [];
     console.log(
       `[Config Service] Patch received: sections=[${patchSections}] credential_keys=[${credentialKeys}]`
     );
-    const config = await loadConfig();
-
-    // Only allow updating credentials section for security
-    if (data.credentials) {
-      // Initialize credentials if not present
-      if (!config.credentials) {
-        config.credentials = {};
-      }
-
-      // Update or delete credential keys
-      for (const [key, value] of Object.entries(data.credentials)) {
-        if (value === undefined || value === null) {
-          // Explicitly delete the key when value is undefined or null
-          delete config.credentials[key as keyof typeof config.credentials];
-        } else {
-          // Set the key
-          (config.credentials as Record<string, string>)[key] = value;
-        }
-      }
+    const unsupportedSections = patchSections.filter(
+      (section) => !['credentials', 'opencode', 'onboarding'].includes(section)
+    );
+    if (unsupportedSections.length > 0) {
+      throw new BadRequest('Unsupported configuration section');
     }
+
+    // Credentials are stored as one encrypted provider connection per tool in
+    // tenant-scoped app_variables. Never write them to YAML or process.env.
+    if (data.credentials) {
+      const repository = new ProviderConnectionRepository(this.db);
+      const updatedBy = (params as AuthenticatedParams | undefined)?.user?.user_id;
+      const updates: Partial<
+        Record<
+          import('@agor/core/types').ProviderConnectionTool,
+          Partial<Record<AgenticToolConfigField, string | null>>
+        >
+      > = {};
+      for (const [key, value] of Object.entries(data.credentials)) {
+        const field = key as AgenticToolConfigField;
+        const tool = providerToolForField(field);
+        if (
+          !tool ||
+          !(TENANT_PROVIDER_CONNECTION_FIELDS[tool] as readonly string[]).includes(field)
+        ) {
+          throw new BadRequest(`Unsupported provider credential field: ${key}`);
+        }
+        if (value !== null && value !== undefined && typeof value !== 'string') {
+          throw new BadRequest(`Provider credential field ${key} must be a string or null`);
+        }
+        updates[tool] = { ...updates[tool], [field]: value ?? null };
+      }
+      await repository.patch(updates, updatedBy);
+    }
+
+    const hasYamlPatch = data.opencode !== undefined || data.onboarding !== undefined;
+    if (!hasYamlPatch) return this.safeFacade();
+
+    const config = await loadConfig();
 
     // Allow updating opencode configuration
     if (data.opencode) {
@@ -370,28 +380,16 @@ export class ConfigService {
     await saveConfig(config);
     console.log('[Config Service] Config saved successfully');
 
-    // Propagate credentials to process.env for hot-reload
-    // Precedence rule: config.yaml (UI) > environment variables
-    if (data.credentials) {
-      for (const [key, value] of Object.entries(data.credentials)) {
-        if (value === undefined || value === null) {
-          // Delete from process.env if credential was cleared
-          delete process.env[key];
-        } else {
-          // Update process.env (UI takes precedence)
-          process.env[key] = value;
-        }
-      }
-    }
-
-    // Return masked config
-    return maskCredentials(config);
+    return this.safeFacade();
   }
 }
 
 /**
  * Service factory function
  */
-export function createConfigService(db: TenantScopeAwareDatabase): ConfigService {
-  return new ConfigService(db);
+export function createConfigService(
+  db: TenantScopeAwareDatabase,
+  providerContext?: { mode: ProviderResolutionMode; config: AgorConfig }
+): ConfigService {
+  return new ConfigService(db, providerContext);
 }

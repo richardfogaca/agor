@@ -716,6 +716,7 @@ export type ConfigCredentialKey =
   | 'ANTHROPIC_AUTH_TOKEN'
   | 'ANTHROPIC_BASE_URL'
   | 'OPENAI_API_KEY'
+  | 'OPENAI_BASE_URL'
   | 'GEMINI_API_KEY'
   | 'CURSOR_API_KEY';
 
@@ -724,6 +725,7 @@ const CONFIG_CREDENTIAL_KEYS: ReadonlySet<string> = new Set<ConfigCredentialKey>
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
   'GEMINI_API_KEY',
   'CURSOR_API_KEY',
 ]);

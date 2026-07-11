@@ -301,9 +301,14 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // for existing deployments).
   configureExecutor(config.execution);
 
-  initializeAnthropicApiKey(config, process.env.ANTHROPIC_API_KEY);
-  initializeAnthropicAuthToken(config, process.env.ANTHROPIC_AUTH_TOKEN);
-  initializeAnthropicBaseUrl(config, process.env.ANTHROPIC_BASE_URL);
+  // Static mode preserves the local/single-tenant config→environment bridge.
+  // Auth-resolved hosted tenants must resolve connections from tenant/user DB
+  // state and never copy a YAML credential into the shared daemon process.
+  if (multiTenancy.mode === 'static') {
+    initializeAnthropicApiKey(config, process.env.ANTHROPIC_API_KEY);
+    initializeAnthropicAuthToken(config, process.env.ANTHROPIC_AUTH_TOKEN);
+    initializeAnthropicBaseUrl(config, process.env.ANTHROPIC_BASE_URL);
+  }
 
   // --------------------------------------------------------------------------
   // Create Feathers app + Express middleware

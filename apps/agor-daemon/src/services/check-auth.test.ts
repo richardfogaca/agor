@@ -1,5 +1,5 @@
 import { promises as fsPromises } from 'node:fs';
-import { resolveApiKey, resolveUserEnvironment } from '@agor/core/config';
+import { resolveProviderConnection } from '@agor/core/config';
 import { Claude } from '@agor/core/sdk';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCheckAuthService } from './check-auth';
@@ -8,8 +8,7 @@ vi.mock('@agor/core/config', async () => {
   const actual = await vi.importActual<typeof import('@agor/core/config')>('@agor/core/config');
   return {
     ...actual,
-    resolveApiKey: vi.fn(),
-    resolveUserEnvironment: vi.fn(),
+    resolveProviderConnection: vi.fn(),
   };
 });
 
@@ -23,8 +22,7 @@ vi.mock('node:fs', () => ({
   promises: { readFile: vi.fn() },
 }));
 
-const resolveApiKeyMock = vi.mocked(resolveApiKey);
-const resolveUserEnvironmentMock = vi.mocked(resolveUserEnvironment);
+const resolveProviderConnectionMock = vi.mocked(resolveProviderConnection);
 const claudeQueryMock = vi.mocked(Claude.query);
 const readFileMock = vi.mocked(fsPromises.readFile);
 
@@ -50,8 +48,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
   delete process.env.ANTHROPIC_API_KEY;
-  resolveUserEnvironmentMock.mockResolvedValue({});
-  resolveApiKeyMock.mockResolvedValue({ apiKey: undefined, source: 'none', useNativeAuth: true });
+  resolveProviderConnectionMock.mockImplementation(async (tool) => ({
+    tool: tool === 'claude-code-cli' ? 'claude-code' : (tool as never),
+    connection: {},
+    source: 'none',
+    useNativeAuth: true,
+  }));
   readFileMock.mockRejectedValue(new Error('ENOENT'));
 });
 
@@ -73,17 +75,16 @@ describe('check-auth Claude subscription tokens', () => {
       })
     );
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
-    expect(resolveApiKeyMock).not.toHaveBeenCalled();
+    expect(resolveProviderConnectionMock).not.toHaveBeenCalled();
   });
 
   it('checks stored CLAUDE_CODE_OAUTH_TOKEN when no Anthropic API key is configured', async () => {
-    resolveApiKeyMock
-      .mockResolvedValueOnce({ apiKey: undefined, source: 'none', useNativeAuth: true })
-      .mockResolvedValueOnce({
-        apiKey: 'sk-ant-oat01-stored',
-        source: 'user',
-        useNativeAuth: false,
-      });
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'claude-code',
+      connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-stored' },
+      source: 'user',
+      useNativeAuth: false,
+    });
     mockClaudeAccount({ tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN' });
 
     const result = await service().create({ tool: 'claude-code' }, {
@@ -99,21 +100,21 @@ describe('check-auth Claude subscription tokens', () => {
       })
     );
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
-    expect(resolveApiKeyMock).toHaveBeenNthCalledWith(1, 'ANTHROPIC_API_KEY', {
+    expect(resolveProviderConnectionMock).toHaveBeenCalledWith('claude-code', {
       userId: 'user-1',
       db: {},
-      tool: 'claude-code',
-    });
-    expect(resolveApiKeyMock).toHaveBeenNthCalledWith(2, 'CLAUDE_CODE_OAUTH_TOKEN', {
-      userId: 'user-1',
-      db: {},
-      tool: 'claude-code',
+      mode: 'static',
+      config: {},
     });
   });
 
   it('validates an Anthropic API key stored as a user env var', async () => {
-    resolveApiKeyMock.mockResolvedValue({ apiKey: undefined, source: 'none', useNativeAuth: true });
-    resolveUserEnvironmentMock.mockResolvedValue({ ANTHROPIC_API_KEY: 'sk-ant-api03-env' });
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'claude-code',
+      connection: { ANTHROPIC_API_KEY: 'sk-ant-api03-env' },
+      source: 'user',
+      useNativeAuth: false,
+    });
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true } as Response);
 
     const result = await service().create({ tool: 'claude-code' }, {
@@ -121,7 +122,12 @@ describe('check-auth Claude subscription tokens', () => {
     } as never);
 
     expect(result).toMatchObject({ authenticated: true, method: 'api-key' });
-    expect(resolveUserEnvironmentMock).toHaveBeenCalledWith('user-1', {}, { tool: 'claude-code' });
+    expect(resolveProviderConnectionMock).toHaveBeenCalledWith('claude-code', {
+      userId: 'user-1',
+      db: {},
+      mode: 'static',
+      config: {},
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       'https://api.anthropic.com/v1/models',
       expect.objectContaining({
@@ -132,11 +138,11 @@ describe('check-auth Claude subscription tokens', () => {
   });
 
   it('validates a Claude subscription token stored as a user env var', async () => {
-    resolveApiKeyMock
-      .mockResolvedValueOnce({ apiKey: undefined, source: 'none', useNativeAuth: true })
-      .mockResolvedValueOnce({ apiKey: undefined, source: 'none', useNativeAuth: true });
-    resolveUserEnvironmentMock.mockResolvedValue({
-      CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-env',
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'claude-code',
+      connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-env' },
+      source: 'user',
+      useNativeAuth: false,
     });
     mockClaudeAccount({ tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN' });
 
@@ -153,7 +159,12 @@ describe('check-auth Claude subscription tokens', () => {
       })
     );
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
-    expect(resolveUserEnvironmentMock).toHaveBeenCalledWith('user-1', {}, { tool: 'claude-code' });
+    expect(resolveProviderConnectionMock).toHaveBeenCalledWith('claude-code', {
+      userId: 'user-1',
+      db: {},
+      mode: 'static',
+      config: {},
+    });
   });
 });
 
@@ -162,7 +173,12 @@ describe('check-auth tri-state', () => {
   const params = { user: { user_id: 'user-1' } } as never;
 
   it('claude stored API key rejected with 401 → unauthenticated', async () => {
-    resolveApiKeyMock.mockResolvedValue({ apiKey: 'sk-bad', source: 'user', useNativeAuth: false });
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'claude-code',
+      connection: { ANTHROPIC_API_KEY: 'sk-bad' },
+      source: 'user',
+      useNativeAuth: false,
+    });
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue({ ok: false, status: 401 } as Response);
@@ -173,8 +189,9 @@ describe('check-auth tri-state', () => {
   });
 
   it('claude API key check that times out / errors → unknown (not proof of no auth)', async () => {
-    resolveApiKeyMock.mockResolvedValue({
-      apiKey: 'sk-maybe',
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'claude-code',
+      connection: { ANTHROPIC_API_KEY: 'sk-maybe' },
       source: 'user',
       useNativeAuth: false,
     });
@@ -186,8 +203,9 @@ describe('check-auth tri-state', () => {
   });
 
   it('claude provider 5xx → unknown', async () => {
-    resolveApiKeyMock.mockResolvedValue({
-      apiKey: 'sk-maybe',
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'claude-code',
+      connection: { ANTHROPIC_API_KEY: 'sk-maybe' },
       source: 'user',
       useNativeAuth: false,
     });
@@ -218,13 +236,44 @@ describe('check-auth tri-state', () => {
   });
 
   it('gemini with a valid API key → authenticated', async () => {
-    resolveApiKeyMock.mockResolvedValue({ apiKey: 'g-key', source: 'user', useNativeAuth: false });
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'gemini',
+      connection: { GEMINI_API_KEY: 'g-key' },
+      source: 'user',
+      useNativeAuth: false,
+    });
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue({ ok: true, status: 200 } as Response);
 
     const result = await service().create({ tool: 'gemini' }, params);
     expect(result.status).toBe('authenticated');
+    fetchMock.mockRestore();
+  });
+
+  it('validates a stored key against the endpoint from the same resolved connection', async () => {
+    resolveProviderConnectionMock.mockResolvedValue({
+      tool: 'codex',
+      connection: {
+        OPENAI_API_KEY: 'tenant-a-key-canary',
+        OPENAI_BASE_URL: 'https://tenant-a-provider.invalid/v1',
+      },
+      source: 'tenant',
+      useNativeAuth: false,
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue({ ok: true, status: 200 } as Response);
+
+    const result = await service().create({ tool: 'codex' }, params);
+
+    expect(result.status).toBe('authenticated');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://tenant-a-provider.invalid/v1/models',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer tenant-a-key-canary' }),
+      })
+    );
     fetchMock.mockRestore();
   });
 

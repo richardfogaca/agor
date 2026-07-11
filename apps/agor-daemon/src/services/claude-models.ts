@@ -6,7 +6,11 @@
  * AVAILABLE_CLAUDE_MODEL_ALIASES when no API key is configured or the call fails.
  */
 
-import { resolveApiKey } from '@agor/core/config';
+import {
+  type AgorConfig,
+  type ProviderResolutionMode,
+  resolveProviderConnection,
+} from '@agor/core/config';
 import { shortId, type TenantScopeAwareDatabase } from '@agor/core/db';
 import { AVAILABLE_CLAUDE_MODEL_ALIASES, DEFAULT_CLAUDE_MODEL } from '@agor/core/models';
 import type { Params, UserID } from '@agor/core/types';
@@ -110,17 +114,24 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 }
 
 export class ClaudeModelsService {
-  constructor(private db: TenantScopeAwareDatabase) {}
+  constructor(
+    private db: TenantScopeAwareDatabase,
+    private providerContext: { mode: ProviderResolutionMode; config: AgorConfig } = {
+      mode: 'static',
+      config: {},
+    }
+  ) {}
 
   async find(params?: AuthenticatedParams): Promise<ClaudeModelsResult> {
     const userId = params?.user?.user_id;
-    const resolution = await resolveApiKey('ANTHROPIC_API_KEY', {
+    const resolution = await resolveProviderConnection('claude-code', {
       userId,
       db: this.db,
-      tool: 'claude-code',
+      ...this.providerContext,
     });
+    const apiKey = resolution.connection.ANTHROPIC_API_KEY;
 
-    if (!resolution.apiKey) {
+    if (!apiKey) {
       console.log(
         `[Claude Models] No Anthropic API key for user ${userId ? shortId(userId) : 'unknown'} — returning static list`
       );
@@ -128,7 +139,12 @@ export class ClaudeModelsService {
     }
 
     try {
-      const client = new Anthropic({ apiKey: resolution.apiKey });
+      const client = new Anthropic({
+        apiKey,
+        ...(resolution.connection.ANTHROPIC_BASE_URL
+          ? { baseURL: resolution.connection.ANTHROPIC_BASE_URL }
+          : {}),
+      });
       // Pass the 1M beta so eligible models report their extended
       // max_input_tokens — used to derive [1m] variants dynamically.
       const page = await withTimeout(
@@ -166,6 +182,9 @@ export class ClaudeModelsService {
   }
 }
 
-export function createClaudeModelsService(db: TenantScopeAwareDatabase): ClaudeModelsService {
-  return new ClaudeModelsService(db);
+export function createClaudeModelsService(
+  db: TenantScopeAwareDatabase,
+  providerContext?: { mode: ProviderResolutionMode; config: AgorConfig }
+): ClaudeModelsService {
+  return new ClaudeModelsService(db, providerContext);
 }

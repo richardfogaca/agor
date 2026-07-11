@@ -20,6 +20,7 @@ export * from './knowledge';
 export * from './mcp';
 export * from './message';
 export * from './presence';
+export * from './provider-connection';
 export * from './repo';
 export * from './report';
 export * from './schedule';

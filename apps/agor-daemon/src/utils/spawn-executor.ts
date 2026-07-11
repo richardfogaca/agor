@@ -25,7 +25,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AgorExecutionSettings } from '@agor/core/config';
+import { type AgorExecutionSettings, stripProviderCredentialEnvironment } from '@agor/core/config';
 import type { AuthenticatedParams } from '@agor/core/types';
 import {
   attachEnvFileCleanup,
@@ -39,6 +39,10 @@ import { issueRuntimeToken } from '../auth/runtime-tokens.js';
 import { withResolvedConfig } from './build-resolved-config-slice.js';
 
 let configuredDaemonUrl: string | null = null;
+
+function defaultExecutorEnv(): Record<string, string> {
+  return stripProviderCredentialEnvironment(process.env);
+}
 
 function resolveExecutorLogLevel(env: Record<string, string>): string {
   return env.LOG_LEVEL || getCurrentLogLevel();
@@ -244,7 +248,7 @@ export function spawnExecutor(
         command: payloadWithConfig.command as string,
         task_id: generateTaskId(),
         unix_user: asUser,
-        log_level: resolveExecutorLogLevel(options.env ?? (process.env as Record<string, string>)),
+        log_level: resolveExecutorLogLevel(options.env ?? defaultExecutorEnv()),
         ...templateVariables,
       },
       logPrefix,
@@ -268,7 +272,7 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
 
   const {
     cwd = executorDir,
-    env = process.env as Record<string, string>,
+    env = defaultExecutorEnv(),
     logPrefix = '[Executor]',
     asUser: rawAsUser,
     onSpawn,
@@ -428,7 +432,7 @@ function spawnExecutorWithTemplate(
   };
 
   const executorProcess = spawn('sh', ['-c', command], {
-    env: { ...process.env, LOG_LEVEL: logLevel },
+    env: { ...(options.env ?? defaultExecutorEnv()), LOG_LEVEL: logLevel },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -540,7 +544,7 @@ export async function runExecutorCommand(
         command: payloadWithConfig.command as string,
         task_id: generateTaskId(),
         unix_user: asUser,
-        log_level: resolveExecutorLogLevel(options.env ?? (process.env as Record<string, string>)),
+        log_level: resolveExecutorLogLevel(options.env ?? defaultExecutorEnv()),
         ...templateVariables,
       },
       logPrefix,
@@ -559,7 +563,7 @@ function runExecutorCommandLocal(
 
   const {
     cwd = executorDir,
-    env = process.env as Record<string, string>,
+    env = defaultExecutorEnv(),
     logPrefix = '[Executor]',
     asUser: rawAsUser,
     preparedEnv,
@@ -728,7 +732,7 @@ function runExecutorCommandWithTemplate(
     let settled = false;
 
     const child = spawn('sh', ['-c', command], {
-      env: { ...process.env, LOG_LEVEL: logLevel },
+      env: { ...(options.env ?? defaultExecutorEnv()), LOG_LEVEL: logLevel },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 

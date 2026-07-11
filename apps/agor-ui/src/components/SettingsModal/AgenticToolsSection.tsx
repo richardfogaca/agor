@@ -9,7 +9,7 @@ import type {
   AgenticToolConfigField,
   AgenticToolName,
   AgorClient,
-  AgorConfig,
+  ProviderCredentialStatus,
 } from '@agor-live/client';
 import {
   CheckCircleOutlined,
@@ -32,8 +32,15 @@ export interface AgenticToolsSectionProps {
   client: AgorClient | null;
 }
 
+export function configuredFieldFromPatchResponse(
+  response: { credentials?: ProviderCredentialStatus },
+  field: AgenticToolConfigField
+): boolean {
+  return response.credentials?.[field]?.configured === true;
+}
+
 /**
- * Field set rendered at the global/admin config level. This is a strict
+ * Field set rendered at the tenant-admin config level. This is a strict
  * subset of the per-user `TOOL_FIELD_CONFIGS` — fields that don't make sense
  * globally (e.g. `CLAUDE_CODE_OAUTH_TOKEN` is a per-user Pro/Max subscription
  * token) are filtered out.
@@ -47,17 +54,14 @@ const GLOBAL_TOOL_FIELDS: Record<AgenticToolName, AgenticToolFieldConfig[]> = {
   'claude-code-cli': TOOL_FIELD_CONFIGS['claude-code-cli'].filter(
     (f) => f.field !== 'CLAUDE_CODE_OAUTH_TOKEN'
   ),
-  // OPENAI_BASE_URL is per-user only: in multiplayer Agor instances hosting
-  // multiple companies, a global override would silently route every user's
-  // Codex traffic through one tenant's endpoint. Each user sets their own.
-  codex: TOOL_FIELD_CONFIGS.codex.filter((f) => f.field !== 'OPENAI_BASE_URL'),
+  codex: TOOL_FIELD_CONFIGS.codex,
   gemini: TOOL_FIELD_CONFIGS.gemini,
   copilot: TOOL_FIELD_CONFIGS.copilot,
   cursor: TOOL_FIELD_CONFIGS.cursor,
   opencode: TOOL_FIELD_CONFIGS.opencode,
 };
 
-/** Per-tool global-config tab body. */
+/** Per-tool tenant-default tab body. */
 const ApiKeyTabContent: React.FC<{
   tool: AgenticToolName;
   fieldStatus: FieldStatus;
@@ -74,8 +78,9 @@ const ApiKeyTabContent: React.FC<{
       <Alert
         title={
           <span>
-            This is the <strong>global API key</strong> fallback for users without their own
-            credentials. CLI login alternatives are configured on the machine Agor runs sessions on.{' '}
+            This is the <strong>tenant provider connection</strong> used when a user has not
+            configured their own connection. Hosted tenants do not inherit credentials or native
+            logins from the daemon.{' '}
             <a
               href="https://agor.live/guide/extended-install#authentication"
               target="_blank"
@@ -118,7 +123,7 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
   const { token } = theme.useToken();
   const { showSuccess, showError } = useThemedMessage();
 
-  // Shared API keys state. `fieldStatus` is a flat env-var → set/unset map;
+  // Tenant provider connection state. `fieldStatus` is a flat env-var → set/unset map;
   // each per-tool tab projects out only the fields it owns via
   // `GLOBAL_TOOL_FIELDS[tool]`.
   const [loadingKeys, setLoadingKeys] = useState(true);
@@ -145,18 +150,18 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
         setLoadingKeys(true);
         setKeysError(null);
 
-        const config = (await client.service('config').get('credentials')) as
-          | AgorConfig['credentials']
-          | undefined;
+        const config = (await client
+          .service('config')
+          .get('credentials')) as ProviderCredentialStatus;
 
-        // Project the YAML credentials blob into a flat env-var → boolean
+        // Project the presence-only credential status into a flat env-var → boolean
         // map. We deliberately walk the union of all global tool fields
         // (rather than enumerating each one inline) so adding a new field
         // to GLOBAL_TOOL_FIELDS auto-propagates here.
         const next: FieldStatus = {};
         for (const fields of Object.values(GLOBAL_TOOL_FIELDS)) {
           for (const { field } of fields) {
-            next[field] = !!(config as Record<string, unknown> | undefined)?.[field];
+            next[field] = config?.[field]?.configured === true;
           }
         }
         setFieldStatus(next);
@@ -206,13 +211,16 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
       setSavingKeys((prev) => ({ ...prev, [field]: true }));
       setKeysError(null);
 
-      await client.service('config').patch(null, {
+      const response = (await client.service('config').patch(null, {
         credentials: {
           [field]: value,
         },
-      });
+      })) as { credentials?: ProviderCredentialStatus };
 
-      setFieldStatus((prev) => ({ ...prev, [field]: true }));
+      setFieldStatus((prev) => ({
+        ...prev,
+        [field]: configuredFieldFromPatchResponse(response, field),
+      }));
     } catch (err) {
       console.error(`Failed to save ${field}:`, err);
       setKeysError(err instanceof Error ? err.message : `Failed to save ${field}`);
@@ -230,13 +238,19 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
       setSavingKeys((prev) => ({ ...prev, [field]: true }));
       setKeysError(null);
 
-      await client.service('config').patch(null, {
+      const response = (await client.service('config').patch(null, {
         credentials: {
           [field]: null,
         },
-      });
+      })) as { credentials?: ProviderCredentialStatus };
 
-      setFieldStatus((prev) => ({ ...prev, [field]: false }));
+      // Clearing a tenant override can reveal an intentional static-instance
+      // fallback. Reflect the authoritative presence/source response instead
+      // of forcing a transient false state until reload.
+      setFieldStatus((prev) => ({
+        ...prev,
+        [field]: configuredFieldFromPatchResponse(response, field),
+      }));
     } catch (err) {
       console.error(`Failed to clear ${field}:`, err);
       setKeysError(err instanceof Error ? err.message : `Failed to clear ${field}`);

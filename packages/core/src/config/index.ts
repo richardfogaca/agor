@@ -15,6 +15,7 @@ export * from './env-vars';
 export * from './executor-heartbeat';
 export * from './key-resolver';
 export * from './multitenancy';
+export * from './provider-connection-resolver';
 export type { ProxyMethod, ResolvedProxy } from './proxies-resolver';
 export { resolveProxies } from './proxies-resolver';
 export * from './repo-list';

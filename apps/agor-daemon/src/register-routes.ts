@@ -944,15 +944,26 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         };
         const cwd = branch?.path;
         if (!cwd) throw new Error('Branch has no path; cannot restart');
-        const { buildSpawnConfigForSession, writeClaudeCliMcpConfigForSession } = await import(
-          './services/claude-cli-integration.js'
-        );
+        const {
+          buildSpawnConfigForSession,
+          resolveClaudeCliProviderSpawn,
+          writeClaudeCliMcpConfigForSession,
+        } = await import('./services/claude-cli-integration.js');
         const { buildClaudeCliSpawn } = await import('@agor/core/claude-cli');
         const mcpConfigPath = await writeClaudeCliMcpConfigForSession(app, session, {
           actor: params.user ?? null,
         });
         const spawnCfg = buildSpawnConfigForSession(session, cwd, { mcpConfigPath });
-        const built = buildClaudeCliSpawn(spawnCfg);
+        const built = await resolveClaudeCliProviderSpawn(
+          app,
+          session,
+          buildClaudeCliSpawn(spawnCfg)
+        );
+        if (!built) {
+          throw new Error(
+            'No scoped Claude credential is configured and native authentication is disabled'
+          );
+        }
         if (app.io) {
           app.io.to(channel).emit('terminal:tab', {
             userId: targetUserId,
@@ -3657,18 +3668,24 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             false,
           frameworkRepoUrl: config.onboarding?.frameworkRepoUrl,
           systemCredentials: {
-            ANTHROPIC_API_KEY: !!(
-              config.credentials?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY
-            ),
-            ANTHROPIC_AUTH_TOKEN: !!(
-              config.credentials?.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN
-            ),
-            ANTHROPIC_BASE_URL: !!(
-              config.credentials?.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL
-            ),
-            OPENAI_API_KEY: !!(config.credentials?.OPENAI_API_KEY || process.env.OPENAI_API_KEY),
-            GEMINI_API_KEY: !!(config.credentials?.GEMINI_API_KEY || process.env.GEMINI_API_KEY),
-            CURSOR_API_KEY: !!(config.credentials?.CURSOR_API_KEY || process.env.CURSOR_API_KEY),
+            ANTHROPIC_API_KEY:
+              multiTenancy.mode === 'static' &&
+              !!(config.credentials?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY),
+            ANTHROPIC_AUTH_TOKEN:
+              multiTenancy.mode === 'static' &&
+              !!(config.credentials?.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN),
+            ANTHROPIC_BASE_URL:
+              multiTenancy.mode === 'static' &&
+              !!(config.credentials?.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL),
+            OPENAI_API_KEY:
+              multiTenancy.mode === 'static' &&
+              !!(config.credentials?.OPENAI_API_KEY || process.env.OPENAI_API_KEY),
+            GEMINI_API_KEY:
+              multiTenancy.mode === 'static' &&
+              !!(config.credentials?.GEMINI_API_KEY || process.env.GEMINI_API_KEY),
+            CURSOR_API_KEY:
+              multiTenancy.mode === 'static' &&
+              !!(config.credentials?.CURSOR_API_KEY || process.env.CURSOR_API_KEY),
           },
         },
         services: servicesConfig,

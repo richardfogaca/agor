@@ -111,7 +111,7 @@ describe('resolveUserEnvironment — scope filtering (v0.5)', () => {
     });
 
     const env = await resolveUserEnvironment(userId, db);
-    expect(env.GITHUB_TOKEN).toBe('gh-secret');
+    expect(env.GITHUB_TOKEN).toBeUndefined();
   });
 
   dbTest('session-scope vars are EXCLUDED when no sessionId is provided', async ({ db }) => {
@@ -149,7 +149,7 @@ describe('resolveUserEnvironment — scope filtering (v0.5)', () => {
     const env = await resolveUserEnvironment(userId, db, { sessionId });
     expect(env.SESSION_ONLY).toBe('session-secret');
     expect(env.OTHER_SESSION).toBeUndefined();
-    expect(env.GITHUB_TOKEN).toBe('gh'); // global still included
+    expect(env.GITHUB_TOKEN).toBeUndefined(); // provider alias stays out of generic children
   });
 
   dbTest('reserved-for-v1 scope values are skipped', async ({ db }) => {
@@ -340,9 +340,44 @@ describe('resolveUserEnvironment — per-tool credential scoping', () => {
     const envWithTool = await resolveUserEnvironment(userId, db, { tool: 'claude-code' });
     expect(envWithTool.ANTHROPIC_API_KEY).toBe('tool-specific');
 
-    // Without `tool`, the global env var still wins (no tool merge happens).
+    // Without `tool`, provider credentials are excluded from generic child
+    // environments (terminals, managed commands, git helpers).
     const envNoTool = await resolveUserEnvironment(userId, db);
-    expect(envNoTool.ANTHROPIC_API_KEY).toBe('global-fallback');
+    expect(envNoTool.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  dbTest('generic child inputs cannot override or inject a provider connection', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+
+    const codexEnv = await createUserProcessEnvironment(
+      userId,
+      db,
+      {
+        OPENAI_API_KEY: 'additional-canary-must-not-win',
+        ANTHROPIC_API_KEY: 'unrelated-additional-canary',
+      },
+      false,
+      [
+        {
+          key: 'OPENAI_BASE_URL',
+          value: 'https://gateway-canary.invalid/v1',
+          forceOverride: true,
+        },
+      ],
+      undefined,
+      'codex'
+    );
+
+    expect(codexEnv.OPENAI_API_KEY).toBe('openai-key');
+    expect(codexEnv.OPENAI_BASE_URL).toBe('https://codex-gateway.example.com/v1');
+    expect(JSON.stringify(codexEnv)).not.toContain('additional-canary');
+    expect(JSON.stringify(codexEnv)).not.toContain('gateway-canary');
+    expect(codexEnv.ANTHROPIC_API_KEY).toBeUndefined();
+
+    const genericEnv = await createUserProcessEnvironment(userId, db, {
+      OPENAI_API_KEY: 'generic-child-canary',
+    });
+    expect(JSON.stringify(genericEnv)).not.toContain('generic-child-canary');
   });
 });
 

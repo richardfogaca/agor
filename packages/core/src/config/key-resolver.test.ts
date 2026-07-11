@@ -59,8 +59,8 @@ describe('resolveApiKey — per-tool credential scoping', () => {
     expect(codexResult.source).toBe('user');
 
     // Codex asking for ANTHROPIC_API_KEY: scoped to its own bucket → NOT found
-    // even though the user has one stored under claude-code. (Falls through to
-    // env/native auth → useNativeAuth=true since no env/config is set in this test.)
+    // even though the user has one stored under claude-code. A mismatched tool/
+    // key request fails closed instead of falling through to shared native auth.
     const codexAnthropic = await resolveApiKey('ANTHROPIC_API_KEY', {
       userId,
       db,
@@ -68,7 +68,7 @@ describe('resolveApiKey — per-tool credential scoping', () => {
     });
     expect(codexAnthropic.apiKey).toBeUndefined();
     expect(codexAnthropic.source).toBe('none');
-    expect(codexAnthropic.useNativeAuth).toBe(true);
+    expect(codexAnthropic.useNativeAuth).toBe(false);
   });
 
   dbTest('omitting tool falls back to cross-bucket sweep (back-compat)', async ({ db }) => {
