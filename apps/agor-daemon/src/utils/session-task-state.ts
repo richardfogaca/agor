@@ -1,13 +1,13 @@
 import type { Params, Session, Task } from '@agor/core/types';
 import {
-  isTerminalTaskStatus,
+  isTaskTurnHolding,
   SessionStatus,
   sessionCanStartTask,
   TaskStatus,
 } from '@agor/core/types';
 
 export function isTaskBlockingPrompt(task: Task): boolean {
-  return task.status !== TaskStatus.QUEUED && !isTerminalTaskStatus(task.status);
+  return task.status === TaskStatus.CREATED || isTaskTurnHolding(task);
 }
 
 export { sessionCanStartTask };

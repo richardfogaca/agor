@@ -1,9 +1,14 @@
 import type { ResolvedExecutorHeartbeatConfig } from '@agor/core/config';
 import { shortId } from '@agor/core/db';
+import { isTerminalTaskStatus, TaskStatus } from '@agor/core/types';
 import type { Application, TasksServiceImpl } from '../declarations.js';
+import { hasExecutorProcess, killExecutorProcess } from '../executor-tracking.js';
 
 export const EXECUTOR_HEARTBEAT_LOST_MESSAGE =
   'Executor heartbeat lost; the executor may have crashed or disconnected.';
+export const EXECUTOR_DISPATCH_TIMEOUT_MESSAGE =
+  'Executor did not connect before the dispatch deadline.';
+const MAX_SUPERVISOR_TICK_MS = 30_000;
 
 export interface ExecutorHeartbeatSupervisorOptions {
   app: Application;
@@ -19,7 +24,8 @@ export class ExecutorHeartbeatSupervisor {
   private readonly now: () => Date;
 
   constructor(private options: ExecutorHeartbeatSupervisorOptions) {
-    this.tickIntervalMs = options.tickIntervalMs ?? Math.min(options.config.interval_ms, 30_000);
+    this.tickIntervalMs =
+      options.tickIntervalMs ?? Math.min(options.config.interval_ms, MAX_SUPERVISOR_TICK_MS);
     this.now = options.now ?? (() => new Date());
   }
 
@@ -41,27 +47,79 @@ export class ExecutorHeartbeatSupervisor {
     this.running = true;
     try {
       const tasksService = this.options.app.service('tasks') as unknown as TasksServiceImpl;
-      const tasks = await tasksService.getActiveWithExecutorHeartbeat();
+      const tasks = await tasksService.getOrphaned();
       const nowMs = this.now().getTime();
       for (const task of tasks) {
-        if (!task.last_executor_heartbeat_at) continue;
-        const heartbeatMs = new Date(task.last_executor_heartbeat_at).getTime();
-        if (!Number.isFinite(heartbeatMs)) continue;
-        if (nowMs - heartbeatMs <= this.options.config.stale_after_ms) continue;
+        const attempt = task.executor_attempt;
+        if (!attempt || attempt.released_at) continue;
+        if (isTerminalTaskStatus(task.status)) {
+          if (!hasExecutorProcess(task.session_id)) {
+            await tasksService.releaseExecutorTurn(
+              { task_id: task.task_id, executor_attempt_id: attempt.id },
+              undefined
+            );
+          }
+          continue;
+        }
+
+        const observedAt =
+          task.last_executor_heartbeat_at ??
+          task.executor_connected_at ??
+          task.started_at ??
+          task.created_at;
+        const observedMs = new Date(observedAt).getTime();
+        if (!Number.isFinite(observedMs)) continue;
+        if (nowMs - observedMs <= this.options.config.stale_after_ms) continue;
 
         try {
           const current = await this.options.app.service('tasks').get(task.task_id);
-          if (current.status !== task.status || !current.last_executor_heartbeat_at) continue;
-          const currentHeartbeatMs = new Date(current.last_executor_heartbeat_at).getTime();
-          if (!Number.isFinite(currentHeartbeatMs)) continue;
-          if (nowMs - currentHeartbeatMs <= this.options.config.stale_after_ms) continue;
+          if (
+            current.status !== task.status ||
+            current.executor_attempt?.id !== attempt.id ||
+            current.executor_attempt.released_at
+          ) {
+            continue;
+          }
+          const currentObservedMs = new Date(
+            current.last_executor_heartbeat_at ??
+              current.executor_connected_at ??
+              current.started_at ??
+              current.created_at
+          ).getTime();
+          if (
+            !Number.isFinite(currentObservedMs) ||
+            nowMs - currentObservedMs <= this.options.config.stale_after_ms
+          ) {
+            continue;
+          }
 
-          await tasksService.failForLostHeartbeat(task.task_id, {
-            completed_at: this.now().toISOString(),
-            error_message: EXECUTOR_HEARTBEAT_LOST_MESSAGE,
-          });
+          if (task.status === TaskStatus.STOPPING) {
+            await tasksService.patch(
+              task.task_id,
+              { status: TaskStatus.STOPPED, completed_at: this.now().toISOString() },
+              {
+                suppressTerminalQueueProcessing: true,
+                suppressCompletionCallbacks: true,
+              }
+            );
+          } else {
+            await tasksService.failForLostHeartbeat(task.task_id, {
+              completed_at: this.now().toISOString(),
+              error_message:
+                task.status === TaskStatus.DISPATCHING
+                  ? EXECUTOR_DISPATCH_TIMEOUT_MESSAGE
+                  : EXECUTOR_HEARTBEAT_LOST_MESSAGE,
+            });
+          }
+          const killed = killExecutorProcess(task.session_id);
+          if (!killed) {
+            await tasksService.releaseExecutorTurn({
+              task_id: task.task_id,
+              executor_attempt_id: attempt.id,
+            });
+          }
           console.warn(
-            `[executor-heartbeat] Marked task ${shortId(task.task_id)} failed after stale heartbeat (${nowMs - currentHeartbeatMs}ms old)`
+            `[executor-heartbeat] Reconciled stale task ${shortId(task.task_id)} (${nowMs - observedMs}ms old)`
           );
         } catch (error) {
           console.warn(

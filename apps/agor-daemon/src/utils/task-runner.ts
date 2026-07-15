@@ -3,17 +3,12 @@
  *
  * Used by `POST /tasks/:id/run` (the pure-REST executor trigger added for
  * issue #1118). Sits one level above `spawnTaskExecutor` — the canonical
- * "transition created/queued → running and fork the executor" primitive in
+ * "admit created/queued work and fork the executor" primitive in
  * `register-routes.ts` — and adds a status revalidation step to defend
  * against patches landing between the route's initial check and the spawn
  * handoff.
  *
- * Mutual exclusion across concurrent callers is handled by
- * `withSessionTurnLock` (see `session-turn-lock.ts`), wrapped around this
- * call by the route handler. Keeping the lock concern in the route lets the
- * same session-level lock cover both `/tasks/:id/run` and
- * `/sessions/:id/prompt`, closing the cross-route race that a per-task
- * lock would miss.
+ * Admission and mutual exclusion are owned by TaskRepository.
  */
 
 import { shortId } from '@agor/core/db';
@@ -42,9 +37,7 @@ export interface RunExistingTaskDeps {
 
 /**
  * Re-fetch a task, verify it's still in `created` state, and hand off to
- * the spawn function. Caller is responsible for any session-level locking
- * (see `withSessionTurnLock`) — this helper only concerns itself with task
- * state.
+ * the spawn function.
  *
  * Throws:
  *   - `NotFound` if the task disappeared between the route's lookup and

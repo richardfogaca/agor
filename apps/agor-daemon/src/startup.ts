@@ -139,8 +139,6 @@ interface OrphanCleanupResult {
   orphanedTasks: Task[];
   orphanedSessions: Session[];
   sessionIdsWithOrphanedTasks: Set<string>;
-  queuedTasks: Task[];
-  sessionsResetFromOrphanedTasks: number;
 }
 
 export async function cleanupOrphanStatuses(ctx: StartupContext): Promise<OrphanCleanupResult> {
@@ -164,42 +162,25 @@ async function cleanupOrphanStatusesInTenantScope(
   // Determine restart type before touching anything — sentinel is consumed here
   const wasGraceful = await readAndClearSentinel();
 
-  // Find all orphaned executor-owned tasks (running, stopping, awaiting_permission, awaiting_input)
+  // Settle every interrupted executor turn through the same release kernel used at runtime.
   const orphanedTasks = await tasksService.getOrphaned(startupParams as never);
 
   if (orphanedTasks.length > 0) {
     for (const task of orphanedTasks) {
-      await tasksService.patch(
-        task.task_id,
-        {
-          status: TaskStatus.STOPPED,
-        },
-        startupParams as never
-      );
+      if (!isTerminalTaskStatus(task.status)) {
+        await tasksService.patch(task.task_id, { status: TaskStatus.STOPPED }, {
+          ...startupParams,
+          suppressTerminalQueueProcessing: true,
+        } as never);
+      }
+      if (task.executor_attempt) {
+        await tasksService.releaseExecutorTurn(
+          { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
+          { ...startupParams, suppressTerminalQueueProcessing: true } as never
+        );
+      }
       startupDebug(
-        `[startup] stopped orphaned task ${shortId(task.task_id)} (was: ${task.status})`
-      );
-    }
-  }
-
-  // Wipe the queue BEFORE making any session promptable. Running tasks are marked STOPPED above,
-  // which invalidates the ordering premise of anything waiting behind them — a queued prompt
-  // typically depends on whatever was running first. Wiping here prevents the session after-patch
-  // hook (triggered below) from draining queued tasks that should be discarded.
-  const queuedResult = (await tasksService.find({
-    query: { status: TaskStatus.QUEUED, $limit: 1000 },
-    ...startupParams,
-  })) as unknown as Paginated<Task>;
-  const queuedTasks = queuedResult.data;
-
-  if (queuedTasks.length > 0) {
-    for (const task of queuedTasks) {
-      await tasksService.patch(
-        task.task_id,
-        {
-          status: TaskStatus.STOPPED,
-        },
-        startupParams as never
+        `[startup] released orphaned task ${shortId(task.task_id)} (was: ${task.status})`
       );
     }
   }
@@ -242,32 +223,6 @@ async function cleanupOrphanStatusesInTenantScope(
   const sessionIdsWithOrphanedTasks = new Set(
     orphanedTasks.map((t: Task) => t.session_id as string)
   );
-  let sessionsResetFromOrphanedTasks = 0;
-  if (sessionIdsWithOrphanedTasks.size > 0) {
-    for (const sessionId of sessionIdsWithOrphanedTasks) {
-      const session = await sessionsService.get(sessionId as Id, startupParams as never);
-      // If session is still in an active state after orphaned task cleanup, set to IDLE
-      if (
-        session.status === SessionStatus.RUNNING ||
-        session.status === SessionStatus.STOPPING ||
-        session.status === SessionStatus.AWAITING_PERMISSION ||
-        session.status === SessionStatus.TIMED_OUT
-      ) {
-        await app.service('sessions').patch(
-          sessionId as Id,
-          {
-            status: SessionStatus.IDLE,
-            ready_for_prompt: true,
-          },
-          startupParams as never
-        );
-        sessionsResetFromOrphanedTasks++;
-        startupDebug(
-          `   ✓ Marked session ${shortId(sessionId)} as idle (had orphaned tasks, was: ${session.status})`
-        );
-      }
-    }
-  }
 
   // Fix sessions that are IDLE but not promptable *because a kill interrupted
   // them* — the daemon died during the stop path after writing status=idle but
@@ -278,13 +233,12 @@ async function cleanupOrphanStatusesInTenantScope(
   // see SessionPromptState in @agor/core/types), so it is the normal resting
   // state of every read session. Discriminate by the session's most recent
   // task: only sessions whose latest task was non-terminal at boot (just
-  // orphan-stopped / queue-wiped above, or still in an executing state) were
+  // orphan-stopped above, or still in an executing state) were
   // actually interrupted; read sessions have a terminal latest task from a
   // previous run and must be left untouched.
-  const bootInterruptedTaskIds = new Set<string>([
-    ...orphanedTasks.map((t: Task) => t.task_id as string),
-    ...queuedTasks.map((t: Task) => t.task_id as string),
-  ]);
+  const bootInterruptedTaskIds = new Set<string>(
+    orphanedTasks.map((t: Task) => t.task_id as string)
+  );
 
   const idleNotReadyResult = (await sessionsService.find({
     query: { status: SessionStatus.IDLE, ready_for_prompt: false, $limit: 1000 },
@@ -323,13 +277,9 @@ async function cleanupOrphanStatusesInTenantScope(
   }
 
   const cleanupParts: string[] = [
-    `${orphanedTasks.length} orphaned task(s) stopped`,
+    `${orphanedTasks.length} orphaned task(s) released`,
     `${orphanedSessions.length} active session(s) reset`,
-    `${queuedTasks.length} queued task(s) stopped`,
   ];
-  if (sessionsResetFromOrphanedTasks > 0) {
-    cleanupParts.push(`${sessionsResetFromOrphanedTasks} task-owned session(s) reset`);
-  }
   if (stuckIdleSessions.length > 0) {
     cleanupParts.push(`${stuckIdleSessions.length} stuck-idle session(s) unblocked`);
   }
@@ -340,8 +290,6 @@ async function cleanupOrphanStatusesInTenantScope(
     orphanedTasks,
     orphanedSessions,
     sessionIdsWithOrphanedTasks,
-    queuedTasks,
-    sessionsResetFromOrphanedTasks,
   };
 }
 
@@ -568,7 +516,16 @@ export async function startup(ctx: StartupContext): Promise<void> {
   );
 
   runPostStartJob('health-monitor-initialize', () => healthMonitor.initialize());
-  runPostStartJob('daemon-restart-notices', () => injectRestartNotices(ctx, orphanCleanupResult));
+  runPostStartJob('daemon-restart-recovery', async () => {
+    await injectRestartNotices(ctx, orphanCleanupResult);
+    await runStartupTenantDatabaseScope(ctx, () =>
+      Promise.all(
+        [...orphanCleanupResult.sessionIdsWithOrphanedTasks].map((sessionId) =>
+          sessionsService.triggerQueueProcessing(sessionId, startupTenantParams(config) as never)
+        )
+      )
+    );
+  });
 
   // Non-blocking credential spill repair. If an agent/user wrote a PAT into a
   // git remote URL while the daemon was down, scrub persisted repo metadata

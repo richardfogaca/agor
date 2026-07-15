@@ -26,6 +26,7 @@ import { MessageRole } from '@agor/core/types';
 import { Agent, type McpServerConfig, type Run, type SDKMessage } from '@cursor/sdk';
 import { getDaemonUrl } from '../../config.js';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
+import type { ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
 import type { ResolvedConfigSlice } from '../../payload-types.js';
 import { getMcpServersForSession } from '../../sdk-handlers/base/mcp-scoping.js';
 import type { StreamingCallbacks } from '../../sdk-handlers/base/types.js';
@@ -461,7 +462,8 @@ export async function executeCursorTask(params: {
     const apiKey = await resolveCursorApiKey(client, taskId);
     const session = await client.service('sessions').get(sessionId);
     const repos = createFeathersBackedRepositories(client);
-    const callbacks = createStreamingCallbacks(client, 'cursor', sessionId);
+    const runtime = (params as typeof params & { runtime?: ExecutorRuntimeObserver }).runtime;
+    const callbacks = createStreamingCallbacks(client, 'cursor', sessionId, runtime);
 
     if (!session.branch_id) {
       throw new Error('Cursor sessions require a branch_id so the local runtime has a cwd.');

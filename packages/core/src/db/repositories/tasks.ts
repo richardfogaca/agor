@@ -7,16 +7,18 @@
 import type { SessionID, Task, TaskMetadata, UUID } from '@agor/core/types';
 import {
   EXECUTING_TASK_STATUSES,
+  isTaskTurnHolding,
   isTerminalTaskStatus,
   SessionStatus,
   TaskStatus,
 } from '@agor/core/types';
-import { and, eq, inArray, like, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { generateId, shortId } from '../../lib/ids';
 import type { Database } from '../client';
 import {
   deleteFrom,
   insert,
+  jsonExtract,
   lockRowForUpdate,
   runDatabaseTransaction,
   select,
@@ -34,6 +36,17 @@ import {
 import { visibleSessionReferenceAccessExists } from './branch-access';
 import { deepMerge } from './merge-utils';
 
+function taskTurnHoldingWhere(db: Database, sessionId?: SessionID) {
+  const holding = or(
+    inArray(tasks.status, [...EXECUTING_TASK_STATUSES]),
+    and(
+      sql`${jsonExtract(db, tasks.data, 'executor_attempt.id')} is not null`,
+      sql`${jsonExtract(db, tasks.data, 'executor_attempt.released_at')} is null`
+    )
+  );
+  return sessionId ? and(eq(tasks.session_id, sessionId), holding) : holding;
+}
+
 /**
  * Task repository implementation
  */
@@ -46,6 +59,13 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
 
   private lockSession(db: Database, sessionId: SessionID): Promise<void> {
     return lockRowForUpdate(db, this.db, sessions, eq(sessions.session_id, sessionId));
+  }
+
+  private async resolveExisting(id: string): Promise<{ fullId: string; task: Task }> {
+    const fullId = await this.resolveId(id);
+    const task = await this.findById(fullId);
+    if (!task) throw new EntityNotFoundError('Task', id);
+    return { fullId, task };
   }
 
   /**
@@ -128,6 +148,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         report: task.report,
         permission_request: task.permission_request, // Permission state for UI approval flow
         executor_attempt: task.executor_attempt,
+        latest_executor_pulse: task.latest_executor_pulse,
         metadata: task.metadata, // Generic metadata bag (e.g., is_agor_callback, source)
       },
     };
@@ -303,8 +324,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
   }
 
   /**
-   * Find orphaned tasks (running, stopping, awaiting permission, or awaiting input)
-   * These are tasks that were interrupted when daemon stopped.
+   * Find active or unreleased executor turns interrupted when the daemon stopped.
    *
    * NOTE: QUEUED tasks are intentionally NOT considered orphans — they were
    * never spawned, so they have no executor to recover. The startup queue
@@ -313,40 +333,12 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
    */
   async findOrphaned(): Promise<Task[]> {
     try {
-      const rows = await select(this.db)
-        .from(tasks)
-        .where(inArray(tasks.status, [...EXECUTING_TASK_STATUSES]))
-        .all();
+      const rows = await select(this.db).from(tasks).where(taskTurnHoldingWhere(this.db)).all();
 
       return rows.map((row: TaskRow) => this.rowToTask(row));
     } catch (error) {
       throw new RepositoryError(
         `Failed to find orphaned tasks: ${error instanceof Error ? error.message : String(error)}`,
-        error
-      );
-    }
-  }
-
-  /**
-   * Find active tasks that have emitted at least one executor heartbeat.
-   *
-   * Tasks with a null heartbeat are intentionally skipped so enabling the
-   * supervisor does not fail legacy/pre-migration rows or tasks still inside
-   * startup grace before the executor sends its first heartbeat.
-   */
-  async findActiveWithExecutorHeartbeat(): Promise<Task[]> {
-    try {
-      const rows = await select(this.db)
-        .from(tasks)
-        .where(
-          sql`${tasks.status} IN ('running', 'stopping', 'awaiting_permission', 'awaiting_input') AND ${tasks.last_executor_heartbeat_at} IS NOT NULL`
-        )
-        .all();
-
-      return rows.map((row: TaskRow) => this.rowToTask(row));
-    } catch (error) {
-      throw new RepositoryError(
-        `Failed to find active tasks with executor heartbeat: ${error instanceof Error ? error.message : String(error)}`,
         error
       );
     }
@@ -399,12 +391,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
 
         const active = await select(db, { task_id: tasks.task_id })
           .from(tasks)
-          .where(
-            and(
-              eq(tasks.session_id, input.sessionId),
-              inArray(tasks.status, [...EXECUTING_TASK_STATUSES])
-            )
-          )
+          .where(taskTurnHoldingWhere(this.db, input.sessionId))
           .limit(1)
           .one();
         const queueHead = await select(db, { task_id: tasks.task_id })
@@ -471,20 +458,84 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     );
   }
 
+  /** Atomically reserve Stop against whichever task currently owns the session turn. */
+  async reserveExecutorStop(
+    sessionId: SessionID
+  ): Promise<{ task: Task | null; transitioned: boolean }> {
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockSession(db, sessionId);
+        const row = await select(db)
+          .from(tasks)
+          .where(taskTurnHoldingWhere(this.db, sessionId))
+          .orderBy(desc(tasks.started_at), desc(tasks.created_at))
+          .limit(1)
+          .one();
+
+        if (!row) {
+          await update(db, sessions)
+            .set({ status: SessionStatus.IDLE, ready_for_prompt: true, updated_at: new Date() })
+            .where(eq(sessions.session_id, sessionId))
+            .run();
+          return { task: null, transitioned: false };
+        }
+
+        await this.lockTask(db, row.task_id);
+        const currentRow = await select(db).from(tasks).where(eq(tasks.task_id, row.task_id)).one();
+        if (!currentRow) throw new EntityNotFoundError('Task', row.task_id);
+        const current = this.rowToTask(currentRow);
+        if (!isTaskTurnHolding(current)) return { task: null, transitioned: false };
+
+        const transitioned =
+          !isTerminalTaskStatus(current.status) && current.status !== TaskStatus.STOPPING;
+        const task = isTerminalTaskStatus(current.status)
+          ? current
+          : { ...current, status: TaskStatus.STOPPING };
+        if (transitioned) {
+          await update(db, tasks)
+            .set({ status: TaskStatus.STOPPING })
+            .where(eq(tasks.task_id, task.task_id))
+            .run();
+        }
+
+        await update(db, sessions)
+          .set({
+            status: SessionStatus.STOPPING,
+            ready_for_prompt: false,
+            updated_at: new Date(),
+          })
+          .where(eq(sessions.session_id, sessionId))
+          .run();
+        return { task, transitioned };
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
   /** Authenticated executor connection. Reconnect by the winning attempt is idempotent. */
   async connectExecutor(
     id: string,
     attemptId: string
   ): Promise<{ task: Task; transitioned: boolean } | null> {
-    const fullId = await this.resolveId(id);
+    const { fullId, task: known } = await this.resolveExisting(id);
     return runDatabaseTransaction(
       this.db,
       async (db) => {
+        await this.lockSession(db, known.session_id);
         await this.lockTask(db, fullId);
+        const session = await select(db)
+          .from(sessions)
+          .where(eq(sessions.session_id, known.session_id))
+          .one();
         const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
         if (!row) throw new EntityNotFoundError('Task', id);
         const current = this.rowToTask(row);
-        if (current.executor_attempt?.id !== attemptId) return null;
+        if (
+          session?.status === SessionStatus.STOPPING ||
+          current.executor_attempt?.id !== attemptId
+        )
+          return null;
         if (current.status === TaskStatus.RUNNING && current.executor_connected_at) {
           return { task: current, transitioned: false };
         }
@@ -519,16 +570,22 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       | typeof TaskStatus.AWAITING_PERMISSION
       | typeof TaskStatus.AWAITING_INPUT
   ): Promise<Task | null> {
-    const fullId = await this.resolveId(id);
+    const { fullId, task: known } = await this.resolveExisting(id);
     return runDatabaseTransaction(
       this.db,
       async (db) => {
+        await this.lockSession(db, known.session_id);
         await this.lockTask(db, fullId);
+        const session = await select(db)
+          .from(sessions)
+          .where(eq(sessions.session_id, known.session_id))
+          .one();
         const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
         if (!row) throw new EntityNotFoundError('Task', id);
         const current = this.rowToTask(row);
         if (
           current.executor_attempt?.id !== attemptId ||
+          session?.status === SessionStatus.STOPPING ||
           !current.executor_connected_at ||
           isTerminalTaskStatus(current.status)
         ) {
@@ -550,7 +607,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
   async recordExecutorTelemetry(
     id: string,
     attemptId: string,
-    telemetry: Pick<Task, 'last_executor_heartbeat_at'>
+    telemetry: Pick<Task, 'last_executor_heartbeat_at' | 'latest_executor_pulse'>
   ): Promise<Task | null> {
     const fullId = await this.resolveId(id);
     return runDatabaseTransaction(
@@ -578,6 +635,55 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
           .where(eq(tasks.task_id, fullId))
           .run();
         return task;
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
+  /** Release admission only after the attempt is terminal and its external effects are settled. */
+  async releaseExecutorTurn(
+    id: string,
+    attemptId: string,
+    releaseError?: string
+  ): Promise<{ task: Task; released: boolean } | null> {
+    const { fullId, task: known } = await this.resolveExisting(id);
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockSession(db, known.session_id);
+        await this.lockTask(db, fullId);
+        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
+        if (!row) throw new EntityNotFoundError('Task', id);
+        const current = this.rowToTask(row);
+        if (current.executor_attempt?.id !== attemptId || !isTerminalTaskStatus(current.status)) {
+          return null;
+        }
+        if (current.executor_attempt.released_at) return { task: current, released: false };
+
+        const task = {
+          ...current,
+          executor_attempt: {
+            id: attemptId,
+            released_at: new Date().toISOString(),
+            ...(releaseError ? { release_error: releaseError } : {}),
+          },
+        } satisfies Task;
+        const data = this.taskToInsert(task);
+        await update(db, tasks).set({ data: data.data }).where(eq(tasks.task_id, fullId)).run();
+        await update(db, sessions)
+          .set({
+            status:
+              task.status === TaskStatus.FAILED
+                ? SessionStatus.FAILED
+                : task.status === TaskStatus.TIMED_OUT
+                  ? SessionStatus.TIMED_OUT
+                  : SessionStatus.IDLE,
+            ready_for_prompt: true,
+            updated_at: new Date(),
+          })
+          .where(eq(sessions.session_id, task.session_id))
+          .run();
+        return { task, released: true };
       },
       { sqliteImmediate: true }
     );
@@ -622,6 +728,8 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
           }
 
           const merged = deepMerge(current, updates);
+          if (updates.latest_executor_pulse)
+            merged.latest_executor_pulse = updates.latest_executor_pulse;
           const insertData = this.taskToInsert(merged);
 
           await update(db, tasks)

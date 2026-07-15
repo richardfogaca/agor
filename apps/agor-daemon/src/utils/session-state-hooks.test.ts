@@ -29,7 +29,7 @@ vi.mock('./session-state', () => ({
   serializeFile: vi.fn(),
 }));
 
-import { pullIfNeeded, pushAsync } from './session-state-hooks';
+import { pullIfNeeded, pushSessionState } from './session-state-hooks';
 
 const db = { run: vi.fn() } as unknown as TenantScopeAwareDatabase;
 const context = {
@@ -66,12 +66,12 @@ describe('session state hook tenant scopes', () => {
     await expect(pullIfNeeded(context)).rejects.toThrow(
       'Missing active tenant context for session state restore'
     );
-    expect(() =>
-      pushAsync({
+    await expect(
+      pushSessionState({
         ...context,
         branchId: 'branch-1',
         taskId: 'task-1',
       })
-    ).toThrow('Missing active tenant context for session state persistence');
+    ).rejects.toThrow('Missing active tenant context for session state persistence');
   });
 });

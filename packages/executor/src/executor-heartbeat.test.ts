@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { startExecutorHeartbeat } from './executor-heartbeat';
+import { startExecutorRuntimeOverseer } from './executor-heartbeat';
 
-describe('startExecutorHeartbeat', () => {
+describe('startExecutorRuntimeOverseer', () => {
   it('writes immediately and then at the configured interval', async () => {
     vi.useFakeTimers();
     try {
       const reportExecutorTelemetry = vi.fn().mockResolvedValue({});
       const client = { service: () => ({ reportExecutorTelemetry }) } as any;
-      const handle = startExecutorHeartbeat({
+      const handle = startExecutorRuntimeOverseer({
         client,
         taskId: 'task-1',
         executorAttemptId: 'attempt-1',
@@ -37,7 +37,7 @@ describe('startExecutorHeartbeat', () => {
     try {
       const reportExecutorTelemetry = vi.fn().mockResolvedValue({});
       const client = { service: () => ({ reportExecutorTelemetry }) } as any;
-      startExecutorHeartbeat({
+      startExecutorRuntimeOverseer({
         client,
         taskId: 'task-1',
         executorAttemptId: 'attempt-1',
@@ -49,5 +49,29 @@ describe('startExecutorHeartbeat', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('coalesces semantic progress and flushes the latest pulse', async () => {
+    const reportExecutorTelemetry = vi.fn().mockResolvedValue({});
+    const client = { service: () => ({ reportExecutorTelemetry }) } as any;
+    const handle = startExecutorRuntimeOverseer({
+      client,
+      taskId: 'task-1',
+      executorAttemptId: 'attempt-1',
+      intervalMs: 60_000,
+    });
+    await Promise.resolve();
+
+    handle.observe('assistant.stream', 'message-1');
+    handle.observe('thinking.progress', 'message-2');
+    await handle.flush();
+
+    expect(reportExecutorTelemetry).toHaveBeenLastCalledWith({
+      task_id: 'task-1',
+      executor_attempt_id: 'attempt-1',
+      heartbeat: true,
+      pulse: { kind: 'thinking.progress', id: 'message-2' },
+    });
+    handle.stop();
   });
 });

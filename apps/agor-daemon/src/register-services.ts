@@ -44,14 +44,7 @@ import type {
   UserID,
   UUID,
 } from '@agor/core/types';
-import {
-  AGENTIC_TOOL_CAPABILITIES,
-  isSessionExecuting,
-  isTaskExecuting,
-  ROLES,
-  SessionStatus,
-  TaskStatus,
-} from '@agor/core/types';
+import { AGENTIC_TOOL_CAPABILITIES, isTaskExecuting, ROLES, TaskStatus } from '@agor/core/types';
 import type { UnixUserMode } from '@agor/core/unix';
 import type express from 'express';
 import type {
@@ -142,7 +135,7 @@ import {
   getCodexHome,
   getSessionFilePath,
 } from './utils/session-state.js';
-import { pullIfNeeded, pushAsync } from './utils/session-state-hooks.js';
+import { pullIfNeeded, pushSessionState } from './utils/session-state-hooks.js';
 import { spawnExecutor } from './utils/spawn-executor.js';
 
 /**
@@ -1001,62 +994,30 @@ function createExecuteHandler(
       },
       onExit: async (code) => {
         console.log(`${logPrefix} Exited with code ${code}`);
-        untrackExecutorProcess(sessionId);
+        let releaseError: string | undefined;
 
-        // Safety net: check if task is still running
+        // A vanished executor cannot own an active task. Terminal work is left
+        // intact and released only after persistence below has settled.
         try {
-          const currentSession = await app.service('sessions').get(sessionId, params);
-          const latestTaskId = currentSession.tasks?.[currentSession.tasks.length - 1];
-
-          if (latestTaskId && latestTaskId !== taskId) {
-            console.log(
-              `⏭️ [Executor] Task ${shortId(taskId)} is not the latest (latest: ${shortId(latestTaskId)}), skipping safety net`
-            );
-          } else if (
-            isSessionExecuting(currentSession) ||
-            currentSession.status === SessionStatus.TIMED_OUT
-          ) {
-            try {
-              const currentTask = await app.service('tasks').get(taskId, params);
-              if (isTaskExecuting(currentTask) || currentTask.status === TaskStatus.TIMED_OUT) {
-                await app.service('tasks').patch(
-                  taskId,
-                  {
-                    status: TaskStatus.FAILED,
-                    error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
-                  },
-                  params
-                );
-                console.log(
-                  `✅ [Executor] Task ${shortId(taskId)} marked as FAILED after executor exit (code: ${code})`
-                );
-              } else {
-                console.log(
-                  `⚠️  [Executor] Task ${shortId(taskId)} already ${currentTask.status}, but session still ${currentSession.status} — repairing session state`
-                );
-                await app
-                  .service('sessions')
-                  .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
-              }
-            } catch (taskError) {
-              console.error(
-                `⚠️  [Executor] Failed to mark task ${shortId(taskId)} as FAILED, falling back to session IDLE update:`,
-                taskError
-              );
-              await app
-                .service('sessions')
-                .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
-              console.log(
-                `✅ [Executor] Session ${shortId(sessionId)} status updated to IDLE after executor exit (was: ${currentSession.status})`
-              );
-            }
-          } else {
-            console.log(
-              `ℹ️  [Executor] Session ${shortId(sessionId)} already in ${currentSession.status} state, skipping IDLE update`
+          const currentTask = await app.service('tasks').get(taskId, params);
+          if (isTaskExecuting(currentTask)) {
+            const stopping = currentTask.status === TaskStatus.STOPPING;
+            await app.service('tasks').patch(
+              taskId,
+              {
+                status: stopping ? TaskStatus.STOPPED : TaskStatus.FAILED,
+                ...(!stopping
+                  ? {
+                      error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
+                    }
+                  : {}),
+              },
+              params
             );
           }
         } catch (error) {
-          console.error(`❌ [Executor] Failed to handle executor exit:`, error);
+          releaseError = error instanceof Error ? error.message : String(error);
+          console.error(`❌ [Executor] Failed to settle executor exit:`, error);
         }
 
         // Stateless FS mode: serialize session file to DB after executor exits
@@ -1065,7 +1026,7 @@ function createExecuteHandler(
             // Re-fetch session to get sdk_session_id (may have been set during execution)
             const freshSession = await app.service('sessions').get(sessionId, params);
             if (freshSession.sdk_session_id) {
-              pushAsync({
+              await pushSessionState({
                 db,
                 sessionId,
                 branchId: freshSession.branch_id,
@@ -1105,11 +1066,25 @@ function createExecuteHandler(
               }
             }
           } catch (pushErr) {
-            console.error(
-              '[stateless-fs] pushAsync setup failed:',
-              pushErr instanceof Error ? pushErr.message : pushErr
-            );
+            releaseError = pushErr instanceof Error ? pushErr.message : String(pushErr);
+            console.error('[stateless-fs] session persistence failed:', releaseError);
           }
+        }
+
+        untrackExecutorProcess(sessionId);
+        try {
+          await runWithTenantDatabaseScope(db, tenantId, () =>
+            app.service('tasks').releaseExecutorTurn(
+              {
+                task_id: taskId,
+                executor_attempt_id: data.executorAttemptId,
+                release_error: releaseError,
+              },
+              params
+            )
+          );
+        } catch (error) {
+          console.error(`❌ [Executor] Failed to release task ${shortId(taskId)}:`, error);
         }
 
         appWithExecutor.sessionTokenService?.revokeToken(sessionToken);

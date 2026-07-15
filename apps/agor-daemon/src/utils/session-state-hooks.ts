@@ -3,7 +3,7 @@
  *
  * Pre/post turn hooks for stateless_fs_mode.
  * pullIfNeeded: restores session file from DB before SDK subprocess starts.
- * pushAsync: serializes session file to DB after SDK subprocess exits.
+ * pushSessionState: serializes the session file after SDK subprocess exit.
  *
  * Lives in the daemon (not core) because these hooks are only invoked from
  * register-services.ts and operate on the daemon's DB + filesystem directly.
@@ -146,13 +146,10 @@ export async function pullIfNeeded(ctx: PullContext): Promise<void> {
  * Push: run after SDK subprocess exits. Fire-and-forget (never awaited by caller).
  * Skips if file hash unchanged. Otherwise: insertProcessing → gzip → markDone → deletePreviousTurns.
  */
-export function pushAsync(ctx: PushContext): void {
+export async function pushSessionState(ctx: PushContext): Promise<void> {
   const tenantId = getCurrentTenantId();
   if (!tenantId) throw new Error('Missing active tenant context for session state persistence');
-  // Fire and forget — errors are logged but never propagated
-  void doPush(ctx, tenantId).catch((err) => {
-    console.error('[session-state] pushAsync failed:', err instanceof Error ? err.message : err);
-  });
+  await doPush(ctx, tenantId);
 }
 
 async function doPush(ctx: PushContext, tenantId: string): Promise<void> {

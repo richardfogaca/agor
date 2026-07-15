@@ -9,7 +9,8 @@ encodes whether the prompt ran or got queued.**
 
 - `task.status === 'queued'` → session was busy; the task is waiting and will
   drain automatically when the session goes idle.
-- `task.status === 'running'` → ran immediately.
+- `task.status === 'dispatching'` → admitted; the executor has not connected yet.
+- `task.status === 'running'` → the admitted executor authenticated successfully.
 - `task.queue_position` → ordering within the session's queue (lowest drains
   first), populated only while QUEUED.
 
@@ -18,24 +19,25 @@ There is no separate "queued vs ran" envelope. The route does not take a
 
 ## Lifecycle
 
-1. **Materialize** — the route always creates a Task via
-   `TaskRepository.createPending({ status })`. CREATED if the session is idle
-   with no queue, QUEUED otherwise. Sentinel values (`message_range.start_index = -1`,
-   `git_state.sha_at_start = ''`) are stamped here and stay until the
-   QUEUED → RUNNING transition.
+1. **Materialize** — the route creates the same CREATED Task shape for every
+   prompt. `TaskRepository.admitExecutorTurn` atomically decides whether that
+   task becomes DISPATCHING or QUEUED.
 2. **Drain** — when a session reaches a terminal task state, the queue
    processor picks the lowest `queue_position` and hands it to
-   `spawnTaskExecutor`, which is the *sole* place that pins
+   `spawnTaskExecutor`, which is the _sole_ place that pins
    `message_range`/`git_state`, writes the initial user-message row, and
    spawns the executor.
-3. **Race safety** — `createPending` wraps the `max(queue_position) + 1`
-   read-then-insert in a transaction so concurrent writers can't collide on
-   identical positions.
+3. **Race safety** — admission locks the session row and enforces one active or
+   unreleased executor turn. Terminal work remains a blocker until process exit
+   and required persistence settle; release then drains the FIFO queue.
+4. **Stop safety** — Stop reserves the current turn under the same session lock,
+   persists STOPPED before signaling the process, and leaves admission blocked
+   until exit cleanup releases the turn.
 
 ## Key files
 
 - Repo: `packages/core/src/db/repositories/tasks.ts` (`createPending`,
-  `findQueued`, `getNextQueued`)
+  `admitExecutorTurn`, `reserveExecutorStop`, `releaseExecutorTurn`)
 - Route: `apps/agor-daemon/src/register-routes.ts` (`/sessions/:id/prompt`,
   `spawnTaskExecutor`, `processNextQueuedTask`)
 - Reactive client: `packages/client/src/reactive-session.ts` (handles

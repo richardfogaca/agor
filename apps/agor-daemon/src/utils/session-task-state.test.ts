@@ -42,6 +42,13 @@ describe('session task state reconciliation', () => {
     ).toBe(false);
   });
 
+  it('does not repair while a terminal executor is still cleaning up', () => {
+    const completedTask = task(TaskStatus.COMPLETED);
+    completedTask.executor_attempt = { id: 'attempt-1' };
+
+    expect(shouldReconcileSessionPromptState(baseSession, [completedTask])).toBe(false);
+  });
+
   it('can ignore a just-created task that is about to own the session turn', () => {
     const createdTask = task(TaskStatus.CREATED);
 

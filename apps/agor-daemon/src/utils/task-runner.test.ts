@@ -2,8 +2,8 @@
  * Behavior tests for the helpers behind `POST /tasks/:id/run` (issue #1118).
  *
  * The route handler in `register-routes.ts` does parse + early validation +
- * RBAC + acquires `withSessionTurnLock`, then delegates to `runExistingTask`,
- * which re-validates task status under the lock. These tests pin the
+ * RBAC, then delegates to `runExistingTask`, which re-validates task status
+ * before database admission. These tests pin the
  * revalidation contract — the part most likely to drift.
  */
 import { Conflict, NotFound } from '@agor/core/feathers';

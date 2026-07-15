@@ -9,6 +9,7 @@ import { shortId } from '@agor/core/db';
  */
 
 const executorProcesses = new Map<string, { pid: number; startedAt: Date }>();
+const EXECUTOR_KILL_GRACE_MS = 3_000;
 
 /**
  * Track an executor process for a session.
@@ -22,6 +23,18 @@ export function trackExecutorProcess(sessionId: string, pid: number): void {
  */
 export function untrackExecutorProcess(sessionId: string): void {
   executorProcesses.delete(sessionId);
+}
+
+export function hasExecutorProcess(sessionId: string): boolean {
+  const proc = executorProcesses.get(sessionId);
+  if (!proc) return false;
+  try {
+    process.kill(proc.pid, 0);
+    return true;
+  } catch {
+    executorProcesses.delete(sessionId);
+    return false;
+  }
 }
 
 /**
@@ -57,14 +70,17 @@ export function killExecutorProcess(sessionId: string): boolean {
 
   // Phase 2: SIGKILL after 3 seconds if still alive
   setTimeout(() => {
+    if (executorProcesses.get(sessionId)?.pid !== proc.pid) return;
     try {
       process.kill(proc.pid, 0); // Check if still alive
-      console.log(`🛑 [Stop] Process still alive after 3s, sending SIGKILL to PID ${proc.pid}`);
+      console.log(
+        `🛑 [Stop] Process still alive after ${EXECUTOR_KILL_GRACE_MS / 1_000}s, sending SIGKILL to PID ${proc.pid}`
+      );
       process.kill(proc.pid, 'SIGKILL');
     } catch {
       // Process already dead — good
     }
-  }, 3000);
+  }, EXECUTOR_KILL_GRACE_MS);
 
   return true;
 }

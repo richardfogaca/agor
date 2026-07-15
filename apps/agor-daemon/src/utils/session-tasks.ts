@@ -1,6 +1,5 @@
 /**
- * Helpers for finding "active" tasks for a session — RUNNING / STOPPING / AWAITING_PERMISSION /
- * AWAITING_INPUT — sorted by recency.
+ * Helpers for finding tasks that still hold a session turn, sorted by recency.
  *
  * Background: `TasksService.find()` short-circuits on `session_id: string`
  * (see `services/tasks.ts:65-110`) and returns ALL session tasks in
@@ -16,10 +15,7 @@
 
 import type { Application } from '@agor/core/feathers';
 import type { Paginated, Params, SessionID, Task } from '@agor/core/types';
-import { EXECUTING_TASK_STATUSES, isTaskExecuting } from '@agor/core/types';
-
-/** Statuses considered "active" — an executor may still be doing work. */
-export const ACTIVE_TASK_STATUSES = EXECUTING_TASK_STATUSES;
+import { isTaskTurnHolding } from '@agor/core/types';
 
 function recencyKey(t: Task): number {
   return new Date(t.started_at || t.created_at).getTime();
@@ -49,19 +45,6 @@ export async function findTasksForSession(
 }
 
 /**
- * The session's active/executor-owned tasks,
- * recency-DESC. Empty when nothing is active.
- */
-export async function findActiveTasksForSession(
-  app: Application,
-  sessionId: SessionID,
-  params?: Params
-): Promise<Task[]> {
-  const all = await findTasksForSession(app, sessionId, params);
-  return all.filter((t) => isTaskExecuting(t));
-}
-
-/**
  * The single most-recent active task — preferred when callers want "the
  * task that is driving this session right now." Falls back to the most-
  * recent task of any status when nothing is active, so widget messages /
@@ -77,5 +60,5 @@ export async function findHostTaskForSession(
 ): Promise<Task | undefined> {
   const all = await findTasksForSession(app, sessionId, params);
   if (all.length === 0) return undefined;
-  return all.find((t) => isTaskExecuting(t)) ?? all[0];
+  return all.find(isTaskTurnHolding) ?? all[0];
 }

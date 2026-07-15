@@ -24,6 +24,7 @@ import type {
   Message,
   Repo,
   Session,
+  SessionID,
   Task,
 } from '@agor/core/types';
 import type {
@@ -122,8 +123,13 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
  * Tasks service with custom methods (server-side implementation)
  */
 export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersParams> {
+  reserveExecutorStop(sessionId: SessionID, params?: FeathersParams): Promise<Task | null>;
   connectExecutor(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: FeathersParams): Promise<Task>;
+  releaseExecutorTurn(
+    data: ExecutorClaim & { release_error?: string },
+    params?: FeathersParams
+  ): Promise<Task>;
   createMany(data: Array<Partial<Task>>): Promise<Task[]>;
   complete(
     id: string,
@@ -132,7 +138,6 @@ export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersP
   ): Promise<Task>;
   fail(id: string, data: { error?: string }, params?: FeathersParams): Promise<Task>;
   getOrphaned(params?: FeathersParams): Promise<Task[]>;
-  getActiveWithExecutorHeartbeat(params?: FeathersParams): Promise<Task[]>;
   failForLostHeartbeat(
     id: string,
     data: { completed_at?: string; error_message: string },

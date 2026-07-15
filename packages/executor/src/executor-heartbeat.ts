@@ -1,4 +1,4 @@
-import type { TaskID } from '@agor/core/types';
+import type { ExecutorPulseKind, TaskID } from '@agor/core/types';
 import type { AgorClient } from './services/feathers-client.js';
 
 export interface ExecutorHeartbeatOptions {
@@ -10,16 +10,23 @@ export interface ExecutorHeartbeatOptions {
   warn?: (...args: unknown[]) => void;
 }
 
-export interface ExecutorHeartbeatHandle {
+export interface ExecutorRuntimeObserver {
+  observe(kind: ExecutorPulseKind, id?: string): void;
+}
+
+export interface ExecutorHeartbeatHandle extends ExecutorRuntimeObserver {
+  flush(): Promise<void>;
   stop(): void;
 }
 
 const DEFAULT_INTERVAL_MS = 10_000;
 
-export function startExecutorHeartbeat(options: ExecutorHeartbeatOptions): ExecutorHeartbeatHandle {
+export function startExecutorRuntimeOverseer(
+  options: ExecutorHeartbeatOptions
+): ExecutorHeartbeatHandle {
   const enabled = options.enabled ?? true;
   if (!enabled) {
-    return { stop() {} };
+    return { observe() {}, async flush() {}, stop() {} };
   }
 
   const intervalMs =
@@ -30,26 +37,42 @@ export function startExecutorHeartbeat(options: ExecutorHeartbeatOptions): Execu
       : DEFAULT_INTERVAL_MS;
   const warn = options.warn ?? console.warn;
   let stopped = false;
-  let inFlight = false;
+  let pending: Promise<void> | undefined;
+  let pulse: { kind: ExecutorPulseKind; id?: string } | undefined;
+  let sentPulse = '';
   let timer: ReturnType<typeof setInterval> | undefined;
 
   const emit = async () => {
-    if (stopped || inFlight) return;
-    inFlight = true;
-    try {
-      await options.client.service('tasks').reportExecutorTelemetry({
+    if (stopped) return;
+    if (pending) {
+      await pending;
+      const latestKey = pulse ? `${pulse.kind}:${pulse.id ?? ''}` : '';
+      if (latestKey && latestKey !== sentPulse) return emit();
+      return;
+    }
+    const snapshot = pulse;
+    const pulseKey = snapshot ? `${snapshot.kind}:${snapshot.id ?? ''}` : '';
+    pending = options.client
+      .service('tasks')
+      .reportExecutorTelemetry({
         task_id: options.taskId,
         executor_attempt_id: options.executorAttemptId,
         heartbeat: true,
+        ...(snapshot && pulseKey !== sentPulse ? { pulse: snapshot } : {}),
+      })
+      .then(() => {
+        if (snapshot) sentPulse = pulseKey;
+      })
+      .catch((error) => {
+        warn(
+          '[executor-overseer] Failed to report runtime telemetry:',
+          error instanceof Error ? error.message : String(error)
+        );
+      })
+      .finally(() => {
+        pending = undefined;
       });
-    } catch (error) {
-      warn(
-        '[executor-heartbeat] Failed to write heartbeat:',
-        error instanceof Error ? error.message : String(error)
-      );
-    } finally {
-      inFlight = false;
-    }
+    return pending;
   };
 
   void emit();
@@ -59,6 +82,10 @@ export function startExecutorHeartbeat(options: ExecutorHeartbeatOptions): Execu
   timer.unref?.();
 
   return {
+    observe(kind, id) {
+      pulse = { kind, ...(id ? { id } : {}) };
+    },
+    flush: emit,
     stop() {
       stopped = true;
       if (timer) clearInterval(timer);

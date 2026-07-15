@@ -135,7 +135,6 @@ import { canControlCliSession } from './utils/mcp-token-authorization.js';
 import { ensureScheduleRunsAsCaller } from './utils/schedule-hooks.js';
 import { runWithSessionQueueTenantScope } from './utils/session-queue-tenant-scope.js';
 import { stopSessionPreserveQueue } from './utils/session-stop.js';
-import { type SessionTurnLocks, withSessionTurnLock } from './utils/session-turn-lock.js';
 import { normalizeMessageSource, runExistingTask } from './utils/task-runner.js';
 import {
   createTenantDatabaseScopeAroundHook,
@@ -990,19 +989,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   );
 
   /**
-   * Per-session "turn" lock — single source of truth for "who's allowed to
-   * spawn an executor for this session right now" mutual exclusion. Shared
-   * by `/sessions/:id/prompt`'s idle branch, `/tasks/:id/run`, and the
-   * queue processor's drain loop. See `utils/session-turn-lock.ts`.
-   *
-   * Without this, two concurrent prompts on the same idle session could
-   * both observe `status === 'idle'` and both spawn executors — a race
-   * that pre-dates the `/tasks/:id/run` route but is now fixed across all
-   * three entry points.
-   */
-  const sessionTurnLocks: SessionTurnLocks = new Map();
-
-  /**
    * Helper: Safely patch an entity, returning false if it was deleted mid-execution
    */
   async function safePatch<T>(
@@ -1029,7 +1015,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
   /**
    * spawnTaskExecutor — sole transition point for `tasks.status` going from
-   * `created` / `queued` → `running`.
+   * `created` / `queued` → `dispatching` (executor) or `running` (legacy CLI).
    *
    * Both the IDLE branch of POST /sessions/:id/prompt and the queued-task
    * drainer call this helper. Centralising the transition guarantees that:
@@ -1360,6 +1346,24 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         } catch (emitErr) {
           console.warn('[Daemon] Failed to emit tasks:failed event:', emitErr);
         }
+
+        if (executorAttemptId) {
+          try {
+            await tasksService.releaseExecutorTurn(
+              {
+                task_id: taskId,
+                executor_attempt_id: executorAttemptId,
+                release_error: errorMessage,
+              },
+              params
+            );
+          } catch (releaseError) {
+            console.error(
+              `❌ [Daemon] Failed to release unspawned task ${shortId(taskId)}:`,
+              releaseError
+            );
+          }
+        }
       }
     });
 
@@ -1508,18 +1512,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Explicit executor trigger for an already-created task. Lets pure-REST
   // harnesses (Python, Go, shell+curl — anything without an MCP client) drive
   // the executor by POSTing a Task row first (`POST /tasks`) and then poking
-  // it awake here. Wraps `spawnTaskExecutor` via `runExistingTask` (status
-  // revalidation) under `withSessionTurnLock` — the same shared session-level
-  // mutex that `/sessions/:id/prompt`'s idle branch and the queue drainer
-  // also acquire — so the on-the-wire effect is identical to "create a task
-  // and run it now."
+  // it awake here. `spawnTaskExecutor` delegates admission to the database,
+  // so this has the same run-or-queue behavior as every other entry point.
   //
-  // Only CREATED tasks on IDLE sessions are accepted. QUEUED tasks are
-  // rejected with a hint to wait for the queue drainer (running them out of
-  // order would violate the queue-position invariant); busy sessions are
-  // rejected with a hint to use `POST /sessions/:id/prompt` (which owns the
-  // atomic create-and-queue path). Splitting the two responsibilities keeps
-  // this endpoint a narrow "run this thing now" trigger.
+  // Only CREATED tasks are accepted. QUEUED tasks drain in order and all
+  // terminal/in-flight states remain immutable.
   // ============================================================================
 
   registerAuthenticatedRoute(
@@ -2071,35 +2068,17 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         const sessionsServiceWithHooks = app.service('sessions') as unknown as SessionsServiceImpl;
 
-        const result = await withSessionTurnLock(sessionTurnLocks, id as SessionID, async () =>
-          stopSessionPreserveQueue(
-            {
-              app,
-              taskRepo: new TaskRepository(db),
-              sessionsService: sessionsServiceWithHooks,
-              tasksService,
-              killExecutorProcess,
-            },
-            id as SessionID,
-            params,
-            { reason: stopReason }
-          )
+        return stopSessionPreserveQueue(
+          {
+            taskRepo: new TaskRepository(db),
+            sessionsService: sessionsServiceWithHooks,
+            tasksService,
+            killExecutorProcess,
+          },
+          id as SessionID,
+          params,
+          { reason: stopReason }
         );
-
-        if (result.success) {
-          deferInFreshTenantScope(params, async () => {
-            try {
-              await sessionsServiceWithHooks.triggerQueueProcessing(id as SessionID, params);
-            } catch (error) {
-              console.error(
-                `❌ [Stop] Failed to process queue after stopping session ${shortId(id)}:`,
-                error
-              );
-            }
-          });
-        }
-
-        return result;
       },
     },
     {
@@ -2112,7 +2091,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Queue listing — task-centric (was message-centric pre-never-lose-prompt).
   // The queue is the set of tasks with status='queued', ranked by
   // queue_position. Each queued task carries the full prompt + metadata; on
-  // drain it transitions queued → running via spawnTaskExecutor.
+  // drain it admits queued work via spawnTaskExecutor.
   //
   // Enqueueing goes through `POST /sessions/:id/prompt` — the daemon decides
   // run-vs-queue based on session state and reports it back via `task.status`.

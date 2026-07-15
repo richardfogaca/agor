@@ -5,8 +5,8 @@
  */
 
 import type { Task, UUID } from '@agor/core/types';
-import { SessionStatus, TaskStatus } from '@agor/core/types';
-import { describe, expect } from 'vitest';
+import { SessionStatus, sanitizeExecutorPulse, TaskStatus } from '@agor/core/types';
+import { describe, expect, it } from 'vitest';
 import { generateId, toShortId } from '../../lib/ids';
 import type { Database } from '../client';
 import { dbTest } from '../test-helpers';
@@ -1357,6 +1357,47 @@ describe('TaskRepository executor turn transitions', () => {
     );
     expect(awaiting?.status).toBe(TaskStatus.AWAITING_PERMISSION);
     expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.AWAITING_PERMISSION);
+
+    const telemetry = await tasks.recordExecutorTelemetry(task.task_id, attemptId, {
+      last_executor_heartbeat_at: new Date().toISOString(),
+      latest_executor_pulse: {
+        kind: 'thinking.progress',
+        id: 'message-1',
+        at: new Date().toISOString(),
+      },
+    });
+    expect(telemetry?.latest_executor_pulse?.kind).toBe('thinking.progress');
+    expect(await tasks.recordExecutorTelemetry(task.task_id, generateId(), {})).toBeNull();
+  });
+
+  dbTest('does not reconnect or project runtime over a reserved stop', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const sessions = new SessionRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const task = await tasks.create(createTaskData({ session_id: sessionId }));
+    const attemptId = generateId();
+    await tasks.admitExecutorTurn({
+      taskId: task.task_id,
+      sessionId,
+      patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: attemptId } },
+    });
+
+    const reserved = await tasks.reserveExecutorStop(sessionId);
+    expect(reserved.task?.status).toBe(TaskStatus.STOPPING);
+    expect(reserved.transitioned).toBe(true);
+    expect(await tasks.connectExecutor(task.task_id, attemptId)).toBeNull();
+    expect(
+      await tasks.transitionExecutorRuntime(task.task_id, attemptId, TaskStatus.AWAITING_PERMISSION)
+    ).toBeNull();
+    expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.STOPPING);
+  });
+
+  it('accepts only bounded runtime pulses', () => {
+    expect(sanitizeExecutorPulse({ kind: 'assistant.stream', id: 'x'.repeat(300) })).toEqual({
+      kind: 'assistant.stream',
+      id: 'x'.repeat(200),
+    });
+    expect(sanitizeExecutorPulse({ kind: 'unknown' })).toBeNull();
   });
 
   dbTest(
@@ -1385,4 +1426,54 @@ describe('TaskRepository executor turn transitions', () => {
       ).rejects.toThrow(/terminal task status/);
     }
   );
+
+  dbTest('keeps queued work blocked until terminal executor effects release', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const sessions = new SessionRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const attemptId = generateId();
+    const first = await tasks.create(createTaskData({ session_id: sessionId }));
+    await tasks.admitExecutorTurn({
+      taskId: first.task_id,
+      sessionId,
+      patch: {
+        status: TaskStatus.DISPATCHING,
+        executor_attempt: { id: attemptId },
+      },
+    });
+    await tasks.connectExecutor(first.task_id, attemptId);
+
+    const second = await tasks.create(createTaskData({ session_id: sessionId }));
+    expect(
+      (
+        await tasks.admitExecutorTurn({
+          taskId: second.task_id,
+          sessionId,
+          patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: generateId() } },
+        })
+      ).status
+    ).toBe(TaskStatus.QUEUED);
+
+    await tasks.update(first.task_id, { status: TaskStatus.COMPLETED });
+    expect(
+      (
+        await tasks.admitExecutorTurn({
+          taskId: second.task_id,
+          sessionId,
+          patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: generateId() } },
+        })
+      ).status
+    ).toBe(TaskStatus.QUEUED);
+    expect(await tasks.releaseExecutorTurn(first.task_id, generateId())).toBeNull();
+    expect((await tasks.releaseExecutorTurn(first.task_id, attemptId))?.released).toBe(true);
+
+    const nextAttempt = generateId();
+    const admitted = await tasks.admitExecutorTurn({
+      taskId: second.task_id,
+      sessionId,
+      patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: nextAttempt } },
+    });
+    expect(admitted.status).toBe(TaskStatus.DISPATCHING);
+    expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.RUNNING);
+  });
 });

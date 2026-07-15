@@ -13,6 +13,7 @@ import { generateId, shortId } from '@agor/core';
 import type { MessageID, PermissionMode, SessionID, TaskID } from '@agor/core/types';
 import { MessageRole } from '@agor/core/types';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
+import type { ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
 import type { ResolvedConfigSlice } from '../../payload-types.js';
 import { OpenCodeTool } from '../../sdk-handlers/opencode/index.js';
 import type { AgorClient } from '../../services/feathers-client.js';
@@ -48,7 +49,8 @@ export async function executeOpenCodeTask(params: {
 
     // Create execution context (similar to other handlers)
     const repos = createFeathersBackedRepositories(client);
-    const callbacks = createStreamingCallbacks(client, 'opencode', sessionId);
+    const runtime = (params as typeof params & { runtime?: ExecutorRuntimeObserver }).runtime;
+    const callbacks = createStreamingCallbacks(client, 'opencode', sessionId, runtime);
 
     // OpenCode server URL: env var > daemon-resolved config slice > default.
     const serverUrl =

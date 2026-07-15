@@ -22,8 +22,9 @@ import type {
   Task,
   TaskID,
 } from '@agor/core/types';
-import { MessageRole, PROVIDER_CREDENTIAL_FIELDS } from '@agor/core/types';
+import { ExecutorPulseKind, MessageRole, PROVIDER_CREDENTIAL_FIELDS } from '@agor/core/types';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
+import type { ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
 import { getCurrentBranch, getGitState } from '../../git/index.js';
 import type { StreamingCallbacks } from '../../sdk-handlers/base/types.js';
 import { normalizeRawSdkResponse } from '../../sdk-handlers/normalizer-factory.js';
@@ -127,7 +128,8 @@ export interface ExecutionContext {
 export function createStreamingCallbacks(
   client: AgorClient,
   toolName: string,
-  sessionId: SessionID
+  sessionId: SessionID,
+  runtime?: ExecutorRuntimeObserver
 ): StreamingCallbacks {
   // Use session_id passed in (available before any streaming starts)
   // This ensures thinking events have session_id even if they fire before onStreamStart
@@ -146,6 +148,7 @@ export function createStreamingCallbacks(
 
   return {
     onStreamStart: async (message_id, data) => {
+      runtime?.observe(ExecutorPulseKind.ASSISTANT_STREAM, message_id);
       // Initialize sequence counter for this message
       sequenceCounters.set(message_id, 0);
 
@@ -158,6 +161,7 @@ export function createStreamingCallbacks(
       });
     },
     onStreamChunk: async (message_id, chunk, _sequenceOverride?: number) => {
+      runtime?.observe(ExecutorPulseKind.ASSISTANT_STREAM, message_id);
       // Get and increment sequence number for this message
       const currentSeq = sequenceCounters.get(message_id) || 0;
       const sequence = _sequenceOverride !== undefined ? _sequenceOverride : currentSeq;
@@ -192,6 +196,7 @@ export function createStreamingCallbacks(
       });
     },
     onThinkingStart: async (message_id, metadata) => {
+      runtime?.observe(ExecutorPulseKind.THINKING_PROGRESS, message_id);
       await broadcastEvent('thinking:start', {
         message_id,
         session_id: currentSessionId,
@@ -199,6 +204,7 @@ export function createStreamingCallbacks(
       });
     },
     onThinkingChunk: async (message_id, chunk) => {
+      runtime?.observe(ExecutorPulseKind.THINKING_PROGRESS, message_id);
       await broadcastEvent('thinking:chunk', {
         message_id,
         session_id: currentSessionId,
@@ -220,12 +226,13 @@ export function createStreamingCallbacks(
 export function createExecutionContext(
   client: AgorClient,
   toolName: string,
-  sessionId: SessionID
+  sessionId: SessionID,
+  runtime?: ExecutorRuntimeObserver
 ): ExecutionContext {
   return {
     client,
     repos: createFeathersBackedRepositories(client),
-    callbacks: createStreamingCallbacks(client, toolName, sessionId),
+    callbacks: createStreamingCallbacks(client, toolName, sessionId, runtime),
   };
 }
 
@@ -454,7 +461,8 @@ export async function executeToolTask(params: {
   }
 
   // Create execution context
-  const ctx = createExecutionContext(client, toolName, sessionId);
+  const runtime = (params as typeof params & { runtime?: ExecutorRuntimeObserver }).runtime;
+  const ctx = createExecutionContext(client, toolName, sessionId, runtime);
 
   // Create tool instance using factory function
   // Pass the resolved key (or empty string) and useNativeAuth flag

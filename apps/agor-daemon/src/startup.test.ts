@@ -6,7 +6,6 @@ import { cleanupOrphanStatuses, type StartupContext } from './startup.js';
 
 interface StartupFixtures {
   orphanedTasks?: Task[];
-  queuedTasks?: Task[];
   /** Returned by the IDLE + ready_for_prompt=false sweep query */
   idleNotReadySessions?: Session[];
   /** Lookup table for tasksService.get / sessionsService.get */
@@ -30,11 +29,8 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
       touchDb();
       return fixtures.orphanedTasks ?? [];
     }),
-    find: vi.fn(async (params: { query?: { status?: string } }) => {
+    find: vi.fn(async () => {
       touchDb();
-      if (params?.query?.status === TaskStatus.QUEUED) {
-        return { data: fixtures.queuedTasks ?? [] };
-      }
       return { data: [] };
     }),
     get: vi.fn(async (id: string) => {
@@ -46,6 +42,7 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
       return task;
     }),
     patch: vi.fn(),
+    releaseExecutorTurn: vi.fn(),
   };
   const sessionsService = {
     find: vi.fn(async (params: { query?: { status?: string; ready_for_prompt?: boolean } }) => {
@@ -124,10 +121,24 @@ describe('startup tenant database scope', () => {
     await expect(cleanupOrphanStatuses(ctx)).resolves.toMatchObject({
       orphanedTasks: [],
       orphanedSessions: [],
-      queuedTasks: [],
-      sessionsResetFromOrphanedTasks: 0,
     });
     expect(baseDb.marker).toHaveBeenCalled();
+  });
+
+  it('releases interrupted executor turns without draining before listen', async () => {
+    const task = makeTask({
+      status: TaskStatus.COMPLETED,
+      executor_attempt: { id: 'attempt-1' },
+    });
+    const { ctx, tasksService } = makeStartupContextWithGuardedDb({ orphanedTasks: [task] });
+
+    await cleanupOrphanStatuses(ctx);
+
+    expect(tasksService.patch).not.toHaveBeenCalled();
+    expect(tasksService.releaseExecutorTurn).toHaveBeenCalledWith(
+      { task_id: task.task_id, executor_attempt_id: 'attempt-1' },
+      expect.objectContaining({ suppressTerminalQueueProcessing: true })
+    );
   });
 
   it('demonstrates guarded startup DB access fails without scope', () => {

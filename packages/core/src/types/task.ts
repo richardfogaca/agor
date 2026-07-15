@@ -108,6 +108,39 @@ export function isTaskExecuting(task: TaskExecutionState): boolean {
   return EXECUTING_TASK_STATUSES.has(task.status);
 }
 
+/** True until an admitted executor has finished all post-turn cleanup. */
+export function isTaskTurnHolding(task: Pick<Task, 'status' | 'executor_attempt'>): boolean {
+  return isTaskExecuting(task) || (!!task.executor_attempt && !task.executor_attempt.released_at);
+}
+
+/** Add the canonical timestamps and duration for a task's first terminal transition. */
+export function finalizeTerminalTaskPatch(current: Task, updates: Partial<Task>): Partial<Task> {
+  const completedAt = updates.completed_at ?? new Date().toISOString();
+  const startTime =
+    current.started_at ?? current.message_range?.start_timestamp ?? current.created_at;
+  const endTimestamp = current.message_range?.end_timestamp;
+  const startTimestamp = current.message_range?.start_timestamp;
+
+  return {
+    ...updates,
+    completed_at: completedAt,
+    ...(updates.duration_ms == null && startTime
+      ? {
+          duration_ms: Math.max(0, new Date(completedAt).getTime() - new Date(startTime).getTime()),
+        }
+      : {}),
+    ...(current.message_range && (!endTimestamp || endTimestamp === startTimestamp)
+      ? {
+          message_range: {
+            ...current.message_range,
+            ...updates.message_range,
+            end_timestamp: completedAt,
+          },
+        }
+      : {}),
+  };
+}
+
 /**
  * Authoritative context-window snapshot captured at task completion.
  *
@@ -135,6 +168,36 @@ export interface ExecutorClaim {
 
 export interface ExecutorTelemetryReport extends ExecutorClaim {
   heartbeat: boolean;
+  pulse?: Omit<ExecutorPulse, 'at'>;
+}
+
+export const ExecutorPulseKind = {
+  SDK_STARTED: 'sdk.started',
+  ASSISTANT_STREAM: 'assistant.stream',
+  THINKING_PROGRESS: 'thinking.progress',
+} as const;
+
+export type ExecutorPulseKind = (typeof ExecutorPulseKind)[keyof typeof ExecutorPulseKind];
+
+export interface ExecutorPulse {
+  kind: ExecutorPulseKind;
+  at: string;
+  id?: string;
+}
+
+const EXECUTOR_PULSE_KIND_SET: ReadonlySet<string> = new Set(Object.values(ExecutorPulseKind));
+const MAX_EXECUTOR_PULSE_ID_LENGTH = 200;
+
+export function sanitizeExecutorPulse(value: unknown): Omit<ExecutorPulse, 'at'> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const { kind, id } = value as Record<string, unknown>;
+  if (typeof kind !== 'string' || !EXECUTOR_PULSE_KIND_SET.has(kind)) return null;
+  return {
+    kind: kind as ExecutorPulseKind,
+    ...(typeof id === 'string' && id.trim()
+      ? { id: id.trim().slice(0, MAX_EXECUTOR_PULSE_ID_LENGTH) }
+      : {}),
+  };
 }
 
 export interface Task {
@@ -153,7 +216,7 @@ export interface Task {
   status: TaskStatus;
 
   /** Durable ownership, launch, cleanup, and post-turn evidence for this turn. */
-  executor_attempt?: { id: string };
+  executor_attempt?: { id: string; released_at?: string; release_error?: string };
 
   /**
    * Queue position when status is QUEUED. Lower values drain first.
@@ -275,5 +338,6 @@ export interface Task {
   executor_connected_at?: string;
   /** Latest heartbeat emitted by the executor while this task is active. */
   last_executor_heartbeat_at?: string; // UTC ISO string
+  latest_executor_pulse?: ExecutorPulse;
   completed_at?: string; // When task reached terminal status (UTC ISO string)
 }

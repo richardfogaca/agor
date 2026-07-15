@@ -3,7 +3,24 @@ import { describe, expect, it, vi } from 'vitest';
 import { TasksService } from './tasks';
 
 describe('TasksService executor heartbeat helpers', () => {
-  it('fails lost heartbeat tasks and marks the session failed without draining its queue', async () => {
+  it('does not bypass executor release when using the complete helper', async () => {
+    const completedTask = {
+      task_id: '018f0000-0000-7000-8000-000000000099',
+      session_id: '018f0000-0000-7000-8000-000000000098',
+      status: TaskStatus.COMPLETED,
+      executor_attempt: { id: 'attempt-1' },
+    };
+    const service = Object.create(TasksService.prototype) as TasksService & {
+      patch: ReturnType<typeof vi.fn>;
+    };
+    service.patch = vi.fn().mockResolvedValue(completedTask);
+
+    await service.complete(completedTask.task_id, {});
+
+    expect(service.patch).toHaveBeenCalledOnce();
+  });
+
+  it('fails lost heartbeat tasks without releasing the executor turn', async () => {
     const taskId = '018f0000-0000-7000-8000-000000000001';
     const sessionId = '018f0000-0000-7000-8000-000000000002';
     const currentTask = {
@@ -69,14 +86,7 @@ describe('TasksService executor heartbeat helpers', () => {
       error_message: 'Executor heartbeat lost',
       duration_ms: 5000,
     });
-    expect(sessionsPatch).toHaveBeenCalledWith(
-      sessionId,
-      { status: 'failed', ready_for_prompt: true },
-      expect.objectContaining({
-        user: { user_id: '018f0000-0000-7000-8000-000000000009' },
-        suppressTerminalQueueProcessing: true,
-      })
-    );
+    expect(sessionsPatch).not.toHaveBeenCalled();
     expect(triggerQueueProcessing).not.toHaveBeenCalled();
   });
 

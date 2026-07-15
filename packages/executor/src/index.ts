@@ -16,9 +16,12 @@ import type {
   SessionID,
   TaskID,
 } from '@agor/core/types';
-import { TaskStatus } from '@agor/core/types';
+import { ExecutorPulseKind, TaskStatus } from '@agor/core/types';
 import { patchConsole } from '@agor/core/utils/logger';
-import { type ExecutorHeartbeatHandle, startExecutorHeartbeat } from './executor-heartbeat.js';
+import {
+  type ExecutorHeartbeatHandle,
+  startExecutorRuntimeOverseer,
+} from './executor-heartbeat.js';
 import type { ResolvedConfigSlice } from './payload-types.js';
 import { globalPermissionManager } from './permissions/permission-manager.js';
 import { type AgorClient, createFeathersClient } from './services/feathers-client.js';
@@ -166,14 +169,13 @@ export class AgorExecutor {
     this.isRunning = true;
 
     const heartbeatConfig = this.config.resolvedConfig?.execution?.executor_heartbeat;
-    this.heartbeat = startExecutorHeartbeat({
+    this.heartbeat = startExecutorRuntimeOverseer({
       client: this.client,
       taskId: this.config.taskId,
       executorAttemptId: this.config.executorAttemptId,
       enabled: heartbeatConfig?.enabled ?? true,
       intervalMs: heartbeatConfig?.interval_ms,
     });
-
     executorDebug(`[executor] Executing task with ${this.config.tool}...`);
 
     try {
@@ -182,6 +184,7 @@ export class AgorExecutor {
         './handlers/sdk/tool-registry.js'
       );
       await initializeToolRegistry();
+      this.heartbeat.observe(ExecutorPulseKind.SDK_STARTED);
 
       // Execute using registry
       await ToolRegistry.execute(this.config.tool, {
@@ -193,8 +196,10 @@ export class AgorExecutor {
         abortController: this.abortController,
         messageSource: this.config.messageSource,
         resolvedConfig: this.config.resolvedConfig,
+        runtime: this.heartbeat,
       });
     } finally {
+      await this.heartbeat?.flush();
       this.heartbeat?.stop();
       this.heartbeat = null;
       this.isRunning = false;
