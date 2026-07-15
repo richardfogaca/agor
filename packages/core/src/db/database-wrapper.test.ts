@@ -1,7 +1,7 @@
-import { sql } from 'drizzle-orm';
+import { eq, type SQL, sql } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
-import { dateTruncUtc } from './database-wrapper';
+import { dateTruncUtc, lockRowForUpdate } from './database-wrapper';
 import { tasks } from './schema.postgres';
 
 describe('dateTruncUtc', () => {
@@ -16,4 +16,13 @@ describe('dateTruncUtc', () => {
     expect(rendered.sql).toContain("date_trunc('week'");
     expect(rendered.sql).not.toContain('date_trunc($');
   });
+});
+
+it('uses a row lock compatible with earlier foreign-key checks', async () => {
+  let query: SQL | undefined;
+  const transaction = { execute: async (value: SQL) => (query = value) };
+
+  await lockRowForUpdate(transaction as never, {} as never, tasks, eq(tasks.task_id, 'task-1'));
+
+  expect(new PgDialect().sqlToQuery(query!).sql).toContain('FOR NO KEY UPDATE');
 });

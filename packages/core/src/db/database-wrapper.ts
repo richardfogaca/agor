@@ -212,10 +212,10 @@ export function dateTruncUtc(db: Database, column: SQL | any, bucket: DateBucket
 }
 
 /**
- * Acquire a row-level lock within a transaction (PostgreSQL FOR UPDATE).
+ * Acquire a row-level lock within a transaction.
  *
- * On PostgreSQL, executes `SELECT 1 FROM <table> WHERE <pk> = <id> FOR UPDATE`
- * so that concurrent transactions block until this one commits.
+ * On PostgreSQL, uses `FOR NO KEY UPDATE` to serialize row changes while staying
+ * compatible with foreign-key checks taken earlier in the transaction.
  * On SQLite, this is a no-op — SQLite's transaction model provides implicit locking.
  *
  * @param tx - Transaction context (from db.transaction callback)
@@ -231,7 +231,7 @@ export async function lockRowForUpdate(
 ): Promise<void> {
   if (isPostgresDatabase(db)) {
     // biome-ignore lint/suspicious/noExplicitAny: Transaction context requires type assertion for raw SQL execution
-    await (tx as any).execute(sql`SELECT 1 FROM ${table} WHERE ${where} FOR UPDATE`);
+    await (tx as any).execute(sql`SELECT 1 FROM ${table} WHERE ${where} FOR NO KEY UPDATE`);
   }
   // SQLite: no-op — implicit locking via transaction
 }
