@@ -482,6 +482,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
     DAEMON_HOST,
     safeService,
     getSocketServer,
+    sessionsService,
     terminalsService,
   } = ctx;
 
