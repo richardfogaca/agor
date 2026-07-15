@@ -388,6 +388,12 @@ The paired `executor_stop_command_template` is required for configured executors
 idempotent and return only after the workload is gone. It supports `{task_id}`, `{session_id}`,
 `{executor_attempt_id}`, and `{termination_reason}`.
 
+### Upgrade Remote Executors with the Daemon
+
+Remote executors are part of the daemon's runtime contract. Upgrade remote executor images to the
+same Agor release when upgrading the daemon; mixed-version daemon/executor deployments are not
+supported.
+
 ### How It Works
 
 1. Daemon receives request (e.g., start agent session)

@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { installProviderConnection, resolveApiKeyForTask } from './base-executor.js';
+import {
+  executeToolTask,
+  installProviderConnection,
+  resolveApiKeyForTask,
+} from './base-executor.js';
 
 function makeClient(error: unknown) {
   return {
@@ -138,5 +142,74 @@ describe('installProviderConnection', () => {
     const advertised = (process.env.AGOR_USER_ENV_KEYS ?? '').split(',');
     expect(advertised).not.toContain('GITHUB_TOKEN');
     expect(advertised).toContain('MY_CUSTOM_VAR');
+  });
+});
+
+describe('executeToolTask failure finalization', () => {
+  let savedEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    savedEnv = { ...process.env };
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in savedEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, savedEnv);
+  });
+
+  it('publishes the user-visible error before making the task terminal', async () => {
+    const calls: string[] = [];
+    const client = {
+      service(name: string) {
+        if (name === 'sessions') {
+          return { get: vi.fn(async () => ({ branch_id: undefined })) };
+        }
+        if (name === 'config/resolve-api-key') {
+          return {
+            create: vi.fn(async () => ({ source: 'native', useNativeAuth: true })),
+          };
+        }
+        if (name === 'messages') {
+          return {
+            find: vi.fn(async () => ({ total: 0, data: [] })),
+            create: vi.fn(async () => {
+              calls.push('message');
+              return {};
+            }),
+          };
+        }
+        if (name === 'tasks') {
+          return {
+            patch: vi.fn(async (_id: string, data: { status?: string }) => {
+              if (data.status === 'failed') calls.push('terminal');
+              return {};
+            }),
+          };
+        }
+        if (name === '/tasks/streaming') return {};
+        throw new Error(`unexpected service ${name}`);
+      },
+    } as never;
+
+    await expect(
+      executeToolTask({
+        client,
+        sessionId: '018f0000-0000-7000-8000-000000000001' as never,
+        taskId: '018f0000-0000-7000-8000-000000000002' as never,
+        prompt: 'fail',
+        abortController: new AbortController(),
+        apiKeyEnvVar: 'OPENAI_API_KEY',
+        toolName: 'codex',
+        createTool: () => ({
+          executePromptWithStreaming: vi.fn(async () => {
+            throw new Error('expected failure');
+          }),
+        }),
+      })
+    ).rejects.toThrow('expected failure');
+
+    expect(calls).toEqual(['message', 'terminal']);
   });
 });

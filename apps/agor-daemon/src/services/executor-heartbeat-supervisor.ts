@@ -1,6 +1,6 @@
 import type { ResolvedExecutorHeartbeatConfig } from '@agor/core/config';
 import { shortId } from '@agor/core/db';
-import { isTerminalTaskStatus, TaskStatus } from '@agor/core/types';
+import { isTerminalTaskStatus, type Task, TaskStatus } from '@agor/core/types';
 import type { Application, TasksServiceImpl } from '../declarations.js';
 
 export const EXECUTOR_HEARTBEAT_LOST_MESSAGE =
@@ -8,6 +8,17 @@ export const EXECUTOR_HEARTBEAT_LOST_MESSAGE =
 export const EXECUTOR_DISPATCH_TIMEOUT_MESSAGE =
   'Executor did not connect before the dispatch deadline.';
 const MAX_SUPERVISOR_TICK_MS = 30_000;
+
+function executorLeaseAgeMs(task: Task, nowMs: number): number | undefined {
+  const observedAt =
+    (isTerminalTaskStatus(task.status) ? task.completed_at : undefined) ??
+    task.last_executor_heartbeat_at ??
+    task.executor_connected_at ??
+    task.started_at ??
+    task.created_at;
+  const observedMs = new Date(observedAt).getTime();
+  return Number.isFinite(observedMs) ? nowMs - observedMs : undefined;
+}
 
 export interface ExecutorHeartbeatSupervisorOptions {
   app: Application;
@@ -57,29 +68,8 @@ export class ExecutorHeartbeatSupervisor {
       for (const task of tasks) {
         const attempt = task.executor_attempt;
         if (!attempt || attempt.released_at) continue;
-        if (isTerminalTaskStatus(task.status)) {
-          try {
-            await tasksService.finalizeExecutorTurn(
-              { task_id: task.task_id, executor_attempt_id: attempt.id },
-              undefined
-            );
-          } catch (error) {
-            console.warn(
-              `[executor-heartbeat] Failed to finalize task ${shortId(task.task_id)}:`,
-              error instanceof Error ? error.message : String(error)
-            );
-          }
-          continue;
-        }
-
-        const observedAt =
-          task.last_executor_heartbeat_at ??
-          task.executor_connected_at ??
-          task.started_at ??
-          task.created_at;
-        const observedMs = new Date(observedAt).getTime();
-        if (!Number.isFinite(observedMs)) continue;
-        if (nowMs - observedMs <= this.options.config.stale_after_ms) continue;
+        const ageMs = executorLeaseAgeMs(task, nowMs);
+        if (ageMs === undefined || ageMs <= this.options.config.stale_after_ms) continue;
 
         try {
           const current = await tasksService.get(task.task_id);
@@ -90,43 +80,40 @@ export class ExecutorHeartbeatSupervisor {
           ) {
             continue;
           }
-          const currentObservedMs = new Date(
-            current.last_executor_heartbeat_at ??
-              current.executor_connected_at ??
-              current.started_at ??
-              current.created_at
-          ).getTime();
-          if (
-            !Number.isFinite(currentObservedMs) ||
-            nowMs - currentObservedMs <= this.options.config.stale_after_ms
-          ) {
+          const currentAgeMs = executorLeaseAgeMs(current, nowMs);
+          if (currentAgeMs === undefined || currentAgeMs <= this.options.config.stale_after_ms) {
             continue;
           }
 
-          if (task.status === TaskStatus.STOPPING) {
-            await tasksService.patch(
-              task.task_id,
-              { status: TaskStatus.STOPPED, completed_at: this.now().toISOString() },
-              {
-                suppressTerminalQueueProcessing: true,
-                suppressCompletionCallbacks: true,
-              }
-            );
-          } else {
-            await tasksService.failForLostHeartbeat(task.task_id, {
-              completed_at: this.now().toISOString(),
-              error_message:
-                task.status === TaskStatus.DISPATCHING
-                  ? EXECUTOR_DISPATCH_TIMEOUT_MESSAGE
-                  : EXECUTOR_HEARTBEAT_LOST_MESSAGE,
-            });
+          if (!isTerminalTaskStatus(current.status)) {
+            if (current.status === TaskStatus.STOPPING) {
+              await tasksService.patch(
+                task.task_id,
+                { status: TaskStatus.STOPPED, completed_at: this.now().toISOString() },
+                {
+                  suppressTerminalQueueProcessing: true,
+                  suppressCompletionCallbacks: true,
+                }
+              );
+            } else {
+              await tasksService.failForLostHeartbeat(task.task_id, {
+                completed_at: this.now().toISOString(),
+                error_message:
+                  current.status === TaskStatus.DISPATCHING
+                    ? EXECUTOR_DISPATCH_TIMEOUT_MESSAGE
+                    : EXECUTOR_HEARTBEAT_LOST_MESSAGE,
+              });
+            }
           }
+
+          // Process exit is the normal finalization signal. This path only
+          // recovers attempts whose executor lease went stale.
           await tasksService.finalizeExecutorTurn({
             task_id: task.task_id,
             executor_attempt_id: attempt.id,
           });
           console.warn(
-            `[executor-heartbeat] Reconciled stale task ${shortId(task.task_id)} (${nowMs - observedMs}ms old)`
+            `[executor-heartbeat] Reconciled stale task ${shortId(task.task_id)} (${currentAgeMs}ms old)`
           );
         } catch (error) {
           console.warn(

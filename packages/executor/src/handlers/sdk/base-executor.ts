@@ -642,10 +642,9 @@ export async function executeToolTask(params: {
       };
     }
 
-    // Update task status to failed with git SHA
-    await client.service('tasks').patch(taskId, patchData);
-
-    // Emit a system error message so the user sees what went wrong in the conversation
+    // Publish the user-visible failure before the terminal transition. Terminal
+    // status is the executor's final required write, after which the daemon may
+    // safely stop and finalize the workload.
     try {
       const existingMessages = await client.service('messages').find({
         query: { session_id: sessionId, $limit: 0 },
@@ -671,6 +670,8 @@ export async function executeToolTask(params: {
     } catch (msgErr) {
       console.error(`[${toolName}] Failed to create error message:`, msgErr);
     }
+
+    await client.service('tasks').patch(taskId, patchData);
 
     throw err;
   } finally {
