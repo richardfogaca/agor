@@ -12,6 +12,7 @@ const MAX_SUPERVISOR_TICK_MS = 30_000;
 export interface ExecutorHeartbeatSupervisorOptions {
   app: Application;
   config: ResolvedExecutorHeartbeatConfig;
+  runInTenantScope?: <T>(work: () => Promise<T>) => Promise<T>;
   tickIntervalMs?: number;
   now?: () => Date;
 }
@@ -42,6 +43,11 @@ export class ExecutorHeartbeatSupervisor {
   }
 
   async checkOnce(): Promise<void> {
+    const run = () => this.checkOnceInTenantScope();
+    return this.options.runInTenantScope ? this.options.runInTenantScope(run) : run();
+  }
+
+  private async checkOnceInTenantScope(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {

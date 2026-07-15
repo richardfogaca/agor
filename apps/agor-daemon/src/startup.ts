@@ -574,7 +574,11 @@ export async function startup(ctx: StartupContext): Promise<void> {
 
   // 5. Start executor heartbeat stale supervisor
   const heartbeatConfig = resolveExecutorHeartbeatConfig(config.execution);
-  const heartbeatSupervisor = new ExecutorHeartbeatSupervisor({ app, config: heartbeatConfig });
+  const heartbeatSupervisor = new ExecutorHeartbeatSupervisor({
+    app,
+    config: heartbeatConfig,
+    runInTenantScope: (work) => runStartupTenantDatabaseScope(ctx, work),
+  });
   heartbeatSupervisor.start();
   if (heartbeatConfig.enabled) {
     console.log(

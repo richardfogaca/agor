@@ -13,6 +13,21 @@ const config = {
 };
 
 describe('ExecutorHeartbeatSupervisor', () => {
+  it('runs background reconciliation inside the configured tenant scope', async () => {
+    const runInTenantScope = vi.fn(async (work: () => Promise<void>) => work());
+    const supervisor = new ExecutorHeartbeatSupervisor({
+      app: {
+        service: () => ({ getOrphaned: vi.fn().mockResolvedValue([]) }),
+      } as any,
+      config,
+      runInTenantScope,
+    });
+
+    await supervisor.checkOnce();
+
+    expect(runInTenantScope).toHaveBeenCalledOnce();
+  });
+
   it('marks active tasks failed when latest heartbeat is stale', async () => {
     const staleTask = {
       task_id: '018f0000-0000-7000-8000-000000000001',
