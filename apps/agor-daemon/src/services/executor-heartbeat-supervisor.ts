@@ -82,7 +82,7 @@ export class ExecutorHeartbeatSupervisor {
         if (nowMs - observedMs <= this.options.config.stale_after_ms) continue;
 
         try {
-          const current = await this.options.app.service('tasks').get(task.task_id);
+          const current = await tasksService.get(task.task_id);
           if (
             current.status !== task.status ||
             current.executor_attempt?.id !== attempt.id ||

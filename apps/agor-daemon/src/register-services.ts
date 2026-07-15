@@ -32,7 +32,6 @@ import {
   UserMCPOAuthTokenRepository,
   visibleSessionReferenceAccessExists,
 } from '@agor/core/db';
-import type { Application } from '@agor/core/feathers';
 import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import type {
   AuthenticatedParams,
@@ -55,6 +54,7 @@ import {
 import type { UnixUserMode } from '@agor/core/unix';
 import type express from 'express';
 import type {
+  Application,
   BoardsServiceImpl,
   MessagesServiceImpl,
   SessionsServiceImpl,
@@ -122,7 +122,7 @@ import { createSessionEnvSelectionsService } from './services/session-env-select
 import { createSessionMCPServersService } from './services/session-mcp-servers.js';
 import { createSessionStreamsService } from './services/session-streams.js';
 import { createSessionsService } from './services/sessions.js';
-import { createTasksService } from './services/tasks.js';
+import { createTasksService, type TasksService } from './services/tasks.js';
 import { createTemplatesService } from './services/templates.js';
 import { createTenantAgenticToolSettingsService } from './services/tenant-agentic-tools.js';
 import { TerminalsService } from './services/terminals.js';
@@ -218,11 +218,6 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     events: ['permission:request', 'permission:timeout'],
   });
 
-  // Wire up the execute handler for spawning executor processes
-  sessionsService.setExecuteHandler(
-    createExecuteHandler(ctx, sessionsService, sessionTokenService)
-  );
-
   // Realtime control-plane: browsers subscribe (create) / unsubscribe (remove)
   // to a session's per-connection streaming channel so per-chunk streaming
   // events reach only the tabs actively viewing that session. Access is gated
@@ -236,7 +231,12 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   });
   app.service('/session-streams').publish(() => []);
 
-  app.use('/tasks', createTasksService(db, app, createExecutorTurnFinalizer({ app, db, config })), {
+  const tasksService = createTasksService(
+    db,
+    app,
+    createExecutorTurnFinalizer({ app, db, config })
+  );
+  app.use('/tasks', tasksService, {
     methods: [
       'find',
       'get',
@@ -260,6 +260,12 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     //      the executor for live tool/thinking visualization.
     events: ['queued', 'tool:start', 'tool:complete', 'thinking:chunk', 'failed'],
   });
+
+  // The execute handler depends on both services; wire it only after both are registered.
+  sessionsService.setExecuteHandler(
+    createExecuteHandler(ctx, sessionsService, tasksService, sessionTokenService)
+  );
+
   app.use('/leaderboard', createLeaderboardService(db));
   const messagesService = createMessagesService(db) as unknown as MessagesServiceImpl;
 
@@ -725,6 +731,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 function createExecuteHandler(
   ctx: RegisterServicesContext,
   sessionsService: SessionsServiceImpl,
+  tasksService: TasksService,
   sessionTokenService: import('./services/session-token-service.js').SessionTokenService
 ) {
   const { db, app, config, daemonUrl } = ctx;
@@ -1013,10 +1020,10 @@ function createExecuteHandler(
         console.log(`${logPrefix} Exited with code ${code}`);
         try {
           await workloadRegistration;
-          const currentTask = await app.service('tasks').get(taskId, params);
+          const currentTask = await tasksService.get(taskId, params);
           if (isTaskExecuting(currentTask)) {
             const stopping = currentTask.status === TaskStatus.STOPPING;
-            await app.service('tasks').patch(
+            await tasksService.patch(
               taskId,
               {
                 status: stopping ? TaskStatus.STOPPED : TaskStatus.FAILED,
@@ -1030,7 +1037,7 @@ function createExecuteHandler(
             );
           }
           await runWithTenantDatabaseScope(db, tenantId, () =>
-            app.service('tasks').finalizeExecutorTurn(
+            tasksService.finalizeExecutorTurn(
               {
                 task_id: taskId,
                 executor_attempt_id: data.executorAttemptId,

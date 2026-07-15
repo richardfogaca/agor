@@ -32,6 +32,7 @@ import type {
   SessionArchiveOptions,
   SessionArchiveResult,
 } from './services/sessions.js';
+import type { TaskParams } from './services/tasks.js';
 
 // Re-export core types for convenience
 export type AuthenticatedUser = CoreAuthenticatedUser;
@@ -122,24 +123,24 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
 /**
  * Tasks service with custom methods (server-side implementation)
  */
-export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersParams> {
-  reserveExecutorStop(sessionId: SessionID, params?: FeathersParams): Promise<Task | null>;
-  connectExecutor(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
-  reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: FeathersParams): Promise<Task>;
-  releaseExecutorTurn(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
-  finalizeExecutorTurn(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
+export interface TasksServiceImpl extends Service<Task, Partial<Task>, TaskParams> {
+  reserveExecutorStop(sessionId: SessionID, params?: TaskParams): Promise<Task | null>;
+  connectExecutor(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
+  reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: TaskParams): Promise<Task>;
+  releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
+  finalizeExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
   createMany(data: Array<Partial<Task>>): Promise<Task[]>;
   complete(
     id: string,
     data: { git_state?: { sha_at_end?: string; commit_message?: string } },
-    params?: FeathersParams
+    params?: TaskParams
   ): Promise<Task>;
-  fail(id: string, data: { error?: string }, params?: FeathersParams): Promise<Task>;
-  getOrphaned(params?: FeathersParams): Promise<Task[]>;
+  fail(id: string, data: { error?: string }, params?: TaskParams): Promise<Task>;
+  getOrphaned(params?: TaskParams): Promise<Task[]>;
   failForLostHeartbeat(
     id: string,
     data: { completed_at?: string; error_message: string },
-    params?: FeathersParams
+    params?: TaskParams
   ): Promise<Task>;
 }
 
