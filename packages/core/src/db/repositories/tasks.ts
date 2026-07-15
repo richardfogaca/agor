@@ -640,11 +640,39 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     );
   }
 
+  /** Attempt-fenced metadata used to recover cleanup after daemon restart. */
+  async patchExecutorAttempt(
+    id: string,
+    attemptId: string,
+    patch: Partial<NonNullable<Task['executor_attempt']>>
+  ): Promise<Task | null> {
+    const fullId = await this.resolveId(id);
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockTask(db, fullId);
+        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
+        if (!row) throw new EntityNotFoundError('Task', id);
+        const current = this.rowToTask(row);
+        if (current.executor_attempt?.id !== attemptId || current.executor_attempt.released_at) {
+          return null;
+        }
+        const task = {
+          ...current,
+          executor_attempt: { ...current.executor_attempt, ...patch, id: attemptId },
+        } satisfies Task;
+        const data = this.taskToInsert(task);
+        await update(db, tasks).set({ data: data.data }).where(eq(tasks.task_id, fullId)).run();
+        return task;
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
   /** Release admission only after the attempt is terminal and its external effects are settled. */
   async releaseExecutorTurn(
     id: string,
-    attemptId: string,
-    releaseError?: string
+    attemptId: string
   ): Promise<{ task: Task; released: boolean } | null> {
     const { fullId, task: known } = await this.resolveExisting(id);
     return runDatabaseTransaction(
@@ -663,9 +691,9 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         const task = {
           ...current,
           executor_attempt: {
-            id: attemptId,
+            ...current.executor_attempt,
             released_at: new Date().toISOString(),
-            ...(releaseError ? { release_error: releaseError } : {}),
+            finalization_error: undefined,
           },
         } satisfies Task;
         const data = this.taskToInsert(task);

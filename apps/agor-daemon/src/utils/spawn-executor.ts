@@ -89,8 +89,10 @@ export interface ExecutorTemplateVariables {
   unix_user_uid?: number;
   unix_user_gid?: number;
   session_id?: string;
+  executor_attempt_id?: string;
   branch_id?: string;
   log_level?: string;
+  termination_reason?: string;
 }
 
 export interface SpawnExecutorOptions {
@@ -104,9 +106,11 @@ export interface SpawnExecutorOptions {
   templateVariables?: ExecutorTemplateVariables;
   onExit?: (code: number | null) => void;
   /** Fired after spawn, before stdin is written. Works for both local and templated paths. */
-  onSpawn?: (child: ChildProcess) => void;
+  onSpawn?: (child: ChildProcess) => void | Promise<void>;
   /** Caller-assembled env; bypasses internal curation. Ignored by templated path. */
   preparedEnv?: Record<string, string>;
+  /** Create a process group so the complete workload can be signalled and verified. */
+  detached?: boolean;
   /** Pre-written 0600 env file; bypasses prepareImpersonationEnv(). Only with asUser. */
   preparedEnvFilePath?: string;
 }
@@ -125,6 +129,29 @@ export interface RunExecutorCommandOptions
   extends Omit<SpawnExecutorOptions, 'onExit' | 'onSpawn'> {
   /** Optional timeout for short-lived command execution. */
   timeoutMs?: number;
+}
+
+function startSpawnedExecutor(
+  child: ChildProcess,
+  payload: Record<string, unknown>,
+  onSpawn: SpawnExecutorOptions['onSpawn'],
+  onError: (error: unknown) => void
+): void {
+  const start = () => {
+    child.stdin?.write(JSON.stringify(payload));
+    child.stdin?.end();
+  };
+  const fail = (error: unknown) => {
+    child.kill('SIGKILL');
+    onError(error);
+  };
+  try {
+    const registration = onSpawn?.(child);
+    if (registration) void registration.then(start).catch(fail);
+    else start();
+  } catch (error) {
+    fail(error);
+  }
 }
 
 /**
@@ -150,8 +177,10 @@ export function substituteTemplateVariables(
     unix_user_uid: variables.unix_user_uid,
     unix_user_gid: variables.unix_user_gid,
     session_id: variables.session_id,
+    executor_attempt_id: variables.executor_attempt_id,
     branch_id: variables.branch_id,
     log_level: variables.log_level,
+    termination_reason: variables.termination_reason,
   };
 
   for (const [key, value] of Object.entries(substitutions)) {
@@ -370,7 +399,7 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
     cwd,
     env: asUser ? undefined : { ...envWithDaemonUrl }, // When impersonating, env is in the command; otherwise pass to spawn
     stdio: ['pipe', 'inherit', 'inherit'], // stdin: pipe, stdout/stderr: inherit (show in daemon logs)
-    detached: false, // Don't detach - let daemon manage lifecycle
+    detached: options.detached ?? false,
   });
 
   // Best-effort safety-net cleanup: the inner bash script `rm -f`s the env
@@ -379,7 +408,10 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
   // uses `sudo -u <asUser> rm -f` so it works under sticky /tmp.
   attachEnvFileCleanup(executorProcess, { envFilePath: prepared.envFilePath, asUser });
 
-  onSpawn?.(executorProcess);
+  startSpawnedExecutor(executorProcess, payload, onSpawn, (error) => {
+    console.error(`${logPrefix} Workload registration failed:`, error);
+    reportExit(127);
+  });
 
   executorProcess.on('error', (error) => {
     console.error(`${logPrefix} Spawn error:`, error.message);
@@ -398,9 +430,6 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
     }
     reportExit(code);
   });
-
-  executorProcess.stdin?.write(JSON.stringify(payload));
-  executorProcess.stdin?.end();
 }
 
 function spawnExecutorWithTemplate(
@@ -428,11 +457,21 @@ function spawnExecutorWithTemplate(
   };
 
   const executorProcess = spawn('sh', ['-c', command], {
-    env: { ...process.env, LOG_LEVEL: logLevel },
+    env: {
+      ...process.env,
+      LOG_LEVEL: logLevel,
+      ...(templateVariables.executor_attempt_id
+        ? { AGOR_EXECUTOR_ATTEMPT_ID: templateVariables.executor_attempt_id }
+        : {}),
+    },
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: options.detached ?? false,
   });
 
-  options.onSpawn?.(executorProcess);
+  startSpawnedExecutor(executorProcess, payload, options.onSpawn, (error) => {
+    console.error(`${logPrefix} Workload registration failed:`, error);
+    reportExit(127);
+  });
 
   executorProcess.stdout?.on('data', (data) => {
     console.log(`${logPrefix} ${data.toString().trim()}`);
@@ -459,9 +498,6 @@ function spawnExecutorWithTemplate(
     }
     reportExit(code);
   });
-
-  executorProcess.stdin?.write(JSON.stringify(payload));
-  executorProcess.stdin?.end();
 }
 
 const EXECUTOR_RESULT_PREFIX = 'AGOR_EXECUTOR_RESULT ';

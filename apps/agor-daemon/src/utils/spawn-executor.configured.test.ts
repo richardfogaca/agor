@@ -33,6 +33,7 @@ function createMockProcess() {
     stdout: EventEmitter;
     stderr: EventEmitter;
     written: string;
+    kill: ReturnType<typeof vi.fn>;
   };
   proc.written = '';
   proc.stdin = new Writable({
@@ -43,6 +44,7 @@ function createMockProcess() {
   });
   proc.stdout = new EventEmitter();
   proc.stderr = new EventEmitter();
+  proc.kill = vi.fn();
   return proc;
 }
 
@@ -126,6 +128,25 @@ describe('configured executor spawning', () => {
     proc.emit('exit', 17);
 
     expect(onExit).toHaveBeenCalledWith(17);
+  });
+
+  it('does not send work before asynchronous workload registration completes', async () => {
+    const proc = createMockProcess();
+    spawnMock.mockReturnValue(proc);
+    let registered!: () => void;
+    const registration = new Promise<void>((resolve) => (registered = resolve));
+    const { spawnExecutor } = await import('./spawn-executor');
+
+    spawnExecutor(
+      { command: 'prompt' },
+      { executorCommandTemplate: 'echo {command}', onSpawn: () => registration }
+    );
+    expect(proc.written).toBe('');
+
+    registered();
+    await registration;
+    await Promise.resolve();
+    expect(JSON.parse(proc.written)).toMatchObject({ command: 'prompt' });
   });
 
   it('keeps createConfiguredSpawner isolated from module-level defaults', async () => {

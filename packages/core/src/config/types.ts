@@ -465,6 +465,13 @@ export interface AgorExecutionSettings {
   executor_command_template?: string;
 
   /**
+   * Idempotent cleanup command paired with `executor_command_template`.
+   * Supports `{task_id}`, `{session_id}`, `{executor_attempt_id}`, and
+   * `{termination_reason}` and must return only after the workload is stopped.
+   */
+  executor_stop_command_template?: string;
+
+  /**
    * Required user environment variables.
    * When set, prompts are blocked if any listed var is missing from the user's resolved environment.
    * Users are directed to Settings → Environment Variables to configure them.

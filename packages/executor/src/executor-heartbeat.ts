@@ -7,6 +7,8 @@ export interface ExecutorHeartbeatOptions {
   executorAttemptId: string;
   enabled?: boolean;
   intervalMs?: number;
+  staleAfterMs?: number;
+  onLeaseLost?: (error?: unknown) => void;
   warn?: (...args: unknown[]) => void;
 }
 
@@ -20,6 +22,7 @@ export interface ExecutorHeartbeatHandle extends ExecutorRuntimeObserver {
 }
 
 const DEFAULT_INTERVAL_MS = 10_000;
+const DEFAULT_STALE_AFTER_MS = 30_000;
 
 export function startExecutorRuntimeOverseer(
   options: ExecutorHeartbeatOptions
@@ -36,15 +39,35 @@ export function startExecutorRuntimeOverseer(
       ? Math.floor(options.intervalMs)
       : DEFAULT_INTERVAL_MS;
   const warn = options.warn ?? console.warn;
+  const staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
   let stopped = false;
+  let leaseLost = false;
+  let lastAcknowledgedAt = Date.now();
   let pending: Promise<void> | undefined;
   let pulse: { kind: ExecutorPulseKind; id?: string } | undefined;
   let sentPulse = '';
   let timer: ReturnType<typeof setInterval> | undefined;
 
+  const checkLease = (error?: unknown) => {
+    const code =
+      error && typeof error === 'object' && 'code' in error
+        ? Number((error as { code?: unknown }).code)
+        : undefined;
+    if (
+      !leaseLost &&
+      ([401, 403, 409].includes(code ?? 0) || Date.now() - lastAcknowledgedAt >= staleAfterMs)
+    ) {
+      leaseLost = true;
+      stopped = true;
+      if (timer) clearInterval(timer);
+      options.onLeaseLost?.(error);
+    }
+  };
+
   const emit = async () => {
     if (stopped) return;
     if (pending) {
+      checkLease();
       await pending;
       const latestKey = pulse ? `${pulse.kind}:${pulse.id ?? ''}` : '';
       if (latestKey && latestKey !== sentPulse) return emit();
@@ -61,6 +84,7 @@ export function startExecutorRuntimeOverseer(
         ...(snapshot && pulseKey !== sentPulse ? { pulse: snapshot } : {}),
       })
       .then(() => {
+        lastAcknowledgedAt = Date.now();
         if (snapshot) sentPulse = pulseKey;
       })
       .catch((error) => {
@@ -68,6 +92,7 @@ export function startExecutorRuntimeOverseer(
           '[executor-overseer] Failed to report runtime telemetry:',
           error instanceof Error ? error.message : String(error)
         );
+        checkLease(error);
       })
       .finally(() => {
         pending = undefined;

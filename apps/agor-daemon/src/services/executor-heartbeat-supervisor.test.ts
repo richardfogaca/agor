@@ -29,7 +29,7 @@ describe('ExecutorHeartbeatSupervisor', () => {
             getOrphaned: vi.fn().mockResolvedValue([staleTask]),
             get: vi.fn().mockResolvedValue(staleTask),
             failForLostHeartbeat,
-            releaseExecutorTurn: vi.fn(),
+            finalizeExecutorTurn: vi.fn(),
           };
         }
         throw new Error(`unknown service ${name}`);
@@ -90,13 +90,13 @@ describe('ExecutorHeartbeatSupervisor', () => {
       executor_attempt: { id: 'attempt-2' },
     };
     const failForLostHeartbeat = vi.fn().mockResolvedValue({});
-    const releaseExecutorTurn = vi.fn().mockResolvedValue({});
+    const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
     const app = {
       service: () => ({
         getOrphaned: vi.fn().mockResolvedValue([task]),
         get: vi.fn().mockResolvedValue(task),
         failForLostHeartbeat,
-        releaseExecutorTurn,
+        finalizeExecutorTurn,
       }),
     } as any;
     const supervisor = new ExecutorHeartbeatSupervisor({
@@ -111,7 +111,7 @@ describe('ExecutorHeartbeatSupervisor', () => {
       task.task_id,
       expect.objectContaining({ error_message: EXECUTOR_DISPATCH_TIMEOUT_MESSAGE })
     );
-    expect(releaseExecutorTurn).toHaveBeenCalledWith({
+    expect(finalizeExecutorTurn).toHaveBeenCalledWith({
       task_id: task.task_id,
       executor_attempt_id: 'attempt-2',
     });
@@ -127,14 +127,14 @@ describe('ExecutorHeartbeatSupervisor', () => {
     };
     const patch = vi.fn().mockResolvedValue({ ...task, status: 'stopped' });
     const failForLostHeartbeat = vi.fn();
-    const releaseExecutorTurn = vi.fn().mockResolvedValue({});
+    const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
     const app = {
       service: () => ({
         getOrphaned: vi.fn().mockResolvedValue([task]),
         get: vi.fn().mockResolvedValue(task),
         patch,
         failForLostHeartbeat,
-        releaseExecutorTurn,
+        finalizeExecutorTurn,
       }),
     } as any;
     const supervisor = new ExecutorHeartbeatSupervisor({
@@ -151,7 +151,7 @@ describe('ExecutorHeartbeatSupervisor', () => {
       expect.objectContaining({ suppressTerminalQueueProcessing: true })
     );
     expect(failForLostHeartbeat).not.toHaveBeenCalled();
-    expect(releaseExecutorTurn).toHaveBeenCalledWith({
+    expect(finalizeExecutorTurn).toHaveBeenCalledWith({
       task_id: task.task_id,
       executor_attempt_id: 'attempt-4',
     });
@@ -165,11 +165,11 @@ describe('ExecutorHeartbeatSupervisor', () => {
       created_at: '2026-01-01T00:00:00.000Z',
       executor_attempt: { id: 'attempt-3' },
     };
-    const releaseExecutorTurn = vi.fn().mockResolvedValue({});
+    const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
     const app = {
       service: () => ({
         getOrphaned: vi.fn().mockResolvedValue([task]),
-        releaseExecutorTurn,
+        finalizeExecutorTurn,
       }),
     } as any;
     const supervisor = new ExecutorHeartbeatSupervisor({
@@ -179,9 +179,37 @@ describe('ExecutorHeartbeatSupervisor', () => {
 
     await supervisor.checkOnce();
 
-    expect(releaseExecutorTurn).toHaveBeenCalledWith(
+    expect(finalizeExecutorTurn).toHaveBeenCalledWith(
       { task_id: task.task_id, executor_attempt_id: 'attempt-3' },
       undefined
     );
+  });
+
+  it('does not let one fenced turn starve later retries', async () => {
+    const tasks = ['1', '2'].map((suffix) => ({
+      task_id: `018f0000-0000-7000-8000-00000000004${suffix}`,
+      session_id: `018f0000-0000-7000-8000-00000000005${suffix}`,
+      status: 'completed',
+      executor_attempt: { id: `attempt-${suffix}` },
+    }));
+    const finalizeExecutorTurn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('cleanup pending'))
+      .mockResolvedValueOnce({});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const supervisor = new ExecutorHeartbeatSupervisor({
+      app: {
+        service: () => ({
+          getOrphaned: vi.fn().mockResolvedValue(tasks),
+          finalizeExecutorTurn,
+        }),
+      } as any,
+      config,
+    });
+
+    await supervisor.checkOnce();
+
+    expect(finalizeExecutorTurn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
   });
 });

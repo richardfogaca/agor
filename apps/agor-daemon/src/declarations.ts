@@ -126,10 +126,8 @@ export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersP
   reserveExecutorStop(sessionId: SessionID, params?: FeathersParams): Promise<Task | null>;
   connectExecutor(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: FeathersParams): Promise<Task>;
-  releaseExecutorTurn(
-    data: ExecutorClaim & { release_error?: string },
-    params?: FeathersParams
-  ): Promise<Task>;
+  releaseExecutorTurn(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
+  finalizeExecutorTurn(data: ExecutorClaim, params?: FeathersParams): Promise<Task>;
   createMany(data: Array<Partial<Task>>): Promise<Task[]>;
   complete(
     id: string,

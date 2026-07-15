@@ -5,7 +5,12 @@
  */
 
 import type { Task, UUID } from '@agor/core/types';
-import { SessionStatus, sanitizeExecutorPulse, TaskStatus } from '@agor/core/types';
+import {
+  ExecutorWorkloadKind,
+  SessionStatus,
+  sanitizeExecutorPulse,
+  TaskStatus,
+} from '@agor/core/types';
 import { describe, expect, it } from 'vitest';
 import { generateId, toShortId } from '../../lib/ids';
 import type { Database } from '../client';
@@ -1368,6 +1373,24 @@ describe('TaskRepository executor turn transitions', () => {
     });
     expect(telemetry?.latest_executor_pulse?.kind).toBe('thinking.progress');
     expect(await tasks.recordExecutorTelemetry(task.task_id, generateId(), {})).toBeNull();
+
+    expect(
+      await tasks.patchExecutorAttempt(task.task_id, attemptId, {
+        workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
+        finalization_error: 'retry me',
+      })
+    ).toMatchObject({
+      executor_attempt: {
+        id: attemptId,
+        workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
+        finalization_error: 'retry me',
+      },
+    });
+    expect(
+      await tasks.patchExecutorAttempt(task.task_id, generateId(), {
+        workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 1 },
+      })
+    ).toBeNull();
   });
 
   dbTest('does not reconnect or project runtime over a reserved stop', async ({ db }) => {
@@ -1465,7 +1488,17 @@ describe('TaskRepository executor turn transitions', () => {
       ).status
     ).toBe(TaskStatus.QUEUED);
     expect(await tasks.releaseExecutorTurn(first.task_id, generateId())).toBeNull();
-    expect((await tasks.releaseExecutorTurn(first.task_id, attemptId))?.released).toBe(true);
+    await tasks.patchExecutorAttempt(first.task_id, attemptId, {
+      workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
+      finalization_error: 'cleared by release',
+    });
+    const released = await tasks.releaseExecutorTurn(first.task_id, attemptId);
+    expect(released?.released).toBe(true);
+    expect(released?.task.executor_attempt).toMatchObject({
+      id: attemptId,
+      workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
+    });
+    expect(released?.task.executor_attempt?.finalization_error).toBeUndefined();
 
     const nextAttempt = generateId();
     const admitted = await tasks.admitExecutorTurn({

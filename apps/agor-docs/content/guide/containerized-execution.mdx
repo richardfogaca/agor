@@ -368,6 +368,8 @@ execution:
         }
       }' \
       -- agor-executor --stdin
+  executor_stop_command_template: |
+    kubectl delete pod executor-{task_id} --ignore-not-found --wait=true
 ```
 
 ### Template Variables
@@ -381,6 +383,10 @@ execution:
 | `{unix_user_gid}` | Target Unix GID                         | `1001`                |
 | `{session_id}`    | Agor session ID (if available)          | `01abc123...`         |
 | `{branch_id}`   | Branch ID (if available)              | `01xyz789...`         |
+
+The paired `executor_stop_command_template` is required for configured executors. It must be
+idempotent and return only after the workload is gone. It supports `{task_id}`, `{session_id}`,
+`{executor_attempt_id}`, and `{termination_reason}`.
 
 ### How It Works
 
@@ -1030,6 +1036,8 @@ execution:
       --rm -i --restart=Never \
       --overrides='{"spec":{"securityContext":{"runAsUser":{unix_user_uid},"fsGroup":{unix_user_gid}}}}' \
       -- agor-executor --stdin
+  executor_stop_command_template: |
+    kubectl delete pod executor-{task_id} --ignore-not-found --wait=true
 ```
 
 ### Step 5: Test Single Executor

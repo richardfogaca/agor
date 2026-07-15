@@ -171,6 +171,26 @@ export interface ExecutorTelemetryReport extends ExecutorClaim {
   pulse?: Omit<ExecutorPulse, 'at'>;
 }
 
+export const ExecutorWorkloadKind = {
+  LOCAL: 'local',
+  TEMPLATED: 'templated',
+} as const;
+
+export type ExecutorWorkloadKind = (typeof ExecutorWorkloadKind)[keyof typeof ExecutorWorkloadKind];
+
+export interface ExecutorWorkloadRef {
+  kind: ExecutorWorkloadKind;
+  /** PID and process-group ID of the attempt's local workload leader. */
+  pid: number;
+}
+
+export interface ExecutorAttempt {
+  id: string;
+  workload?: ExecutorWorkloadRef;
+  released_at?: string;
+  finalization_error?: string;
+}
+
 export const ExecutorPulseKind = {
   SDK_STARTED: 'sdk.started',
   ASSISTANT_STREAM: 'assistant.stream',
@@ -216,7 +236,7 @@ export interface Task {
   status: TaskStatus;
 
   /** Durable ownership, launch, cleanup, and post-turn evidence for this turn. */
-  executor_attempt?: { id: string; released_at?: string; release_error?: string };
+  executor_attempt?: ExecutorAttempt;
 
   /**
    * Queue position when status is QUEUED. Lower values drain first.

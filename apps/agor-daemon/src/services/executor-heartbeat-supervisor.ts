@@ -2,7 +2,6 @@ import type { ResolvedExecutorHeartbeatConfig } from '@agor/core/config';
 import { shortId } from '@agor/core/db';
 import { isTerminalTaskStatus, TaskStatus } from '@agor/core/types';
 import type { Application, TasksServiceImpl } from '../declarations.js';
-import { hasExecutorProcess, killExecutorProcess } from '../executor-tracking.js';
 
 export const EXECUTOR_HEARTBEAT_LOST_MESSAGE =
   'Executor heartbeat lost; the executor may have crashed or disconnected.';
@@ -53,10 +52,15 @@ export class ExecutorHeartbeatSupervisor {
         const attempt = task.executor_attempt;
         if (!attempt || attempt.released_at) continue;
         if (isTerminalTaskStatus(task.status)) {
-          if (!hasExecutorProcess(task.session_id)) {
-            await tasksService.releaseExecutorTurn(
+          try {
+            await tasksService.finalizeExecutorTurn(
               { task_id: task.task_id, executor_attempt_id: attempt.id },
               undefined
+            );
+          } catch (error) {
+            console.warn(
+              `[executor-heartbeat] Failed to finalize task ${shortId(task.task_id)}:`,
+              error instanceof Error ? error.message : String(error)
             );
           }
           continue;
@@ -111,13 +115,10 @@ export class ExecutorHeartbeatSupervisor {
                   : EXECUTOR_HEARTBEAT_LOST_MESSAGE,
             });
           }
-          const killed = killExecutorProcess(task.session_id);
-          if (!killed) {
-            await tasksService.releaseExecutorTurn({
-              task_id: task.task_id,
-              executor_attempt_id: attempt.id,
-            });
-          }
+          await tasksService.finalizeExecutorTurn({
+            task_id: task.task_id,
+            executor_attempt_id: attempt.id,
+          });
           console.warn(
             `[executor-heartbeat] Reconciled stale task ${shortId(task.task_id)} (${nowMs - observedMs}ms old)`
           );

@@ -89,7 +89,6 @@ import type {
   SessionsServiceImpl,
   TasksServiceImpl,
 } from './declarations.js';
-import { killExecutorProcess } from './executor-tracking.js';
 import { probeDatabase, probePendingMigrations } from './health/db-probe.js';
 import {
   authenticatedHealthDb,
@@ -1349,11 +1348,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         if (executorAttemptId) {
           try {
-            await tasksService.releaseExecutorTurn(
+            await tasksService.finalizeExecutorTurn(
               {
                 task_id: taskId,
                 executor_attempt_id: executorAttemptId,
-                release_error: errorMessage,
               },
               params
             );
@@ -2073,7 +2071,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             taskRepo: new TaskRepository(db),
             sessionsService: sessionsServiceWithHooks,
             tasksService,
-            killExecutorProcess,
           },
           id as SessionID,
           params,

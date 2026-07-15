@@ -174,14 +174,21 @@ async function cleanupOrphanStatusesInTenantScope(
         } as never);
       }
       if (task.executor_attempt) {
-        await tasksService.releaseExecutorTurn(
-          { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
-          { ...startupParams, suppressTerminalQueueProcessing: true } as never
-        );
+        try {
+          await tasksService.finalizeExecutorTurn(
+            { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
+            { ...startupParams, suppressTerminalQueueProcessing: true } as never
+          );
+          startupDebug(
+            `[startup] released orphaned task ${shortId(task.task_id)} (was: ${task.status})`
+          );
+        } catch (error) {
+          console.warn(
+            `[startup] Task ${shortId(task.task_id)} remains fenced for supervisor retry:`,
+            error
+          );
+        }
       }
-      startupDebug(
-        `[startup] released orphaned task ${shortId(task.task_id)} (was: ${task.status})`
-      );
     }
   }
 

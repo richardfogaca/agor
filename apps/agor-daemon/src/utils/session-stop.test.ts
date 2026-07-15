@@ -30,11 +30,11 @@ describe('stopSessionPreserveQueue', () => {
     const tasksService = {
       reserveExecutorStop: vi.fn(async () => runningTask),
       patch: vi.fn(async (id, data) => ({ task_id: id, ...data })),
+      finalizeExecutorTurn: vi.fn(async () => runningTask),
     };
     const taskRepo = {
       findQueued: vi.fn(async () => [queuedTask]),
     };
-    const killExecutorProcess = vi.fn(() => true);
     const params = { provider: 'rest' };
 
     const result = await stopSessionPreserveQueue(
@@ -42,7 +42,6 @@ describe('stopSessionPreserveQueue', () => {
         taskRepo: taskRepo as never,
         sessionsService: sessionsService as never,
         tasksService: tasksService as never,
-        killExecutorProcess,
       },
       sessionId as never,
       params,
@@ -55,10 +54,13 @@ describe('stopSessionPreserveQueue', () => {
       stoppedTaskId: runningTask.task_id,
       queuedTasksPreserved: 1,
     });
-    expect(killExecutorProcess).toHaveBeenCalledWith(sessionId);
+    expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
+      { task_id: runningTask.task_id, executor_attempt_id: 'attempt-1' },
+      params
+    );
     expect(tasksService.patch).toHaveBeenCalledTimes(1);
     expect(tasksService.patch.mock.invocationCallOrder[0]).toBeLessThan(
-      killExecutorProcess.mock.invocationCallOrder[0]
+      tasksService.finalizeExecutorTurn.mock.invocationCallOrder[0]
     );
     expect(tasksService.patch).toHaveBeenCalledWith(
       runningTask.task_id,
@@ -92,18 +94,17 @@ describe('stopSessionPreserveQueue', () => {
     const tasksService = {
       reserveExecutorStop: vi.fn(async () => awaitingInputTask),
       patch: vi.fn(async (id, data) => ({ task_id: id, ...data })),
+      finalizeExecutorTurn: vi.fn(async () => awaitingInputTask),
     };
     const taskRepo = {
       findQueued: vi.fn(async () => []),
     };
-    const killExecutorProcess = vi.fn(() => true);
 
     const result = await stopSessionPreserveQueue(
       {
         taskRepo: taskRepo as never,
         sessionsService: sessionsService as never,
         tasksService: tasksService as never,
-        killExecutorProcess,
       },
       sessionId as never,
       {},
@@ -116,7 +117,10 @@ describe('stopSessionPreserveQueue', () => {
       stoppedTaskId: awaitingInputTask.task_id,
       queuedTasksPreserved: 0,
     });
-    expect(killExecutorProcess).toHaveBeenCalledWith(sessionId);
+    expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
+      { task_id: awaitingInputTask.task_id, executor_attempt_id: 'attempt-2' },
+      {}
+    );
     expect(tasksService.patch).toHaveBeenCalledWith(
       awaitingInputTask.task_id,
       expect.objectContaining({ status: 'stopped' }),
@@ -144,22 +148,56 @@ describe('stopSessionPreserveQueue', () => {
     const tasksService = {
       reserveExecutorStop: vi.fn(async () => completedTask),
       patch: vi.fn(),
+      finalizeExecutorTurn: vi.fn(async () => completedTask),
     };
-    const killExecutorProcess = vi.fn(() => true);
 
     const result = await stopSessionPreserveQueue(
       {
         taskRepo: { findQueued: vi.fn(async () => []) } as never,
         sessionsService: sessionsService as never,
         tasksService: tasksService as never,
-        killExecutorProcess,
       },
       sessionId as never
     );
 
     expect(result.status).toBe('stopping');
-    expect(killExecutorProcess).toHaveBeenCalledWith(sessionId);
+    expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
+      { task_id: completedTask.task_id, executor_attempt_id: 'attempt-3' },
+      {}
+    );
     expect(tasksService.patch).not.toHaveBeenCalled();
+  });
+
+  it('keeps a stopped turn fenced for supervisor retry when finalization fails', async () => {
+    const task = {
+      task_id: 'task-fenced',
+      session_id: 'session-fenced',
+      status: 'running',
+      executor_attempt: { id: 'attempt-fenced' },
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const result = await stopSessionPreserveQueue(
+      {
+        taskRepo: { findQueued: vi.fn(async () => []) } as never,
+        sessionsService: { get: vi.fn(async () => ({ status: 'running' })) } as never,
+        tasksService: {
+          reserveExecutorStop: vi.fn(async () => task),
+          patch: vi.fn(async () => task),
+          finalizeExecutorTurn: vi.fn(async () => {
+            throw new Error('cleanup pending');
+          }),
+        } as never,
+      },
+      task.session_id as never
+    );
+
+    expect(result).toMatchObject({ success: true, status: 'stopping' });
+    expect(warn).toHaveBeenCalledWith(
+      '[Stop] Cleanup remains fenced for supervisor retry:',
+      expect.any(Error)
+    );
+    warn.mockRestore();
   });
 
   it('does not stop the task if reserving the stopping state fails', async () => {
@@ -184,11 +222,11 @@ describe('stopSessionPreserveQueue', () => {
         throw new Error('reservation denied');
       }),
       patch: vi.fn(async (id, data) => ({ task_id: id, ...data })),
+      finalizeExecutorTurn: vi.fn(),
     };
     const taskRepo = {
       findQueued: vi.fn(async () => []),
     };
-    const killExecutorProcess = vi.fn(() => true);
 
     await expect(
       stopSessionPreserveQueue(
@@ -196,7 +234,6 @@ describe('stopSessionPreserveQueue', () => {
           taskRepo: taskRepo as never,
           sessionsService: sessionsService as never,
           tasksService: tasksService as never,
-          killExecutorProcess,
         },
         sessionId as never,
         { provider: 'rest' }
@@ -204,7 +241,7 @@ describe('stopSessionPreserveQueue', () => {
     ).rejects.toThrow('reservation denied');
 
     expect(tasksService.patch).not.toHaveBeenCalled();
-    expect(killExecutorProcess).not.toHaveBeenCalled();
+    expect(tasksService.finalizeExecutorTurn).not.toHaveBeenCalled();
   });
 
   it('does not signal the executor if persisting the stopped task fails', async () => {
@@ -215,7 +252,7 @@ describe('stopSessionPreserveQueue', () => {
       status: 'running',
       created_at: '2026-01-01T00:00:00.000Z',
     };
-    const killExecutorProcess = vi.fn(() => true);
+    const finalizeExecutorTurn = vi.fn();
 
     await expect(
       stopSessionPreserveQueue(
@@ -229,13 +266,13 @@ describe('stopSessionPreserveQueue', () => {
             patch: vi.fn(async () => {
               throw new Error('task patch denied');
             }),
+            finalizeExecutorTurn,
           } as never,
-          killExecutorProcess,
         },
         sessionId as never
       )
     ).rejects.toThrow('task patch denied');
 
-    expect(killExecutorProcess).not.toHaveBeenCalled();
+    expect(finalizeExecutorTurn).not.toHaveBeenCalled();
   });
 });

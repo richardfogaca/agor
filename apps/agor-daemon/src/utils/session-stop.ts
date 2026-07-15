@@ -19,8 +19,7 @@ export interface StopSessionResult {
 export interface StopSessionDeps {
   taskRepo: Pick<TaskRepository, 'findQueued'>;
   sessionsService: Pick<SessionsServiceImpl, 'get'>;
-  tasksService: Pick<TasksServiceImpl, 'patch' | 'reserveExecutorStop'>;
-  killExecutorProcess: (sessionId: string) => boolean;
+  tasksService: Pick<TasksServiceImpl, 'patch' | 'reserveExecutorStop' | 'finalizeExecutorTurn'>;
 }
 
 /**
@@ -80,11 +79,18 @@ export async function stopSessionPreserveQueue(
     );
   }
 
-  const processKilled = deps.killExecutorProcess(sessionId);
-  if (!processKilled) {
-    console.warn(
-      `⚠️  [Stop] No tracked process for session ${shortId(sessionId)} — executor may have already exited`
-    );
+  if (latestTask.executor_attempt) {
+    try {
+      await deps.tasksService.finalizeExecutorTurn(
+        {
+          task_id: latestTask.task_id,
+          executor_attempt_id: latestTask.executor_attempt.id,
+        },
+        params
+      );
+    } catch (error) {
+      console.warn('[Stop] Cleanup remains fenced for supervisor retry:', error);
+    }
   }
 
   return {

@@ -31,6 +31,7 @@ patchConsole();
 
 const DEBUG_EXECUTOR =
   process.env.AGOR_DEBUG_EXECUTOR === '1' || process.env.DEBUG?.includes('executor');
+const LEASE_LOSS_EXIT_GRACE_MS = 3_000;
 
 function executorDebug(...args: unknown[]): void {
   if (DEBUG_EXECUTOR) {
@@ -175,6 +176,13 @@ export class AgorExecutor {
       executorAttemptId: this.config.executorAttemptId,
       enabled: heartbeatConfig?.enabled ?? true,
       intervalMs: heartbeatConfig?.interval_ms,
+      staleAfterMs: heartbeatConfig?.stale_after_ms,
+      onLeaseLost: () => {
+        console.error('[executor] Runtime lease lost; aborting executor');
+        this.abortController.abort();
+        const timer = setTimeout(() => process.exit(1), LEASE_LOSS_EXIT_GRACE_MS);
+        timer.unref?.();
+      },
     });
     executorDebug(`[executor] Executing task with ${this.config.tool}...`);
 

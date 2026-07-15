@@ -480,6 +480,12 @@ describe('loadConfig cache', () => {
     await expect(loadConfig()).rejects.toThrow(/opportunistic.*deprecated/s);
   });
 
+  it('requires configured executor launch and cleanup templates as a pair', async () => {
+    await writeConfigFile({ execution: { executor_command_template: 'start {task_id}' } });
+
+    await expect(loadConfig()).rejects.toThrow(/executor_stop_command_template/);
+  });
+
   it('treats branch_rbac as app-level only in simple Unix mode', async () => {
     await writeConfigFile({
       execution: { branch_rbac: true, unix_user_mode: 'simple' },

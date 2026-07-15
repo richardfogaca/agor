@@ -46,6 +46,7 @@ import {
   ExecutorHeartbeatCallbackRunner,
 } from '../utils/executor-heartbeat-callback.js';
 import { ensureRepoOriginAlignedById } from '../utils/realign-repo-origin';
+import type { ExecutorTurnFinalizer } from './executor-turn-finalizer.js';
 import type { SessionsService } from './sessions';
 
 /**
@@ -113,7 +114,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     Promise<CompletionCallbackDispatchResult>
   >();
 
-  constructor(db: TenantScopeAwareDatabase, app: Application) {
+  constructor(
+    db: TenantScopeAwareDatabase,
+    app: Application,
+    private finalizeTurn: ExecutorTurnFinalizer
+  ) {
     const taskRepo = new TaskRepository(db);
     super(taskRepo, {
       id: 'task_id',
@@ -1191,17 +1196,10 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     return task;
   }
 
-  async releaseExecutorTurn(
-    data: ExecutorClaim & { release_error?: string },
-    params?: TaskParams
-  ): Promise<Task> {
+  async releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task> {
     if (!data.task_id || !data.executor_attempt_id)
       throw new BadRequest('Invalid executor release');
-    const result = await this.taskRepo.releaseExecutorTurn(
-      data.task_id,
-      data.executor_attempt_id,
-      data.release_error
-    );
+    const result = await this.taskRepo.releaseExecutorTurn(data.task_id, data.executor_attempt_id);
     if (!result) throw new Conflict('Executor turn is not releasable');
     if (result.released) {
       this.emit?.('patched', result.task);
@@ -1212,6 +1210,10 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       }
     }
     return result.task;
+  }
+
+  finalizeExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task> {
+    return this.finalizeTurn(data, params);
   }
 
   /**
@@ -1262,6 +1264,10 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
 /**
  * Service factory function
  */
-export function createTasksService(db: TenantScopeAwareDatabase, app: Application): TasksService {
-  return new TasksService(db, app);
+export function createTasksService(
+  db: TenantScopeAwareDatabase,
+  app: Application,
+  finalizer: ExecutorTurnFinalizer
+): TasksService {
+  return new TasksService(db, app, finalizer);
 }

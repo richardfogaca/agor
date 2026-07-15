@@ -143,16 +143,16 @@ export async function pullIfNeeded(ctx: PullContext): Promise<void> {
 }
 
 /**
- * Push: run after SDK subprocess exits. Fire-and-forget (never awaited by caller).
+ * Push: run after SDK subprocess exits and return the persisted content hash.
  * Skips if file hash unchanged. Otherwise: insertProcessing → gzip → markDone → deletePreviousTurns.
  */
-export async function pushSessionState(ctx: PushContext): Promise<void> {
+export async function pushSessionState(ctx: PushContext): Promise<string | undefined> {
   const tenantId = getCurrentTenantId();
   if (!tenantId) throw new Error('Missing active tenant context for session state persistence');
-  await doPush(ctx, tenantId);
+  return doPush(ctx, tenantId);
 }
 
-async function doPush(ctx: PushContext, tenantId: string): Promise<void> {
+async function doPush(ctx: PushContext, tenantId: string): Promise<string | undefined> {
   // For Codex, find the actual session file (may be in a date-based subdirectory)
   let filePath: string;
   if (ctx.tool === 'codex') {
@@ -160,7 +160,7 @@ async function doPush(ctx: PushContext, tenantId: string): Promise<void> {
     const found = await findCodexSessionFile(codexHome, ctx.sdkSessionId);
     if (!found) {
       // No session file found — Codex may not have written one (e.g. error before first turn)
-      return;
+      return undefined;
     }
     filePath = found;
   } else {
@@ -172,12 +172,12 @@ async function doPush(ctx: PushContext, tenantId: string): Promise<void> {
 
   // Skip if file doesn't exist
   if (currentMd5 === '') {
-    return;
+    return undefined;
   }
 
   // Skip if hash unchanged
   if (ctx.lastKnownMd5 && currentMd5 === ctx.lastKnownMd5) {
-    return;
+    return currentMd5;
   }
 
   // Determine turn_index
@@ -213,4 +213,5 @@ async function doPush(ctx: PushContext, tenantId: string): Promise<void> {
   console.log(
     `[session-state] Pushed session state (turn ${turnIndex}, ${payload.length} bytes gzipped)`
   );
+  return currentMd5;
 }

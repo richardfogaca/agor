@@ -42,7 +42,7 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
       return task;
     }),
     patch: vi.fn(),
-    releaseExecutorTurn: vi.fn(),
+    finalizeExecutorTurn: vi.fn(),
   };
   const sessionsService = {
     find: vi.fn(async (params: { query?: { status?: string; ready_for_prompt?: boolean } }) => {
@@ -135,10 +135,28 @@ describe('startup tenant database scope', () => {
     await cleanupOrphanStatuses(ctx);
 
     expect(tasksService.patch).not.toHaveBeenCalled();
-    expect(tasksService.releaseExecutorTurn).toHaveBeenCalledWith(
+    expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
       { task_id: task.task_id, executor_attempt_id: 'attempt-1' },
       expect.objectContaining({ suppressTerminalQueueProcessing: true })
     );
+  });
+
+  it('continues boot while failed cleanup stays fenced for supervisor retry', async () => {
+    const task = makeTask({
+      status: TaskStatus.COMPLETED,
+      executor_attempt: { id: 'attempt-fenced' },
+    });
+    const { ctx, tasksService } = makeStartupContextWithGuardedDb({ orphanedTasks: [task] });
+    tasksService.finalizeExecutorTurn.mockRejectedValueOnce(new Error('cleanup pending'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await expect(cleanupOrphanStatuses(ctx)).resolves.toBeDefined();
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('remains fenced for supervisor retry'),
+      expect.any(Error)
+    );
+    warn.mockRestore();
   });
 
   it('demonstrates guarded startup DB access fails without scope', () => {

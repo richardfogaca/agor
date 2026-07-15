@@ -74,4 +74,47 @@ describe('startExecutorRuntimeOverseer', () => {
     });
     handle.stop();
   });
+
+  it('abandons the lease immediately when the attempt is rejected', async () => {
+    const error = Object.assign(new Error('conflict'), { code: 409 });
+    const onLeaseLost = vi.fn();
+    const client = {
+      service: () => ({ reportExecutorTelemetry: vi.fn().mockRejectedValue(error) }),
+    } as any;
+
+    startExecutorRuntimeOverseer({
+      client,
+      taskId: 'task-1',
+      executorAttemptId: 'attempt-1',
+      onLeaseLost,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onLeaseLost).toHaveBeenCalledWith(error);
+  });
+
+  it('abandons a telemetry request that remains unacknowledged past the lease TTL', async () => {
+    vi.useFakeTimers();
+    try {
+      const onLeaseLost = vi.fn();
+      const client = {
+        service: () => ({ reportExecutorTelemetry: vi.fn(() => new Promise(() => undefined)) }),
+      } as any;
+
+      startExecutorRuntimeOverseer({
+        client,
+        taskId: 'task-1',
+        executorAttemptId: 'attempt-1',
+        intervalMs: 1000,
+        staleAfterMs: 3000,
+        onLeaseLost,
+      });
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(onLeaseLost).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

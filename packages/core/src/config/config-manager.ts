@@ -369,6 +369,7 @@ function validateConfig(config: AgorConfig): void {
     'permission_timeout_ms',
     'stateless_fs_mode',
     'executor_command_template',
+    'executor_stop_command_template',
     'required_user_env_vars',
     'managed_envs_minimum_role',
     'managed_envs_execution_mode',
@@ -475,6 +476,14 @@ function validateConfig(config: AgorConfig): void {
   if (unknownPaths.length > 0) {
     throw new Error(
       `Config error: unrecognized ${unknownPaths.length === 1 ? 'key' : 'keys'}: ${unknownPaths.join(', ')}`
+    );
+  }
+
+  const executorTemplate = config.execution?.executor_command_template;
+  const executorStopTemplate = config.execution?.executor_stop_command_template;
+  if (!!executorTemplate !== !!executorStopTemplate) {
+    throw new Error(
+      'Config error: execution.executor_command_template and execution.executor_stop_command_template must be configured together'
     );
   }
 
