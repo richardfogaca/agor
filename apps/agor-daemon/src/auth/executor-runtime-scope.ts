@@ -48,6 +48,11 @@ const EXECUTOR_TASK_FIELDS = new Set([
   'report',
   'permission_request',
 ]);
+const EXECUTOR_LIFECYCLE_METHODS = new Set([
+  'connectExecutor',
+  'finishExecutorAttempt',
+  'reportExecutorTelemetry',
+]);
 
 function scopedPayload(context: HookContext): ExecutorSessionTokenPayload | null {
   const params = context.params as AuthenticatedParams & ExecutorSessionTokenPayload;
@@ -232,8 +237,7 @@ export function executorRuntimeScopeGuard() {
     const path = normalizePath(context.path);
 
     if (path === 'tasks') {
-      const executorMethod =
-        context.method === 'connectExecutor' || context.method === 'reportExecutorTelemetry';
+      const executorMethod = EXECUTOR_LIFECYCLE_METHODS.has(context.method);
       if (executorMethod && !payload) {
         throw new Forbidden('Executor-scoped authentication is required');
       }
@@ -257,17 +261,6 @@ export function executorRuntimeScopeGuard() {
         }
       } else if (context.method === 'remove') {
         if (payload) throw new Forbidden('Executors cannot remove tasks');
-        const existing = asRecord(
-          await (
-            context.service as { findByIdForScopeCheck?: (id: string) => Promise<unknown> }
-          ).findByIdForScopeCheck?.(String(context.id))
-        );
-        if (
-          !existing ||
-          (existing.status !== TaskStatus.CREATED && existing.status !== TaskStatus.QUEUED)
-        ) {
-          throw new Forbidden('Only pending tasks can be removed externally');
-        }
       }
     }
 
@@ -332,7 +325,7 @@ export function executorRuntimeScopeGuard() {
         }
         if (scope.sessionId)
           expectMatch(scope.sessionId, data.session_id ?? query.session_id, 'session');
-        if (context.method === 'connectExecutor' || context.method === 'reportExecutorTelemetry') {
+        if (EXECUTOR_LIFECYCLE_METHODS.has(context.method)) {
           expectMatch(
             expectClaim(scope.executorAttemptId, 'attempt'),
             data.executor_attempt_id,

@@ -846,6 +846,24 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     }
   }
 
+  /** Delete only while the task is pending, serialized against session admission. */
+  async removePending(id: string): Promise<Task | null> {
+    const { fullId, task: known } = await this.resolveExisting(id);
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockSession(db, known.session_id);
+        const current = await this.loadLockedTask(db, fullId, id);
+        if (current.status !== TaskStatus.CREATED && current.status !== TaskStatus.QUEUED) {
+          return null;
+        }
+        await deleteFrom(db, tasks).where(eq(tasks.task_id, fullId)).run();
+        return current;
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
   /**
    * Delete task by ID
    */

@@ -9,6 +9,7 @@ import {
 } from '@agor/core/unix';
 import type { Application, TasksServiceImpl } from '../declarations.js';
 import { ensureExecutorWorkloadStopped, stopTemplatedExecutor } from '../executor-tracking.js';
+import { daemonParams } from '../utils/daemon-params.js';
 import { pushSessionState } from '../utils/session-state-hooks.js';
 import { substituteTemplateVariables } from '../utils/spawn-executor.js';
 
@@ -30,8 +31,9 @@ export function createExecutorTurnFinalizer(options: {
   const active = new Map<string, Promise<Task>>();
 
   const finalize: ExecutorTurnFinalizer = async (claim, params) => {
+    const internalParams = daemonParams(params);
     const tasks = options.app.service('tasks') as unknown as TasksServiceImpl;
-    const task = await tasks.get(claim.task_id, params);
+    const task = await tasks.get(claim.task_id, internalParams);
     const attempt = task.executor_attempt;
     if (attempt?.id !== claim.executor_attempt_id) {
       throw new Error('Executor attempt no longer owns this turn');
@@ -58,9 +60,11 @@ export function createExecutorTurnFinalizer(options: {
       await ensureExecutorWorkloadStopped(attempt.id, attempt.workload);
 
       if (options.config.execution?.stateless_fs_mode && task.executor_connected_at) {
-        const session = await options.app.service('sessions').get(task.session_id, params);
+        const session = await options.app.service('sessions').get(task.session_id, internalParams);
         if (session.sdk_session_id) {
-          const branch = await options.app.service('branches').get(session.branch_id, params);
+          const branch = await options.app
+            .service('branches')
+            .get(session.branch_id, internalParams);
           const mode = (options.config.execution.unix_user_mode ?? 'simple') as UnixUserMode;
           const unixUser = resolveUnixUserForImpersonation({
             mode,
@@ -79,11 +83,11 @@ export function createExecutorTurnFinalizer(options: {
             executorHomeDir: unixUser ? getHomedirFromUsername(unixUser) : undefined,
           });
           if (!md5) throw new Error(SESSION_STATE_MISSING_ERROR);
-          await tasks.patch(task.task_id, { session_md5: md5 }, params);
+          await tasks.patch(task.task_id, { session_md5: md5 }, internalParams);
         }
       }
 
-      return tasks.releaseExecutorTurn(claim, params);
+      return tasks.releaseExecutorTurn(claim, internalParams);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await attemptRepo

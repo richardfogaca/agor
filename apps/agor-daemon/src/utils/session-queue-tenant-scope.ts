@@ -1,6 +1,7 @@
 import { type AgorConfig, resolveMultiTenancyConfig } from '@agor/core/config';
 import { runWithTenantContext, type TenantScopeAwareDatabase } from '@agor/core/db';
 import type { Params, SessionID, TenantContext, TenantID } from '@agor/core/types';
+import { daemonParams } from './daemon-params.js';
 import { deferWithTenantContext, resolveTenantIdForDeferredScope } from './tenant-db-scope.js';
 
 type QueueTenantParams = Params & {
@@ -43,15 +44,8 @@ export function queueTenantParams(
   // makes secret resolution for the next queued task fail with a task-scope
   // mismatch. Preserve the resolved user and other internal context, but
   // deliberately cross an authentication boundary here.
-  const {
-    authentication: _authentication,
-    connection: _connection,
-    provider: _provider,
-    headers: _headers,
-    ...internalParams
-  } = params ?? {};
   return {
-    ...internalParams,
+    ...daemonParams(params),
     tenant: {
       ...currentTenant,
       tenant_id: tenantId as TenantID,

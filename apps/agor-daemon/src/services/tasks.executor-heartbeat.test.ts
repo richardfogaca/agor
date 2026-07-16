@@ -1,3 +1,4 @@
+import { runWithTenantContext } from '@agor/core/db';
 import { TaskStatus } from '@agor/core/types';
 import { describe, expect, it, vi } from 'vitest';
 import { TasksService } from './tasks';
@@ -5,6 +6,7 @@ import { TasksService } from './tasks';
 describe('TasksService executor heartbeat helpers', () => {
   it.each([
     ['connectExecutor', { task_id: 'task-1', executor_attempt_id: 'attempt-1' }],
+    ['finishExecutorAttempt', { task_id: 'task-1', executor_attempt_id: 'attempt-1' }],
     [
       'reportExecutorTelemetry',
       { task_id: 'task-1', executor_attempt_id: 'attempt-1', heartbeat: true },
@@ -22,6 +24,54 @@ describe('TasksService executor heartbeat helpers', () => {
         executorAttemptId: 'attempt-2',
       })
     ).rejects.toThrow(/authenticated scope/);
+  });
+
+  it('acknowledges a terminal remote attempt before deferred canonical finalization', async () => {
+    const task = {
+      task_id: 'task-1',
+      session_id: 'session-1',
+      status: TaskStatus.COMPLETED,
+      executor_attempt: { id: 'attempt-1' },
+    };
+    let finalized!: () => void;
+    const finalization = new Promise<void>((resolve) => (finalized = resolve));
+    const finalizeTurn = vi.fn(async () => finalized());
+    const service = new TasksService({} as never, {} as never, finalizeTurn);
+    service.get = vi.fn().mockResolvedValue(task);
+    const params = {
+      executorTaskId: 'task-1',
+      executorAttemptId: 'attempt-1',
+      tenant: { tenant_id: 'tenant-1', source: 'auth_claim' as const },
+    };
+
+    const result = await runWithTenantContext('tenant-1', () =>
+      service.finishExecutorAttempt({ task_id: 'task-1', executor_attempt_id: 'attempt-1' }, params)
+    );
+
+    expect(result).toBe(task);
+    expect(finalizeTurn).not.toHaveBeenCalled();
+    await finalization;
+    expect(finalizeTurn).toHaveBeenCalledWith(
+      { task_id: 'task-1', executor_attempt_id: 'attempt-1' },
+      params
+    );
+  });
+
+  it('does not finish an attempt before its final write', async () => {
+    const finalizeTurn = vi.fn();
+    const service = new TasksService({} as never, {} as never, finalizeTurn);
+    service.get = vi.fn().mockResolvedValue({
+      status: TaskStatus.RUNNING,
+      executor_attempt: { id: 'attempt-1' },
+    });
+
+    await expect(
+      service.finishExecutorAttempt(
+        { task_id: 'task-1', executor_attempt_id: 'attempt-1' },
+        { executorTaskId: 'task-1', executorAttemptId: 'attempt-1' }
+      )
+    ).rejects.toThrow(/not ready to finish/);
+    expect(finalizeTurn).not.toHaveBeenCalled();
   });
 
   it('does not bypass executor release when using the complete helper', async () => {

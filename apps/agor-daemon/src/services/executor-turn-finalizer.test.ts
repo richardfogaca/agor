@@ -55,7 +55,7 @@ function setup(
       },
     },
   });
-  return { finalizer, releaseExecutorTurn, patch };
+  return { finalizer, releaseExecutorTurn, patch, services };
 }
 
 describe('executor turn finalizer', () => {
@@ -115,6 +115,30 @@ describe('executor turn finalizer', () => {
     expect(mocks.ensureStopped).toHaveBeenCalledTimes(1);
     expect(mocks.pushSessionState).not.toHaveBeenCalled();
     expect(releaseExecutorTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops external transport authority before background settlement', async () => {
+    const { finalizer, services, releaseExecutorTurn } = setup(false);
+    const trusted = {
+      user: { user_id: 'user-1' },
+      tenant: { tenant_id: 'tenant-1', source: 'auth_claim' },
+    };
+
+    await finalizer({ task_id: 'task-1', executor_attempt_id: 'attempt-1' }, {
+      ...trusted,
+      authentication: { strategy: 'jwt' },
+      connection: {},
+      executorAttemptId: 'attempt-1',
+      executorTaskId: 'task-1',
+      headers: {},
+      provider: 'socketio',
+    } as never);
+
+    expect(services.tasks.get).toHaveBeenCalledWith('task-1', trusted);
+    expect(releaseExecutorTurn).toHaveBeenCalledWith(
+      { task_id: 'task-1', executor_attempt_id: 'attempt-1' },
+      trusted
+    );
   });
 
   it('coalesces concurrent finalization of the same attempt', async () => {

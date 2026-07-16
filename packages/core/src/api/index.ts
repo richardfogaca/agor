@@ -297,6 +297,7 @@ export interface SessionsService extends AgorService<Session> {
  */
 export interface TasksService extends AgorService<Task> {
   connectExecutor(data: ExecutorClaim, params?: Params): Promise<Task>;
+  finishExecutorAttempt(data: ExecutorClaim, params?: Params): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: Params): Promise<Task>;
   /**
    * Create multiple tasks in a single request
@@ -880,7 +881,7 @@ function extendTasksService(client: AgorClient): void {
     methods?: (...names: string[]) => unknown;
   };
   if (service[TASKS_SERVICE_EXTENDED]) return;
-  service.methods?.('connectExecutor', 'reportExecutorTelemetry');
+  service.methods?.('connectExecutor', 'finishExecutorAttempt', 'reportExecutorTelemetry');
   service[TASKS_SERVICE_EXTENDED] = true;
 }
 

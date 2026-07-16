@@ -127,6 +127,7 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
 export interface TasksServiceImpl extends Service<Task, Partial<Task>, TaskParams> {
   reserveExecutorStop(sessionId: SessionID, params?: TaskParams): Promise<Task | null>;
   connectExecutor(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
+  finishExecutorAttempt(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: TaskParams): Promise<Task>;
   releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
   finalizeExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;

@@ -254,6 +254,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       'patch',
       'remove',
       'connectExecutor',
+      'finishExecutorAttempt',
       'reportExecutorTelemetry',
     ],
     // Custom events not in this list are dropped at the FeathersJS transport

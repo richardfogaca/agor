@@ -23,12 +23,12 @@ import type {
   ContentBlock,
   ExecutorClaim,
   ExecutorTelemetryReport,
+  NullableId,
   Paginated,
   QueryParams,
   Session,
   SessionID,
   Task,
-  TaskID,
   UUID,
 } from '@agor/core/types';
 import {
@@ -47,6 +47,10 @@ import {
   ExecutorHeartbeatCallbackRunner,
 } from '../utils/executor-heartbeat-callback.js';
 import { ensureRepoOriginAlignedById } from '../utils/realign-repo-origin';
+import {
+  deferWithTenantContext,
+  resolveTenantIdForDeferredScope,
+} from '../utils/tenant-db-scope.js';
 import type { ExecutorTurnFinalizer } from './executor-turn-finalizer.js';
 import type { SessionsService } from './sessions';
 
@@ -110,7 +114,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
         default: PAGINATION.DEFAULT_LIMIT,
         max: PAGINATION.MAX_LIMIT,
       },
-      multi: ['patch', 'remove'],
+      multi: ['patch'],
     });
 
     this.taskRepo = taskRepo;
@@ -903,8 +907,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     ];
   }
 
-  async findByIdForScopeCheck(taskId: TaskID): Promise<Task | null> {
-    return this.taskRepo.findById(taskId);
+  async remove(id: NullableId, _params?: TaskParams): Promise<Task | Task[]> {
+    if (id === null) throw new BadRequest('Bulk task removal is not supported');
+    const removed = await this.taskRepo.removePending(String(id));
+    if (!removed) throw new Conflict('Only pending tasks can be removed');
+    return removed;
   }
 
   /** Reserve Stop under the same database lock used by admission and release. */
@@ -956,6 +963,31 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     if (!task) throw new Conflict('Executor telemetry is no longer accepted');
     this.emit?.('patched', task);
     if (data.heartbeat) this.publishExecutorHeartbeat(task, observedAt);
+    return task;
+  }
+
+  /** Acknowledge the executor's final write, then reconcile through the canonical finalizer. */
+  async finishExecutorAttempt(data: ExecutorClaim, params?: TaskParams): Promise<Task> {
+    if (!data.task_id || !data.executor_attempt_id) throw new BadRequest('Invalid executor finish');
+    const claim = authenticatedExecutorClaim(data, params);
+    const task = await this.get(claim.task_id, params);
+    if (
+      task.executor_attempt?.id !== claim.executor_attempt_id ||
+      !isTerminalTaskStatus(task.status)
+    ) {
+      throw new Conflict('Executor attempt is not ready to finish');
+    }
+    if (task.executor_attempt.released_at) return task;
+    if (!resolveTenantIdForDeferredScope(params))
+      throw new Conflict('Missing executor tenant scope');
+
+    deferWithTenantContext(
+      params,
+      async () => {
+        await this.finalizeTurn(claim, params);
+      },
+      (error) => console.warn('⚠️  [TasksService] Executor finalization failed:', error)
+    );
     return task;
   }
 

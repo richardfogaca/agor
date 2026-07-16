@@ -1369,6 +1369,27 @@ describe('TaskRepository executor turn transitions', () => {
     expect(session?.tasks).toHaveLength(1);
   });
 
+  dbTest('serializes pending removal against executor admission', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const pending = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    const [removed, admitted] = await Promise.all([
+      tasks.removePending(pending.task_id),
+      tasks.claimNextExecutorTurn({
+        sessionId,
+        patch: {
+          status: TaskStatus.DISPATCHING,
+          executor_attempt: { id: generateId() },
+        },
+      }),
+    ]);
+
+    expect([removed, admitted].filter(Boolean)).toHaveLength(1);
+    expect(await tasks.findById(pending.task_id)).toEqual(
+      admitted ? expect.objectContaining({ status: TaskStatus.DISPATCHING }) : null
+    );
+  });
+
   dbTest('connects only the winning attempt and projects runtime state', async ({ db }) => {
     const tasks = new TaskRepository(db);
     const sessions = new SessionRepository(db);

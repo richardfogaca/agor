@@ -63,17 +63,21 @@ export class AgorExecutor {
     this.abortController = new AbortController();
   }
 
-  /**
-   * Bound wrapper around the standalone `tryMarkTaskTerminal` helper for
-   * the four fail-safe paths inside this class. Guards against a missing
-   * client (e.g. when the daemon connection never came up).
-   */
-  private async tryMarkTaskTerminal(
-    status: typeof TaskStatus.FAILED | typeof TaskStatus.STOPPED,
+  /** Make terminal state the final executor write, then surrender the attempt. */
+  private async finishExecutorAttempt(
+    status?: typeof TaskStatus.FAILED | typeof TaskStatus.STOPPED,
     errorMessage?: string
   ): Promise<void> {
     if (!this.client) return;
-    await tryMarkTaskTerminal(this.client, this.config.taskId, status, errorMessage);
+    if (status) await tryMarkTaskTerminal(this.client, this.config.taskId, status, errorMessage);
+    try {
+      await this.client.service('tasks').finishExecutorAttempt({
+        task_id: this.config.taskId,
+        executor_attempt_id: this.config.executorAttemptId,
+      });
+    } catch (error) {
+      console.error('[executor] Failed to finish executor attempt:', error);
+    }
   }
 
   /**
@@ -105,13 +109,14 @@ export class AgorExecutor {
 
       // Execute the task
       await this.executeTask();
+      await this.finishExecutorAttempt();
 
       // Exit successfully
       console.log('[executor] Task completed, exiting');
       process.exit(0);
     } catch (error) {
       console.error('[executor] Fatal error:', error);
-      await this.tryMarkTaskTerminal(
+      await this.finishExecutorAttempt(
         TaskStatus.FAILED,
         error instanceof Error ? error.message : String(error)
       );
@@ -231,7 +236,7 @@ export class AgorExecutor {
       // The daemon's stop route already patches the task to STOPPED before
       // sending the signal — this fallback only fires if we received an
       // out-of-band signal and the task is still active.
-      await this.tryMarkTaskTerminal(TaskStatus.STOPPED);
+      await this.finishExecutorAttempt(TaskStatus.STOPPED);
 
       process.exit(0);
     };
@@ -241,7 +246,7 @@ export class AgorExecutor {
 
     process.on('uncaughtException', async (error) => {
       console.error('[executor] Uncaught exception:', error);
-      await this.tryMarkTaskTerminal(
+      await this.finishExecutorAttempt(
         TaskStatus.FAILED,
         `uncaughtException: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -250,7 +255,7 @@ export class AgorExecutor {
 
     process.on('unhandledRejection', async (reason) => {
       console.error('[executor] Unhandled rejection:', reason);
-      await this.tryMarkTaskTerminal(
+      await this.finishExecutorAttempt(
         TaskStatus.FAILED,
         `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`
       );

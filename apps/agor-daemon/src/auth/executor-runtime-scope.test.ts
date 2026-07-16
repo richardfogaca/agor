@@ -23,6 +23,7 @@ function ctx(overrides: Partial<HookContext>): HookContext {
 describe('executorRuntimeScopeGuard', () => {
   it.each([
     'connectExecutor',
+    'finishExecutorAttempt',
     'reportExecutorTelemetry',
   ])('rejects ordinary user auth for %s', async (method) => {
     const context = ctx({
@@ -85,10 +86,7 @@ describe('executorRuntimeScopeGuard', () => {
     ).rejects.toThrow(/daemon-owned/);
   });
 
-  it.each([
-    [TaskStatus.QUEUED, true],
-    [TaskStatus.RUNNING, false],
-  ])('allows external removal only while a task is pending (%s)', async (status, allowed) => {
+  it('leaves pending-state removal enforcement to the repository transaction', async () => {
     const context = ctx({
       method: 'remove',
       id: 'task-1',
@@ -97,12 +95,9 @@ describe('executorRuntimeScopeGuard', () => {
         query: {},
         provider: 'socketio',
       },
-      service: { findByIdForScopeCheck: async () => ({ status }) },
     });
-    const result = expect(executorRuntimeScopeGuard()(context));
 
-    if (allowed) await result.resolves.toBe(context);
-    else await result.rejects.toThrow(/pending tasks/);
+    await expect(executorRuntimeScopeGuard()(context)).resolves.toBe(context);
   });
 
   it('rejects task removal by an executor token', async () => {
@@ -487,9 +482,13 @@ describe('executorRuntimeScopeGuard', () => {
     });
   });
 
-  it('rejects an executor lifecycle claim for another attempt', async () => {
+  it.each([
+    'connectExecutor',
+    'finishExecutorAttempt',
+    'reportExecutorTelemetry',
+  ])('rejects an executor lifecycle claim for another attempt (%s)', async (method) => {
     const context = ctx({
-      method: 'connectExecutor',
+      method,
       data: { task_id: 'task-1', executor_attempt_id: 'attempt-2' },
     });
 
