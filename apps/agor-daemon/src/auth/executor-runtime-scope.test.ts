@@ -391,7 +391,10 @@ describe('executorRuntimeScopeGuard', () => {
     await executorRuntimeScopeGuard()(context);
 
     expect(context.data).toMatchObject({ taskId: 'task-1' });
-    expect(context.params).toMatchObject({ executorAttemptId: 'attempt-1' });
+    expect(context.params).toMatchObject({
+      executorAttemptId: 'attempt-1',
+      executorTaskId: 'task-1',
+    });
   });
 
   it('rejects API key resolution for another task under executor token auth', async () => {

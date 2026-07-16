@@ -12,7 +12,7 @@
  *
  * Originally landed in #781 ("feat: pass user context to agents for
  * multi-user sessions"). The logic later moved inline into
- * `spawnTaskExecutor` during the never-lose-a-prompt refactor (#1068)
+ * `startClaimedTask` during the never-lose-a-prompt refactor (#1068)
  * and ended up coupled to `params.user.user_id`, which silently drops
  * the prefix on any drain/callback path that doesn't carry a populated
  * `queued_by_user_id` through the queue → spawn hop. This module

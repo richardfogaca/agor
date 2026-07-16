@@ -19,6 +19,8 @@ export const TaskStatus = {
 
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
 
+export const SESSION_COMPLETION_CALLBACK_EVENT = 'session_completion' as const;
+
 /**
  * Structured metadata attached to a task. All fields are optional, but the
  * ones that are present are load-bearing — typing them here prevents drift
@@ -40,6 +42,9 @@ export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
 export interface TaskMetadata {
   is_agor_callback?: boolean;
   source?: MessageSource;
+  /** Per-turn execution options must survive the durable queue boundary. */
+  permission_mode?: import('./session').PermissionMode;
+  stream?: boolean;
   queued_by_user_id?: string;
   child_session_id?: SessionID;
   child_task_id?: TaskID;
@@ -50,7 +55,7 @@ export interface TaskMetadata {
    * paths race.
    */
   callback_dispatches?: Array<{
-    event: 'session_completion';
+    event: typeof SESSION_COMPLETION_CALLBACK_EVENT;
     target_session_id: SessionID;
     queued_task_id?: TaskID;
     dispatched_at: string;
@@ -241,10 +246,7 @@ export interface Task {
   /** Durable ownership, launch, cleanup, and post-turn evidence for this turn. */
   executor_attempt?: ExecutorAttempt;
 
-  /**
-   * Queue position when status is QUEUED. Lower values drain first.
-   * Undefined for non-queued tasks.
-   */
+  /** Queue position when status is QUEUED. Lower values drain first. */
   queue_position?: number;
 
   /**

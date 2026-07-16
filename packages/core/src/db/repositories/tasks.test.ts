@@ -926,7 +926,6 @@ describe('TaskRepository edge cases', () => {
  */
 function createPendingInput(overrides: {
   session_id: string;
-  status: typeof TaskStatus.CREATED | typeof TaskStatus.QUEUED;
   full_prompt?: string;
   metadata?: Parameters<TaskRepository['createPending']>[0]['metadata'];
 }): Parameters<TaskRepository['createPending']>[0] {
@@ -936,7 +935,6 @@ function createPendingInput(overrides: {
     >[0]['session_id'],
     full_prompt: overrides.full_prompt ?? 'test prompt',
     created_by: 'test-user',
-    status: overrides.status,
     metadata: overrides.metadata,
   };
 }
@@ -948,9 +946,7 @@ describe('TaskRepository.createPending', () => {
       const taskRepo = new TaskRepository(db);
       const sessionId = await createSessionWithDeps(db);
 
-      const queued = await taskRepo.createPending(
-        createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-      );
+      const queued = await taskRepo.createPending(createPendingInput({ session_id: sessionId }));
 
       expect(queued.status).toBe(TaskStatus.QUEUED);
       expect(queued.queue_position).toBe(1);
@@ -962,15 +958,9 @@ describe('TaskRepository.createPending', () => {
     const taskRepo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);
 
-    const first = await taskRepo.createPending(
-      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-    );
-    const second = await taskRepo.createPending(
-      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-    );
-    const third = await taskRepo.createPending(
-      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-    );
+    const first = await taskRepo.createPending(createPendingInput({ session_id: sessionId }));
+    const second = await taskRepo.createPending(createPendingInput({ session_id: sessionId }));
+    const third = await taskRepo.createPending(createPendingInput({ session_id: sessionId }));
 
     expect(first.queue_position).toBe(1);
     expect(second.queue_position).toBe(2);
@@ -982,15 +972,9 @@ describe('TaskRepository.createPending', () => {
     const sessionA = await createSessionWithDeps(db);
     const sessionB = await createSessionWithDeps(db);
 
-    await taskRepo.createPending(
-      createPendingInput({ session_id: sessionA, status: TaskStatus.QUEUED })
-    );
-    await taskRepo.createPending(
-      createPendingInput({ session_id: sessionA, status: TaskStatus.QUEUED })
-    );
-    const onB = await taskRepo.createPending(
-      createPendingInput({ session_id: sessionB, status: TaskStatus.QUEUED })
-    );
+    await taskRepo.createPending(createPendingInput({ session_id: sessionA }));
+    await taskRepo.createPending(createPendingInput({ session_id: sessionA }));
+    const onB = await taskRepo.createPending(createPendingInput({ session_id: sessionB }));
 
     // Session B's first queued task should be at position 1, not 3.
     expect(onB.queue_position).toBe(1);
@@ -1006,7 +990,7 @@ describe('TaskRepository.createPending', () => {
     };
 
     const queued = await taskRepo.createPending(
-      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED, metadata })
+      createPendingInput({ session_id: sessionId, metadata })
     );
 
     expect(queued.metadata).toEqual(metadata);
@@ -1015,30 +999,26 @@ describe('TaskRepository.createPending', () => {
     expect(refetched?.metadata).toEqual(metadata);
   });
 
-  dbTest('should leave queue_position unset for CREATED tasks (idle path)', async ({ db }) => {
+  dbTest('should enqueue an explicit CREATED draft in FIFO order', async ({ db }) => {
     const taskRepo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);
+    const created = await taskRepo.create(createTaskData({ session_id: sessionId }));
+    const queued = await taskRepo.enqueueCreatedTask(created.task_id);
 
-    const created = await taskRepo.createPending(
-      createPendingInput({ session_id: sessionId, status: TaskStatus.CREATED })
-    );
-
-    expect(created.status).toBe(TaskStatus.CREATED);
-    expect(created.queue_position).toBeUndefined();
+    expect(queued.status).toBe(TaskStatus.QUEUED);
+    expect(queued.queue_position).toBe(1);
   });
 
   dbTest(
-    'should stamp sentinels on the row so spawnTaskExecutor knows what to recompute',
+    'should stamp sentinels on the row so startClaimedTask knows what to recompute',
     async ({ db }) => {
       const taskRepo = new TaskRepository(db);
       const sessionId = await createSessionWithDeps(db);
 
-      const queued = await taskRepo.createPending(
-        createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-      );
+      const queued = await taskRepo.createPending(createPendingInput({ session_id: sessionId }));
 
       // The sentinel contract: while a task is QUEUED/CREATED, message_range
-      // and git_state hold "not yet pinned" markers. spawnTaskExecutor is the
+      // and git_state hold "not yet pinned" markers. startClaimedTask is the
       // sole place that overwrites these on the way to RUNNING.
       expect(queued.message_range.start_index).toBe(-1);
       expect(queued.git_state.sha_at_start).toBe('');
@@ -1063,15 +1043,9 @@ describe('TaskRepository.createPending', () => {
       // *committed* duplicates. Successful rows must therefore have distinct,
       // monotonically-increasing positions starting at 1.
       const settled = await Promise.allSettled([
-        taskRepo.createPending(
-          createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-        ),
-        taskRepo.createPending(
-          createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-        ),
-        taskRepo.createPending(
-          createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
-        ),
+        taskRepo.createPending(createPendingInput({ session_id: sessionId })),
+        taskRepo.createPending(createPendingInput({ session_id: sessionId })),
+        taskRepo.createPending(createPendingInput({ session_id: sessionId })),
       ]);
 
       const successes = settled
@@ -1100,21 +1074,18 @@ describe('TaskRepository.findQueued', () => {
     await taskRepo.createPending(
       createPendingInput({
         session_id: sessionId,
-        status: TaskStatus.QUEUED,
         full_prompt: 'first queued',
       })
     );
     await taskRepo.createPending(
       createPendingInput({
         session_id: sessionId,
-        status: TaskStatus.QUEUED,
         full_prompt: 'second queued',
       })
     );
     await taskRepo.createPending(
       createPendingInput({
         session_id: sessionId,
-        status: TaskStatus.QUEUED,
         full_prompt: 'third queued',
       })
     );
@@ -1127,6 +1098,73 @@ describe('TaskRepository.findQueued', () => {
       'first queued',
       'second queued',
       'third queued',
+    ]);
+  });
+});
+
+describe('TaskRepository.createCompletionCallback', () => {
+  dbTest('refuses callback visibility before executor release', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sourceSessionId = await createSessionWithDeps(db);
+    const targetSessionId = await createSessionWithDeps(db);
+    const source = await taskRepo.create(
+      createTaskData({
+        session_id: sourceSessionId,
+        status: TaskStatus.COMPLETED,
+        executor_attempt: { id: generateId() },
+      })
+    );
+
+    await expect(
+      taskRepo.createCompletionCallback({
+        sourceTaskId: source.task_id,
+        targetSessionId,
+        fullPrompt: 'must stay fenced',
+        createdBy: 'test-user',
+        metadata: {},
+      })
+    ).rejects.toThrow(/has not settled/);
+    expect(await taskRepo.findQueued(targetSessionId)).toEqual([]);
+  });
+
+  dbTest('atomically enqueues and deduplicates a completion callback', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sourceSessionId = await createSessionWithDeps(db);
+    const targetSessionId = await createSessionWithDeps(db);
+    const source = await taskRepo.create(
+      createTaskData({ session_id: sourceSessionId, status: TaskStatus.COMPLETED })
+    );
+    const input: Parameters<TaskRepository['createCompletionCallback']>[0] = {
+      sourceTaskId: source.task_id,
+      targetSessionId,
+      fullPrompt: 'child completed',
+      createdBy: 'test-user',
+      metadata: {
+        is_agor_callback: true,
+        child_session_id: sourceSessionId,
+        child_task_id: source.task_id,
+      },
+    };
+
+    const results = await Promise.all([
+      taskRepo.createCompletionCallback(input),
+      taskRepo.createCompletionCallback(input),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const queued = await taskRepo.findQueued(targetSessionId);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      full_prompt: 'child completed',
+      status: TaskStatus.QUEUED,
+      queue_position: 1,
+    });
+    expect((await taskRepo.findById(source.task_id))?.metadata?.callback_dispatches).toEqual([
+      expect.objectContaining({
+        event: 'session_completion',
+        target_session_id: targetSessionId,
+        queued_task_id: queued[0].task_id,
+      }),
     ]);
   });
 });
@@ -1188,9 +1226,7 @@ describe('TaskRepository.getNextQueued', () => {
     const sessionA = await createSessionWithDeps(db);
     const sessionB = await createSessionWithDeps(db);
 
-    await taskRepo.createPending(
-      createPendingInput({ session_id: sessionA, status: TaskStatus.QUEUED })
-    );
+    await taskRepo.createPending(createPendingInput({ session_id: sessionA }));
 
     const next = await taskRepo.getNextQueued(sessionB);
 
@@ -1225,7 +1261,7 @@ describe('TaskRepository.getNextQueued', () => {
 // before flipping the task to RUNNING. These tests are tripwires: they assert
 // the post-recompute shape on real data we control. End-to-end coverage of the
 // recompute path itself lives in a follow-up PR; this is the cheapest possible
-// guard so a future regression in spawnTaskExecutor isn't silent.
+// guard so a future regression in startClaimedTask isn't silent.
 // ============================================================================
 
 describe('TaskRepository sentinel invariants', () => {
@@ -1303,33 +1339,31 @@ describe('TaskRepository sentinel invariants', () => {
 });
 
 describe('TaskRepository executor turn transitions', () => {
-  dbTest('admits one concurrent turn and queues the contender', async ({ db }) => {
+  dbTest('a later worker cannot bypass a slower FIFO head', async ({ db }) => {
     const tasks = new TaskRepository(db);
     const sessions = new SessionRepository(db);
     const sessionId = await createSessionWithDeps(db);
-    const [first, second] = await Promise.all([
-      tasks.create(createTaskData({ session_id: sessionId })),
-      tasks.create(createTaskData({ session_id: sessionId })),
-    ]);
-    const admit = (task: Task) => {
-      const attemptId = generateId();
-      return tasks.admitExecutorTurn({
-        taskId: task.task_id,
+    const first = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    const second = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    const claim = () =>
+      tasks.claimNextExecutorTurn({
         sessionId,
         patch: {
           status: TaskStatus.DISPATCHING,
           started_at: new Date().toISOString(),
-          executor_attempt: { id: attemptId },
+          executor_attempt: { id: generateId() },
         },
       });
-    };
+    let finishFirstPreparation!: () => void;
+    const firstPreparation = new Promise<void>((resolve) => (finishFirstPreparation = resolve));
+    const delayedFirstWorker = firstPreparation.then(claim);
+    const fasterSecondWorker = claim();
+    finishFirstPreparation();
+    const claimed = await Promise.all([delayedFirstWorker, fasterSecondWorker]);
 
-    const admitted = await Promise.all([admit(first), admit(second)]);
-
-    expect(admitted.map((task) => task.status).sort()).toEqual([
-      TaskStatus.DISPATCHING,
-      TaskStatus.QUEUED,
-    ]);
+    expect(claimed.filter(Boolean)).toHaveLength(1);
+    expect(claimed.find(Boolean)?.task_id).toBe(first.task_id);
+    expect((await tasks.findById(second.task_id))?.status).toBe(TaskStatus.QUEUED);
     const session = await sessions.findById(sessionId);
     expect(session?.status).toBe(SessionStatus.RUNNING);
     expect(session?.tasks).toHaveLength(1);
@@ -1339,10 +1373,9 @@ describe('TaskRepository executor turn transitions', () => {
     const tasks = new TaskRepository(db);
     const sessions = new SessionRepository(db);
     const sessionId = await createSessionWithDeps(db);
-    const task = await tasks.create(createTaskData({ session_id: sessionId }));
+    const task = await tasks.createPending(createPendingInput({ session_id: sessionId }));
     const attemptId = generateId();
-    await tasks.admitExecutorTurn({
-      taskId: task.task_id,
+    await tasks.claimNextExecutorTurn({
       sessionId,
       patch: {
         status: TaskStatus.DISPATCHING,
@@ -1397,10 +1430,9 @@ describe('TaskRepository executor turn transitions', () => {
     const tasks = new TaskRepository(db);
     const sessions = new SessionRepository(db);
     const sessionId = await createSessionWithDeps(db);
-    const task = await tasks.create(createTaskData({ session_id: sessionId }));
+    const task = await tasks.createPending(createPendingInput({ session_id: sessionId }));
     const attemptId = generateId();
-    await tasks.admitExecutorTurn({
-      taskId: task.task_id,
+    await tasks.claimNextExecutorTurn({
       sessionId,
       patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: attemptId } },
     });
@@ -1437,9 +1469,8 @@ describe('TaskRepository executor turn transitions', () => {
       const tasks = new TaskRepository(db);
       const sessionId = await createSessionWithDeps(db);
       const attemptId = generateId();
-      const created = await tasks.create(createTaskData({ session_id: sessionId }));
-      const dispatching = await tasks.admitExecutorTurn({
-        taskId: created.task_id,
+      await tasks.createPending(createPendingInput({ session_id: sessionId }));
+      const dispatching = await tasks.claimNextExecutorTurn({
         sessionId,
         patch: {
           status: TaskStatus.DISPATCHING,
@@ -1448,12 +1479,13 @@ describe('TaskRepository executor turn transitions', () => {
         },
       });
 
+      expect(dispatching).not.toBeNull();
       await expect(
-        tasks.update(dispatching.task_id, { status: TaskStatus.RUNNING })
+        tasks.update(dispatching!.task_id, { status: TaskStatus.RUNNING })
       ).rejects.toThrow(/connectExecutor/);
-      await tasks.update(dispatching.task_id, { status: TaskStatus.FAILED });
+      await tasks.update(dispatching!.task_id, { status: TaskStatus.FAILED });
       await expect(
-        tasks.update(dispatching.task_id, { status: TaskStatus.RUNNING })
+        tasks.update(dispatching!.task_id, { status: TaskStatus.RUNNING })
       ).rejects.toThrow(/terminal task status/);
     }
   );
@@ -1463,9 +1495,8 @@ describe('TaskRepository executor turn transitions', () => {
     const sessions = new SessionRepository(db);
     const sessionId = await createSessionWithDeps(db);
     const attemptId = generateId();
-    const first = await tasks.create(createTaskData({ session_id: sessionId }));
-    await tasks.admitExecutorTurn({
-      taskId: first.task_id,
+    const first = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    await tasks.claimNextExecutorTurn({
       sessionId,
       patch: {
         status: TaskStatus.DISPATCHING,
@@ -1473,28 +1504,25 @@ describe('TaskRepository executor turn transitions', () => {
       },
     });
     await tasks.connectExecutor(first.task_id, attemptId);
-
-    const second = await tasks.create(createTaskData({ session_id: sessionId }));
     expect(
-      (
-        await tasks.admitExecutorTurn({
-          taskId: second.task_id,
-          sessionId,
-          patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: generateId() } },
-        })
-      ).status
-    ).toBe(TaskStatus.QUEUED);
+      await tasks.withActiveExecutorAttempt(first.task_id, attemptId, async () => 'accepted')
+    ).toBe('accepted');
+
+    await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    expect(
+      await tasks.claimNextExecutorTurn({
+        sessionId,
+        patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: generateId() } },
+      })
+    ).toBeNull();
 
     await tasks.update(first.task_id, { status: TaskStatus.COMPLETED });
     expect(
-      (
-        await tasks.admitExecutorTurn({
-          taskId: second.task_id,
-          sessionId,
-          patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: generateId() } },
-        })
-      ).status
-    ).toBe(TaskStatus.QUEUED);
+      await tasks.claimNextExecutorTurn({
+        sessionId,
+        patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: generateId() } },
+      })
+    ).toBeNull();
     expect(await tasks.releaseExecutorTurn(first.task_id, generateId())).toBeNull();
     await tasks.patchExecutorAttempt(first.task_id, attemptId, {
       workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
@@ -1512,14 +1540,16 @@ describe('TaskRepository executor turn transitions', () => {
         workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 1 },
       })
     ).toBeNull();
+    expect(
+      await tasks.withActiveExecutorAttempt(first.task_id, attemptId, async () => 'late write')
+    ).toBeNull();
 
     const nextAttempt = generateId();
-    const admitted = await tasks.admitExecutorTurn({
-      taskId: second.task_id,
+    const admitted = await tasks.claimNextExecutorTurn({
       sessionId,
       patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: nextAttempt } },
     });
-    expect(admitted.status).toBe(TaskStatus.DISPATCHING);
+    expect(admitted?.status).toBe(TaskStatus.DISPATCHING);
     expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.RUNNING);
   });
 });

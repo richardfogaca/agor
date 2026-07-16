@@ -134,7 +134,7 @@ import { canControlCliSession } from './utils/mcp-token-authorization.js';
 import { ensureScheduleRunsAsCaller } from './utils/schedule-hooks.js';
 import { runWithSessionQueueTenantScope } from './utils/session-queue-tenant-scope.js';
 import { stopSessionPreserveQueue } from './utils/session-stop.js';
-import { normalizeMessageSource, runExistingTask } from './utils/task-runner.js';
+import { normalizeMessageSource } from './utils/task-runner.js';
 import {
   createTenantDatabaseScopeAroundHook,
   deferWithTenantContext,
@@ -636,6 +636,24 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const _reposRepo = new RepoRepository(db);
   const _tasksRepo = new TaskRepository(db);
 
+  async function withExecutorMutation<T>(params: RouteParams, work: () => Promise<T>): Promise<T> {
+    const scope = params as RouteParams & {
+      executorAttemptId?: string;
+      executorTaskId?: string;
+    };
+    if (!scope.executorAttemptId && !scope.executorTaskId) return work();
+    if (!scope.executorAttemptId || !scope.executorTaskId) {
+      throw new Conflict('Executor runtime scope is incomplete');
+    }
+    const result = await _tasksRepo.withActiveExecutorAttempt(
+      scope.executorTaskId,
+      scope.executorAttemptId,
+      work
+    );
+    if (result === null) throw new Conflict('Executor attempt no longer owns runtime writes');
+    return result;
+  }
+
   const permissionService = new PermissionService((event, data) => {
     app.service('sessions').emit(event, data);
   });
@@ -655,7 +673,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     '/messages/bulk',
     {
       async create(data: unknown, params: RouteParams) {
-        return messagesService.createMany(data as Message[]);
+        return messagesService.createMany(data as Message[], params);
       },
     },
     {
@@ -675,25 +693,27 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
         params: RouteParams
       ) {
-        app.service('messages').emit(data.event, data.data);
-        if (isServiceAccountRoute(params)) {
-          const gatewayStreamingEvent =
-            data.event === 'streaming:start' ||
-            data.event === 'streaming:chunk' ||
-            data.event === 'streaming:end' ||
-            data.event === 'streaming:error'
-              ? data.event
-              : null;
+        return withExecutorMutation(params, async () => {
+          app.service('messages').emit(data.event, data.data);
+          if (isServiceAccountRoute(params)) {
+            const gatewayStreamingEvent =
+              data.event === 'streaming:start' ||
+              data.event === 'streaming:chunk' ||
+              data.event === 'streaming:end' ||
+              data.event === 'streaming:error'
+                ? data.event
+                : null;
 
-          if (gatewayStreamingEvent) {
-            deferInFreshTenantScope(params, async () => {
-              await (
-                app.service('gateway') as unknown as GatewayService
-              ).handleMessageStreamingEvent(gatewayStreamingEvent, data.data);
-            });
+            if (gatewayStreamingEvent) {
+              deferInFreshTenantScope(params, async () => {
+                await (
+                  app.service('gateway') as unknown as GatewayService
+                ).handleMessageStreamingEvent(gatewayStreamingEvent, data.data);
+              });
+            }
           }
-        }
-        return { success: true };
+          return { success: true };
+        });
       },
     },
     {
@@ -713,24 +733,26 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
         params: RouteParams
       ) {
-        app.service('tasks').emit(data.event, data.data);
-        if (isServiceAccountRoute(params) && data.event === 'tool:start') {
-          const sessionId =
-            typeof data.data.session_id === 'string' ? data.data.session_id : undefined;
-          const toolName =
-            typeof data.data.tool_name === 'string' ? data.data.tool_name : undefined;
-          if (sessionId) {
-            deferInFreshTenantScope(params, async () => {
-              await (app.service('gateway') as unknown as GatewayService).updateProgress({
-                session_id: sessionId,
-                state: 'working',
-                task_id: typeof data.data.task_id === 'string' ? data.data.task_id : undefined,
-                tool_name: toolName,
+        return withExecutorMutation(params, async () => {
+          app.service('tasks').emit(data.event, data.data);
+          if (isServiceAccountRoute(params) && data.event === 'tool:start') {
+            const sessionId =
+              typeof data.data.session_id === 'string' ? data.data.session_id : undefined;
+            const toolName =
+              typeof data.data.tool_name === 'string' ? data.data.tool_name : undefined;
+            if (sessionId) {
+              deferInFreshTenantScope(params, async () => {
+                await (app.service('gateway') as unknown as GatewayService).updateProgress({
+                  session_id: sessionId,
+                  state: 'working',
+                  task_id: typeof data.data.task_id === 'string' ? data.data.task_id : undefined,
+                  tool_name: toolName,
+                });
               });
-            });
+            }
           }
-        }
-        return { success: true };
+          return { success: true };
+        });
       },
     },
     {
@@ -1012,12 +1034,48 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     }
   }
 
+  async function failClaimedTask(task: Task, error: unknown, params: RouteParams): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    await safePatch(
+      'tasks',
+      task.task_id,
+      { status: TaskStatus.FAILED, completed_at: new Date().toISOString(), error_message: message },
+      'Task',
+      params
+    );
+    try {
+      await appendSystemMessage({
+        app,
+        db,
+        sessionId: task.session_id,
+        taskId: task.task_id,
+        content: `⚠️ The agent failed to start.\n\n${message}`,
+        role: MessageRole.ASSISTANT,
+        metadata: { is_meta: true },
+        params,
+      });
+    } catch (systemMessageError) {
+      console.warn('[Daemon] Failed to write system error message:', systemMessageError);
+    }
+    app.service('tasks').emit('failed', {
+      task_id: task.task_id,
+      session_id: task.session_id,
+      error_message: message,
+    });
+    if (task.executor_attempt) {
+      await tasksService.finalizeExecutorTurn(
+        { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
+        params
+      );
+    }
+  }
+
   /**
-   * spawnTaskExecutor — sole transition point for `tasks.status` going from
-   * `created` / `queued` → `dispatching` (executor) or `running` (legacy CLI).
+   * startClaimedTask — prepare and launch the queue head after the repository
+   * has durably claimed it as `dispatching` (executor) or `running` (legacy CLI).
    *
-   * Both the IDLE branch of POST /sessions/:id/prompt and the queued-task
-   * drainer call this helper. Centralising the transition guarantees that:
+   * The queue drainer calls this only after atomically claiming the FIFO head.
+   * Centralising preparation and launch guarantees that:
    *
    *   - `message_range.start_index`, `git_state.{ref,sha}_at_start`, and
    *     `started_at` are recomputed against fresh state right before the
@@ -1035,19 +1093,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
    *   - Spawn failures synthesise a `type:'system'` error message so the
    *     chat surfaces *why* the assistant didn't respond, instead of silently
    *     leaving a ghost task in FAILED with no transcript trace.
-   *
-   * The session.tasks list is appended here too, so callers don't have to
-   * remember to do it themselves.
    */
-  async function spawnTaskExecutor(
-    task: Task,
-    options: {
-      permissionMode?: import('@agor/core/types').PermissionMode;
-      stream?: boolean;
-      messageSource?: MessageSource;
-    },
-    params: RouteParams
-  ): Promise<Task> {
+  async function startClaimedTask(task: Task, params: RouteParams): Promise<Task> {
     const tenantId = getCurrentTenantId();
     if (!tenantId) throw new Error('Missing active tenant context for task executor startup');
     const {
@@ -1066,10 +1113,36 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     if (!agenticToolEnabled) {
       throw new Forbidden(`${loadedSession.agentic_tool} is disabled for this workspace`);
     }
-    const session = await sessionsService.materializeAgenticToolPreset(loadedSession, params);
-    const startTimestamp = new Date().toISOString();
+    let session = await sessionsService.materializeAgenticToolPreset(loadedSession, params);
+    if (
+      session.agentic_tool_preset_id &&
+      task.metadata?.permission_mode !== undefined &&
+      task.metadata.permission_mode !== session.permission_config?.mode
+    ) {
+      throw new Forbidden('Preset-backed sessions cannot override permission mode per task');
+    }
+    if (config.execution?.stateless_fs_mode) {
+      const capabilities = AGENTIC_TOOL_CAPABILITIES[session.agentic_tool];
+      if (capabilities && !capabilities.supportsStatelessFsMode) {
+        const supported = Object.entries(AGENTIC_TOOL_CAPABILITIES)
+          .filter(([, candidate]) => candidate.supportsStatelessFsMode)
+          .map(([name]) => name)
+          .join(', ');
+        throw new Error(
+          `stateless_fs_mode is enabled but tool '${session.agentic_tool}' does not support it. Supported tools: ${supported}`
+        );
+      }
+    }
+    if (session.archived) {
+      session = (await sessionsService.patch(
+        session.session_id,
+        { archived: false, archived_reason: undefined },
+        params
+      )) as typeof session;
+    }
+    const startTimestamp = task.started_at ?? new Date().toISOString();
 
-    // Finish fallible prompt preparation before reserving the session turn.
+    // Preparation happens only after the durable FIFO head owns the turn.
     const { prompt: promptForExecutor } = await buildPrompterPrefixedPrompt({
       rawPrompt: task.full_prompt,
       sessionCreatedBy: session.created_by,
@@ -1077,56 +1150,22 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       usersRepo: bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db)),
     });
 
-    // The daemon transitions the task to RUNNING and writes required sentinel
-    // git fields before executor spawn. The executor overwrites these with the
-    // authoritative task-start git state from inside the managed checkout.
-    const gitStateAtStart = 'unknown';
-    const refAtStart = 'unknown';
-
     const usesExecutor = session.agentic_tool !== 'claude-code-cli';
-    const executorAttemptId = usesExecutor ? generateId() : undefined;
-    const updatedTask = await _tasksRepo.admitExecutorTurn({
-      taskId: task.task_id,
-      sessionId: task.session_id,
-      patch: {
-        status: usesExecutor ? TaskStatus.DISPATCHING : TaskStatus.RUNNING,
-        started_at: startTimestamp,
-        ...(executorAttemptId
-          ? {
-              executor_attempt: { id: executorAttemptId },
-            }
-          : {}),
+    const executorAttemptId = task.executor_attempt?.id;
+    if (usesExecutor && !executorAttemptId) throw new Error('Claimed task has no executor attempt');
+    const updatedTask = (await tasksService.patch(
+      task.task_id,
+      {
         message_range: {
           start_index: messageStartIndex,
           end_index: messageStartIndex + 1,
           start_timestamp: startTimestamp,
           end_timestamp: startTimestamp,
         },
-        git_state: {
-          ref_at_start: refAtStart,
-          sha_at_start: gitStateAtStart,
-        },
+        git_state: { ref_at_start: 'unknown', sha_at_start: 'unknown' },
       },
-    });
-    emitServiceEvent(app, {
-      path: 'tasks',
-      event: 'patched',
-      data: updatedTask,
-      params,
-      id: updatedTask.task_id,
-    });
-    if (updatedTask.status === TaskStatus.QUEUED) {
-      app.service('tasks').emit('queued', updatedTask);
-      return updatedTask;
-    }
-    const admittedSession = await sessionsService.get(task.session_id, params);
-    emitServiceEvent(app, {
-      path: 'sessions',
-      event: 'patched',
-      data: admittedSession,
-      params,
-      id: admittedSession.session_id,
-    });
+      params
+    )) as Task;
 
     // Alt D — write the user-message row before spawning. Gated by kill switch.
     // The executor's createUserMessage has a skip-if-exists guard so a duplicate
@@ -1141,7 +1180,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // Prefer task.metadata.source (set when the task was queued) over
         // the request's messageSource — the latter applies only to the
         // current draining tick, the former to where the prompt originated.
-        const source = task.metadata?.source ?? options.messageSource;
+        const source = task.metadata?.source;
         if (source) {
           messageMetadata.source = source;
         }
@@ -1168,7 +1207,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       }
     }
 
-    const useStreaming = options.stream !== false;
+    const useStreaming = task.metadata?.stream !== false;
     const sessionId = task.session_id;
     const taskId = task.task_id;
 
@@ -1280,9 +1319,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             taskId,
             executorAttemptId: executorAttemptId!,
             prompt: promptForExecutor,
-            permissionMode: options.permissionMode,
+            permissionMode: task.metadata?.permission_mode,
             stream: useStreaming,
-            messageSource: options.messageSource,
+            messageSource: task.metadata?.source,
           },
           params
         );
@@ -1300,71 +1339,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           `❌ [Daemon] Executor spawn failed for session=${shortId(sessionId)} task=${shortId(taskId)} agent=${session.agentic_tool} unix_username=${session.unix_username ?? 'null'}: ${errorMessage}`,
           error
         );
-        await safePatch(
-          'tasks',
-          taskId,
-          {
-            status: TaskStatus.FAILED,
-            completed_at: new Date().toISOString(),
-            error_message: errorMessage,
-          },
-          'Task',
-          params
-        );
-
-        // Synthesize a system message so the chat surfaces *why* the agent
-        // didn't respond. Without this the transcript shows only the user
-        // prompt and silence even though the task list reads FAILED.
         try {
-          // Recompute the next index instead of trusting `messageStartIndex
-          // + 1` — the daemon-write user-message above is wrapped in a
-          // try/catch and may have been swallowed, leaving a gap at
-          // `messageStartIndex`. countMessages always reports the live row
-          // count, so it lands the system error at the true tail whether
-          // the user-message row exists or not (no gap, no collision).
-          const errorContent = `⚠️ The agent failed to start.\n\n${errorMessage}`;
-          await appendSystemMessage({
-            app,
-            db,
-            sessionId,
-            taskId,
-            content: errorContent,
-            role: MessageRole.ASSISTANT,
-            metadata: { is_meta: true },
-            params,
-          });
-        } catch (sysErr) {
-          console.warn(
-            '[Daemon] Failed to write system error message after spawn failure:',
-            sysErr
-          );
-        }
-
-        try {
-          app.service('tasks').emit('failed', {
-            task_id: taskId,
-            session_id: sessionId,
-            error_message: errorMessage,
-          });
-        } catch (emitErr) {
-          console.warn('[Daemon] Failed to emit tasks:failed event:', emitErr);
-        }
-
-        if (executorAttemptId) {
-          try {
-            await tasksService.finalizeExecutorTurn(
-              {
-                task_id: taskId,
-                executor_attempt_id: executorAttemptId,
-              },
-              params
-            );
-          } catch (releaseError) {
-            console.error(
-              `❌ [Daemon] Failed to release unspawned task ${shortId(taskId)}:`,
-              releaseError
-            );
-          }
+          await failClaimedTask(updatedTask, error, params);
+        } catch (finalizationError) {
+          console.error(`❌ [Daemon] Failed to settle task ${shortId(taskId)}:`, finalizationError);
         }
       }
     });
@@ -1416,56 +1394,15 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           );
         }
 
-        let session = await sessionsService.get(id, params);
+        const session = await sessionsService.get(id, params);
         id = session.session_id;
-
-        if (!(await isTenantAgenticToolEnabled(session.agentic_tool ?? 'claude-code', db))) {
-          throw new Forbidden(
-            `${session.agentic_tool ?? 'claude-code'} is disabled for this workspace`
-          );
-        }
-        session = await sessionsService.materializeAgenticToolPreset(session, params);
-        if (
-          session.agentic_tool_preset_id &&
-          data.permissionMode !== undefined &&
-          data.permissionMode !== session.permission_config?.mode
-        ) {
-          throw new Forbidden('Preset-backed sessions cannot override permission mode per task');
-        }
-
-        // Early validation: reject unsupported tools when stateless_fs_mode is enabled
-        if (config.execution?.stateless_fs_mode) {
-          const toolName = session.agentic_tool as import('@agor/core/types').AgenticToolName;
-          const capabilities = AGENTIC_TOOL_CAPABILITIES[toolName];
-          if (capabilities && !capabilities.supportsStatelessFsMode) {
-            const supported = Object.entries(AGENTIC_TOOL_CAPABILITIES)
-              .filter(([, caps]) => caps.supportsStatelessFsMode)
-              .map(([name]) => name)
-              .join(', ');
-            throw new Error(
-              `stateless_fs_mode is enabled but tool '${toolName}' does not support it. Supported tools: ${supported}`
-            );
-          }
-        }
-
-        // Auto-unarchive on prompt
-        if (session.archived) {
-          console.log(
-            `📦 [Prompt] Auto-unarchiving session ${shortId(id)} (was archived: ${session.archived_reason || 'unknown reason'})`
-          );
-          session = (await sessionsService.patch(
-            id,
-            { archived: false, archived_reason: undefined },
-            params
-          )) as typeof session;
-        }
 
         if (session.status === SessionStatus.STOPPING) {
           throw new Error('Cannot send prompt: session is currently stopping');
         }
 
-        // Every entry point creates the same pending shape and asks the
-        // repository to admit it. The database transition decides run vs queue.
+        // Submission order is assigned before any fallible preparation. The
+        // queue processor is the sole owner of claim, preparation, and launch.
         const taskRepo = new TaskRepository(db);
         if (!params.user?.user_id) {
           throw new NotAuthenticated('Authentication required to prompt a session');
@@ -1473,15 +1410,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         const createdBy = params.user.user_id;
 
         const metadata: import('@agor/core/types').TaskMetadata = {
+          ...(data.metadata ?? {}),
           queued_by_user_id: createdBy,
           ...(messageSource ? { source: messageSource } : {}),
-          ...(data.metadata ?? {}),
+          ...(data.permissionMode ? { permission_mode: data.permissionMode } : {}),
+          stream: data.stream !== false,
         };
         const task = await taskRepo.createPending({
           session_id: id as SessionID,
           full_prompt: data.prompt,
           created_by: createdBy,
-          status: TaskStatus.CREATED,
           metadata,
         });
         emitServiceEvent(app, {
@@ -1491,15 +1429,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           params,
           id: task.task_id,
         });
-        return spawnTaskExecutor(
-          task,
-          {
-            permissionMode: data.permissionMode,
-            stream: data.stream !== false,
-            messageSource,
-          },
-          params
+        app.service('tasks').emit('queued', task);
+        deferInFreshTenantScope(params, () =>
+          sessionsService.triggerQueueProcessing(task.session_id, params)
         );
+        return task;
       },
     },
     {
@@ -1514,8 +1448,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Explicit executor trigger for an already-created task. Lets pure-REST
   // harnesses (Python, Go, shell+curl — anything without an MCP client) drive
   // the executor by POSTing a Task row first (`POST /tasks`) and then poking
-  // it awake here. `spawnTaskExecutor` delegates admission to the database,
-  // so this has the same run-or-queue behavior as every other entry point.
+  // it awake here. Running a draft enqueues it into the same FIFO used by
+  // every prompt; the queue processor remains the only launch path.
   //
   // Only CREATED tasks are accepted. QUEUED tasks drain in order and all
   // terminal/in-flight states remain immutable.
@@ -1562,7 +1496,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         // Branch RBAC — defense in depth. Without this, a member with
         // 'view' permission could trigger execution; the eventual
-        // `tasks.patch` inside spawnTaskExecutor would still 403 via the
+        // task preparation inside startClaimedTask would still 403 via the
         // `ensureCanPromptInSession` hook, but only after we'd done extra
         // work and emitted partial state. Mirrors the upload route's
         // pattern (~L1467) and `ensureCanPromptInSession` semantics —
@@ -1606,19 +1540,19 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           }
         }
 
-        return runExistingTask(
-          task,
-          {
-            permissionMode: data.permissionMode,
-            stream: data.stream !== false,
-            messageSource: normalizeMessageSource(data.messageSource, params),
-          },
-          params,
-          {
-            findTaskById: (id) => taskRepo.findById(id),
-            spawnFn: spawnTaskExecutor,
-          }
+        const source = normalizeMessageSource(data.messageSource, params);
+        const queued = await taskRepo.enqueueCreatedTask(task.task_id, {
+          ...task.metadata,
+          ...(source ? { source } : {}),
+          ...(data.permissionMode ? { permission_mode: data.permissionMode } : {}),
+          stream: data.stream !== false,
+          queued_by_user_id: task.created_by,
+        });
+        app.service('tasks').emit('queued', queued);
+        deferInFreshTenantScope(params, () =>
+          sessionsService.triggerQueueProcessing(queued.session_id, params)
         );
+        return queued;
       },
     },
     {
@@ -2092,10 +2026,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Queue listing — task-centric (was message-centric pre-never-lose-prompt).
   // The queue is the set of tasks with status='queued', ranked by
   // queue_position. Each queued task carries the full prompt + metadata; on
-  // drain it admits queued work via spawnTaskExecutor.
+  // drain it claims queued work before startClaimedTask performs preparation.
   //
-  // Enqueueing goes through `POST /sessions/:id/prompt` — the daemon decides
-  // run-vs-queue based on session state and reports it back via `task.status`.
+  // Enqueueing goes through `POST /sessions/:id/prompt`; the drainer atomically
+  // claims the FIFO head when the session becomes available.
   // ============================================================================
 
   registerAuthenticatedRoute(
@@ -2140,14 +2074,38 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     params: RouteParams
   ): Promise<void> {
     const taskRepo = bindRepositoryToTenantUnitOfWork(db, new TaskRepository(db));
-    const nextTask = await taskRepo.getNextQueued(sessionId);
-
-    if (!nextTask) {
+    const session = await sessionsService.get(sessionId, params);
+    const usesExecutor = session.agentic_tool !== 'claude-code-cli';
+    const claimed = await taskRepo.claimNextExecutorTurn({
+      sessionId,
+      patch: {
+        status: usesExecutor ? TaskStatus.DISPATCHING : TaskStatus.RUNNING,
+        started_at: new Date().toISOString(),
+        ...(usesExecutor ? { executor_attempt: { id: generateId() } } : {}),
+      },
+    });
+    if (!claimed) {
       taskQueueDebug(`📭 No queued tasks for session ${shortId(sessionId)}`);
       return;
     }
 
-    const userId = nextTask.metadata?.queued_by_user_id;
+    emitServiceEvent(app, {
+      path: 'tasks',
+      event: 'patched',
+      data: claimed,
+      params,
+      id: claimed.task_id,
+    });
+    const admittedSession = await sessionsService.get(sessionId, params);
+    emitServiceEvent(app, {
+      path: 'sessions',
+      event: 'patched',
+      data: admittedSession,
+      params,
+      id: admittedSession.session_id,
+    });
+
+    const userId = claimed.metadata?.queued_by_user_id;
     const userRepo = bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db));
     const queuedByUser = userId ? await userRepo.findById(userId) : undefined;
 
@@ -2159,21 +2117,15 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       : params;
 
     console.log(
-      `📬 Processing queued task ${shortId(nextTask.task_id)} ` +
-        `(position ${nextTask.queue_position}) ` +
+      `📬 Processing queued task ${shortId(claimed.task_id)} ` +
         `with user context: ${queuedByUser ? shortId(queuedByUser.user_id) : 'none'}`
     );
 
-    // Admission revalidates both the queue head and active turn atomically.
-    const source = nextTask.metadata?.source;
-    await spawnTaskExecutor(
-      nextTask,
-      {
-        stream: true,
-        messageSource: source,
-      },
-      taskParams
-    );
+    try {
+      await startClaimedTask(claimed, taskParams);
+    } catch (error) {
+      await failClaimedTask(claimed, error, taskParams);
+    }
 
     console.log(`✅ Queued task drained for session ${shortId(sessionId)}`);
   }

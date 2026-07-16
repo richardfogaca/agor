@@ -1,33 +1,32 @@
 # Task Queueing
 
-**Tasks are the queueable unit. Sessions accept prompts. The Task entity itself
-encodes whether the prompt ran or got queued.**
+**Tasks are the queueable unit. Sessions accept prompts. Every accepted prompt
+enters one durable FIFO before preparation or execution.**
 
 ## Wire shape
 
-`POST /sessions/:id/prompt` always returns a `Task`. Callers inspect:
+`POST /sessions/:id/prompt` returns the newly queued `Task`:
 
-- `task.status === 'queued'` → session was busy; the task is waiting and will
-  drain automatically when the session goes idle.
+- `task.status === 'queued'` → durably accepted; it will be claimed immediately
+  if the session is available, otherwise it waits.
 - `task.status === 'dispatching'` → admitted; the executor has not connected yet.
 - `task.status === 'running'` → the admitted executor authenticated successfully.
 - `task.queue_position` → ordering within the session's queue (lowest drains
   first), populated only while QUEUED.
 
-There is no separate "queued vs ran" envelope. The route does not take a
-`queue: true` flag. Callers don't ask, the response answers.
+There is no separate "queued vs ran" envelope or `queue: true` flag. Reactive
+task events expose the later DISPATCHING/RUNNING transitions.
 
 ## Lifecycle
 
-1. **Materialize** — the route creates the same CREATED Task shape for every
-   prompt. `TaskRepository.admitExecutorTurn` atomically decides whether that
-   task becomes DISPATCHING or QUEUED.
-2. **Drain** — when a session reaches a terminal task state, the queue
-   processor picks the lowest `queue_position` and hands it to
-   `spawnTaskExecutor`, which is the _sole_ place that pins
+1. **Materialize** — every prompt is atomically created as QUEUED with its
+   durable `queue_position` before fallible preparation starts.
+2. **Drain** — the repository claims only the lowest `queue_position`, moving
+   it to DISPATCHING (or RUNNING for the legacy CLI). The queue processor then
+   hands that claimed task to `startClaimedTask`, which is the _sole_ place that pins
    `message_range`/`git_state`, writes the initial user-message row, and
    spawns the executor.
-3. **Race safety** — admission locks the session row and enforces one active or
+3. **Race safety** — claiming locks the session row and enforces one active or
    unreleased executor turn. Terminal work remains a blocker until process exit
    and required persistence settle; release then drains the FIFO queue.
 4. **Stop safety** — Stop reserves the current turn under the same session lock,
@@ -37,9 +36,9 @@ There is no separate "queued vs ran" envelope. The route does not take a
 ## Key files
 
 - Repo: `packages/core/src/db/repositories/tasks.ts` (`createPending`,
-  `admitExecutorTurn`, `reserveExecutorStop`, `releaseExecutorTurn`)
+  `claimNextExecutorTurn`, `reserveExecutorStop`, `releaseExecutorTurn`)
 - Route: `apps/agor-daemon/src/register-routes.ts` (`/sessions/:id/prompt`,
-  `spawnTaskExecutor`, `processNextQueuedTask`)
+  `startClaimedTask`, `processNextQueuedTask`)
 - Reactive client: `packages/client/src/reactive-session.ts` (handles
   `tasks:created`/`tasks:queued`/`tasks:patched` events)
 

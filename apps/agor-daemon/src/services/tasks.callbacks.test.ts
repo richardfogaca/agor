@@ -1,4 +1,3 @@
-import { runWithTenantDatabaseScope } from '@agor/core/db';
 import { type Session, type Task, TaskStatus } from '@agor/core/types';
 import { describe, expect, it, vi } from 'vitest';
 import { TasksService } from './tasks';
@@ -83,6 +82,54 @@ function makeService(
     ...options.parentSession,
   });
 
+  const callbackTask = makeTask({
+    task_id: callbackTaskId,
+    session_id: parentSessionId,
+    status: TaskStatus.QUEUED,
+  });
+  const createCompletionCallback = vi.fn(
+    async (data: {
+      sourceTaskId: string;
+      targetSessionId: string;
+      fullPrompt: string;
+      createdBy: string;
+      metadata: Task['metadata'];
+    }) => {
+      const source = tasksById.get(data.sourceTaskId);
+      if (
+        source?.metadata?.callback_dispatches?.some(
+          (dispatch) => dispatch.target_session_id === data.targetSessionId
+        )
+      ) {
+        return null;
+      }
+      if (source) {
+        tasksById.set(data.sourceTaskId, {
+          ...source,
+          metadata: {
+            ...source.metadata,
+            callback_dispatches: [
+              ...(source.metadata?.callback_dispatches ?? []),
+              {
+                event: 'session_completion',
+                target_session_id: data.targetSessionId as Session['session_id'],
+                queued_task_id: callbackTaskId,
+                dispatched_at: '2026-01-01T00:00:06.000Z',
+              },
+            ],
+          },
+        });
+      }
+      return {
+        ...callbackTask,
+        session_id: data.targetSessionId,
+        full_prompt: data.fullPrompt,
+        created_by: data.createdBy,
+        metadata: data.metadata,
+      } as Task;
+    }
+  );
+
   const repository = {
     findById: vi.fn(async (id: string) => tasksById.get(id) ?? null),
     update: vi.fn(async (id: string, updates: Partial<Task>) => {
@@ -94,14 +141,21 @@ function makeService(
     create: vi.fn(),
     findAll: vi.fn(async () => [...tasksById.values()]),
     delete: vi.fn(),
+    createCompletionCallback,
+    releaseExecutorTurn: vi.fn(async (id: string, attemptId: string) => {
+      const current = tasksById.get(id);
+      if (current?.executor_attempt?.id !== attemptId) return null;
+      const task = {
+        ...current,
+        executor_attempt: {
+          ...current.executor_attempt,
+          released_at: '2026-01-01T00:00:06.000Z',
+        },
+      } as Task;
+      tasksById.set(id, task);
+      return { task, released: true };
+    }),
   };
-
-  const callbackTask = makeTask({
-    task_id: callbackTaskId,
-    session_id: parentSessionId,
-    status: TaskStatus.QUEUED,
-  });
-  const createPending = vi.fn(async (data: Partial<Task>) => ({ ...callbackTask, ...data }));
 
   const sessionsPatch = vi.fn(async (id: string, updates: Partial<Session>) => {
     const target = id === parentSessionId ? parentSession : childSession;
@@ -119,23 +173,22 @@ function makeService(
 
   const service = Object.create(TasksService.prototype) as TasksService & {
     repository: typeof repository;
-    taskRepo: typeof repository & { createPending: typeof createPending };
+    taskRepo: typeof repository;
     id: string;
     emit: ReturnType<typeof vi.fn>;
     app: { service: ReturnType<typeof vi.fn> };
-    completionCallbackDispatches: Map<string, Promise<unknown>>;
   };
   service.repository = repository;
-  service.taskRepo = { ...repository, createPending };
+  service.taskRepo = repository;
   service.id = 'task_id';
   service.emit = vi.fn();
-  service.completionCallbackDispatches = new Map();
   service.app = {
     service: vi.fn((name: string) => {
       if (name === 'sessions') {
         return {
           get: vi.fn(async (id: string) => (id === parentSessionId ? parentSession : childSession)),
           patch: sessionsPatch,
+          emit: vi.fn(),
           triggerQueueProcessing,
         };
       }
@@ -148,7 +201,7 @@ function makeService(
   return {
     service,
     repository,
-    createPending,
+    createCompletionCallback,
     sessionsPatch,
     triggerQueueProcessing,
     messagesFind,
@@ -158,60 +211,44 @@ function makeService(
 }
 
 describe('TasksService completion callbacks', () => {
-  it('defers callback dispatch until after the tenant transaction commits', async () => {
-    const events: string[] = [];
-    const { service, createPending } = makeService();
-    const tx = {
-      execute: vi.fn(async () => []),
-    };
-    const db = {
-      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => {
-        events.push('tx:start');
-        const result = await callback(tx);
-        events.push('tx:committed');
-        return result;
-      }),
-    };
-    createPending.mockImplementationOnce(async (data: Partial<Task>) => {
-      events.push('callback:queued');
-      return {
-        ...makeTask({
-          task_id: callbackTaskId,
-          session_id: parentSessionId,
-          status: TaskStatus.QUEUED,
-        }),
-        ...data,
-      };
-    });
-    await runWithTenantDatabaseScope(db as never, 'tenant-1', async () => {
-      await service.patch(taskId, {
-        status: TaskStatus.COMPLETED,
-        completed_at: '2026-01-01T00:00:05.000Z',
-      });
-
-      events.push('patch:returned');
-      expect(createPending).not.toHaveBeenCalled();
+  it('does not dispatch an executor callback until release succeeds', async () => {
+    const { service, createCompletionCallback } = makeService({
+      task: { executor_attempt: { id: 'attempt-1' } },
     });
 
-    expect(events).toEqual([
-      'tx:start',
-      'patch:returned',
-      'tx:committed',
-      'tx:start',
-      'callback:queued',
-      'tx:committed',
-      'tx:start',
-      'tx:committed',
-      'tx:start',
-      'tx:committed',
-    ]);
-    expect(createPending).toHaveBeenCalledTimes(1);
+    await service.patch(taskId, {
+      status: TaskStatus.COMPLETED,
+      completed_at: '2026-01-01T00:00:05.000Z',
+    });
+    expect(createCompletionCallback).not.toHaveBeenCalled();
+
+    await service.releaseExecutorTurn({
+      task_id: taskId,
+      executor_attempt_id: 'attempt-1',
+    });
+    expect(createCompletionCallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not dispatch completion callbacks for a timed-out release', async () => {
+    const { service, createCompletionCallback } = makeService({
+      task: {
+        status: TaskStatus.TIMED_OUT,
+        executor_attempt: { id: 'attempt-1' },
+      },
+    });
+
+    await service.releaseExecutorTurn({
+      task_id: taskId,
+      executor_attempt_id: 'attempt-1',
+    });
+
+    expect(createCompletionCallback).not.toHaveBeenCalled();
   });
 
   it('queues exactly one templated callback with last-message metadata for a completed subsession task', async () => {
     const {
       service,
-      createPending,
+      createCompletionCallback,
       sessionsPatch,
       triggerQueueProcessing,
       messagesFind,
@@ -223,11 +260,10 @@ describe('TasksService completion callbacks', () => {
       completed_at: '2026-01-01T00:00:05.000Z',
     });
 
-    await vi.waitFor(() => expect(createPending).toHaveBeenCalledTimes(1));
-    expect(createPending).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(createCompletionCallback).toHaveBeenCalledTimes(1));
+    expect(createCompletionCallback).toHaveBeenCalledWith(
       expect.objectContaining({
-        session_id: parentSessionId,
-        status: TaskStatus.QUEUED,
+        targetSessionId: parentSessionId,
         metadata: expect.objectContaining({
           is_agor_callback: true,
           source: 'agor',
@@ -237,7 +273,7 @@ describe('TasksService completion callbacks', () => {
         }),
       })
     );
-    const callbackPrompt = createPending.mock.calls[0][0].full_prompt as string;
+    const callbackPrompt = createCompletionCallback.mock.calls[0][0].fullPrompt;
     expect(callbackPrompt).toContain('[Agor] Child session');
     expect(callbackPrompt).toContain('**Result:**');
     expect(callbackPrompt).toContain('Final child result');
@@ -266,7 +302,7 @@ describe('TasksService completion callbacks', () => {
   });
 
   it('includeOriginalPrompt=false queues one templated callback without an original prompt section', async () => {
-    const { service, createPending } = makeService({
+    const { service, createCompletionCallback } = makeService({
       childSession: {
         callback_config: {
           enabled: true,
@@ -287,8 +323,8 @@ describe('TasksService completion callbacks', () => {
       completed_at: '2026-01-01T00:00:05.000Z',
     });
 
-    await vi.waitFor(() => expect(createPending).toHaveBeenCalledTimes(1));
-    const callbackPrompt = createPending.mock.calls[0][0].full_prompt as string;
+    await vi.waitFor(() => expect(createCompletionCallback).toHaveBeenCalledTimes(1));
+    const callbackPrompt = createCompletionCallback.mock.calls[0][0].fullPrompt;
     expect(callbackPrompt).toContain('[Agor] Child session');
     expect(callbackPrompt).toContain('**Result:**');
     expect(callbackPrompt).toContain('Final child result');
@@ -301,7 +337,7 @@ describe('TasksService completion callbacks', () => {
       'Investigate callback duplication.',
       'Keep this second line in the callback body.',
     ].join('\n');
-    const { service, createPending } = makeService({
+    const { service, createCompletionCallback } = makeService({
       childSession: {
         callback_config: {
           enabled: true,
@@ -320,8 +356,8 @@ describe('TasksService completion callbacks', () => {
       completed_at: '2026-01-01T00:00:05.000Z',
     });
 
-    await vi.waitFor(() => expect(createPending).toHaveBeenCalledTimes(1));
-    const callbackPrompt = createPending.mock.calls[0][0].full_prompt as string;
+    await vi.waitFor(() => expect(createCompletionCallback).toHaveBeenCalledTimes(1));
+    const callbackPrompt = createCompletionCallback.mock.calls[0][0].fullPrompt;
     expect(callbackPrompt).toContain('[Agor] Child session');
     expect(callbackPrompt).toContain('## Original Prompt');
     expect(callbackPrompt).toContain(originalPrompt);
@@ -330,7 +366,7 @@ describe('TasksService completion callbacks', () => {
   });
 
   it('uses the same single templated patch completion path for sessions.create callbacks without spawn genealogy', async () => {
-    const { service, createPending, sessionsPatch } = makeService({
+    const { service, createCompletionCallback, sessionsPatch } = makeService({
       childSession: {
         genealogy: { children: [] },
         callback_config: {
@@ -350,8 +386,8 @@ describe('TasksService completion callbacks', () => {
       completed_at: '2026-01-01T00:00:05.000Z',
     });
 
-    await vi.waitFor(() => expect(createPending).toHaveBeenCalledTimes(1));
-    const callbackPrompt = createPending.mock.calls[0][0].full_prompt as string;
+    await vi.waitFor(() => expect(createCompletionCallback).toHaveBeenCalledTimes(1));
+    const callbackPrompt = createCompletionCallback.mock.calls[0][0].fullPrompt;
     expect(callbackPrompt).toContain('[Agor] Child session');
     expect(callbackPrompt).toContain('## Original Prompt');
     expect(callbackPrompt).toContain('remote session initial prompt');
@@ -365,7 +401,7 @@ describe('TasksService completion callbacks', () => {
   });
 
   it('dedupes concurrent completion callback dispatch for the same task target', async () => {
-    const { service, createPending, childSession } = makeService();
+    const { service, createCompletionCallback, childSession } = makeService();
     const completedTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
@@ -376,32 +412,25 @@ describe('TasksService completion callbacks', () => {
       (service as any).dispatchCompletionCallbacks(completedTask, childSession, {}),
     ]);
 
-    expect(createPending).toHaveBeenCalledTimes(1);
+    expect(createCompletionCallback).toHaveBeenCalledTimes(2);
   });
 
-  it('still triggers target queue processing if dispatch marker persistence fails after queueing', async () => {
-    const { service, repository, createPending, triggerQueueProcessing } = makeService();
+  it('does not trigger target processing if the atomic callback enqueue fails', async () => {
+    const { service, createCompletionCallback, triggerQueueProcessing } = makeService();
     const completedTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
     });
-    const originalUpdate = repository.update.getMockImplementation();
-    repository.update.mockImplementation(async (id: string, updates: Partial<Task>) => {
-      if (updates.metadata?.callback_dispatches) {
-        throw new Error('metadata write failed');
-      }
-      if (!originalUpdate) throw new Error('missing original update');
-      return originalUpdate(id, updates);
-    });
+    createCompletionCallback.mockRejectedValueOnce(new Error('atomic enqueue failed'));
 
     await (service as any).dispatchCompletionCallbacks(completedTask, makeSession(), {});
 
-    expect(createPending).toHaveBeenCalledTimes(1);
-    expect(triggerQueueProcessing).toHaveBeenCalledWith(parentSessionId, {});
+    expect(createCompletionCallback).toHaveBeenCalledTimes(1);
+    expect(triggerQueueProcessing).not.toHaveBeenCalledWith(parentSessionId, {});
   });
 
   it('runs once-mode cleanup only for the caller that actually attempts dispatch', async () => {
-    const { service, createPending, sessionsPatch, childSession } = makeService();
+    const { service, createCompletionCallback, sessionsPatch, childSession } = makeService();
     const completedTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
@@ -412,7 +441,7 @@ describe('TasksService completion callbacks', () => {
       (service as any).dispatchCompletionCallbacks(completedTask, childSession, {}),
     ]);
 
-    expect(createPending).toHaveBeenCalledTimes(1);
+    expect(createCompletionCallback).toHaveBeenCalledTimes(2);
     expect(
       sessionsPatch.mock.calls.filter(
         ([id, updates]) =>
@@ -422,7 +451,7 @@ describe('TasksService completion callbacks', () => {
   });
 
   it("callbackMode='once' prevents a repeat callback after the first firing", async () => {
-    const { service, createPending, childSession } = makeService();
+    const { service, createCompletionCallback, childSession } = makeService();
     const firstTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
@@ -430,10 +459,10 @@ describe('TasksService completion callbacks', () => {
 
     await (service as any).dispatchCompletionCallbacks(firstTask, childSession, {});
 
-    expect(createPending).toHaveBeenCalledTimes(1);
+    expect(createCompletionCallback).toHaveBeenCalledTimes(1);
     expect(childSession.callback_config?.enabled).toBe(false);
 
-    createPending.mockClear();
+    createCompletionCallback.mockClear();
 
     const secondTask = makeTask({
       task_id: '018f0000-0000-7000-8000-000000000202' as Task['task_id'],
@@ -444,12 +473,12 @@ describe('TasksService completion callbacks', () => {
 
     await (service as any).dispatchCompletionCallbacks(secondTask, childSession, {});
 
-    expect(createPending).not.toHaveBeenCalled();
+    expect(createCompletionCallback).not.toHaveBeenCalled();
   });
 
   it("callbackMode='once' does not disable when callback queueing fails before firing", async () => {
-    const { service, createPending, sessionsPatch, childSession } = makeService();
-    createPending.mockRejectedValueOnce(new Error('queue failed'));
+    const { service, createCompletionCallback, sessionsPatch, childSession } = makeService();
+    createCompletionCallback.mockRejectedValueOnce(new Error('queue failed'));
     const completedTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
@@ -457,7 +486,7 @@ describe('TasksService completion callbacks', () => {
 
     await (service as any).dispatchCompletionCallbacks(completedTask, childSession, {});
 
-    expect(createPending).toHaveBeenCalledTimes(1);
+    expect(createCompletionCallback).toHaveBeenCalledTimes(1);
     expect(
       sessionsPatch.mock.calls.filter(
         ([id, updates]) =>
@@ -468,20 +497,22 @@ describe('TasksService completion callbacks', () => {
   });
 
   it('does not queue or trigger when callback dispatch metadata already exists', async () => {
-    const { service, createPending, triggerQueueProcessing, childSession } = makeService({
-      task: {
-        metadata: {
-          callback_dispatches: [
-            {
-              event: 'session_completion',
-              target_session_id: parentSessionId,
-              queued_task_id: callbackTaskId,
-              dispatched_at: '2026-01-01T00:00:06.000Z',
-            },
-          ],
+    const { service, createCompletionCallback, triggerQueueProcessing, childSession } = makeService(
+      {
+        task: {
+          metadata: {
+            callback_dispatches: [
+              {
+                event: 'session_completion',
+                target_session_id: parentSessionId,
+                queued_task_id: callbackTaskId,
+                dispatched_at: '2026-01-01T00:00:06.000Z',
+              },
+            ],
+          },
         },
-      },
-    });
+      }
+    );
     const completedTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
@@ -499,21 +530,23 @@ describe('TasksService completion callbacks', () => {
 
     await (service as any).dispatchCompletionCallbacks(completedTask, childSession, {});
 
-    expect(createPending).not.toHaveBeenCalled();
+    expect(createCompletionCallback).toHaveBeenCalledTimes(1);
     expect(triggerQueueProcessing).not.toHaveBeenCalledWith(parentSessionId, {});
   });
 
   it('does not queue or trigger target processing when callbacks are disabled', async () => {
-    const { service, createPending, triggerQueueProcessing, childSession } = makeService({
-      childSession: {
-        callback_config: {
-          enabled: false,
-          callback_session_id: parentSessionId,
-          callback_created_by: userId,
-          callback_mode: 'once',
+    const { service, createCompletionCallback, triggerQueueProcessing, childSession } = makeService(
+      {
+        childSession: {
+          callback_config: {
+            enabled: false,
+            callback_session_id: parentSessionId,
+            callback_created_by: userId,
+            callback_mode: 'once',
+          },
         },
-      },
-    });
+      }
+    );
     const completedTask = makeTask({
       status: TaskStatus.COMPLETED,
       completed_at: '2026-01-01T00:00:05.000Z',
@@ -521,12 +554,12 @@ describe('TasksService completion callbacks', () => {
 
     await (service as any).dispatchCompletionCallbacks(completedTask, childSession, {});
 
-    expect(createPending).not.toHaveBeenCalled();
+    expect(createCompletionCallback).not.toHaveBeenCalled();
     expect(triggerQueueProcessing).not.toHaveBeenCalledWith(parentSessionId, {});
   });
 
   it('uses legacy genealogy parent fallback when callback_session_id is absent', async () => {
-    const { service, createPending, childSession } = makeService({
+    const { service, createCompletionCallback, childSession } = makeService({
       childSession: {
         callback_config: {
           enabled: true,
@@ -542,8 +575,8 @@ describe('TasksService completion callbacks', () => {
 
     await (service as any).dispatchCompletionCallbacks(completedTask, childSession, {});
 
-    expect(createPending).toHaveBeenCalledWith(
-      expect.objectContaining({ session_id: parentSessionId })
+    expect(createCompletionCallback).toHaveBeenCalledWith(
+      expect.objectContaining({ targetSessionId: parentSessionId })
     );
   });
 });

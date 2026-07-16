@@ -6,7 +6,13 @@
  */
 
 import { PAGINATION } from '@agor/core/config';
-import { MessagesRepository, type TenantScopeAwareDatabase } from '@agor/core/db';
+import {
+  type Database,
+  MessagesRepository,
+  TaskRepository,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
+import { Conflict } from '@agor/core/feathers';
 import type {
   Message,
   MessageID,
@@ -29,6 +35,8 @@ export type MessageParams = QueryParams<{
 }> & {
   /** Internal RBAC SQL pushdown marker set by register-hooks for external regular users. */
   _agorSqlSessionAccessUserId?: UUID;
+  executorAttemptId?: string;
+  executorTaskId?: string;
 };
 
 /**
@@ -36,8 +44,9 @@ export type MessageParams = QueryParams<{
  */
 export class MessagesService extends DrizzleService<Message, Partial<Message>, MessageParams> {
   private messagesRepo: MessagesRepository;
+  private taskRepo: TaskRepository;
 
-  constructor(db: TenantScopeAwareDatabase) {
+  constructor(private db: TenantScopeAwareDatabase) {
     const messagesRepo = new MessagesRepository(db);
     super(messagesRepo, {
       id: 'message_id',
@@ -50,6 +59,52 @@ export class MessagesService extends DrizzleService<Message, Partial<Message>, M
     });
 
     this.messagesRepo = messagesRepo;
+    this.taskRepo = new TaskRepository(db);
+  }
+
+  private async withExecutorAttempt<T>(
+    params: MessageParams | undefined,
+    work: (db: Database) => Promise<T>
+  ): Promise<T> {
+    if (!params?.executorAttemptId) return work(this.db);
+    if (!params.executorTaskId) throw new Conflict('Executor transcript scope is incomplete');
+    const result = await this.taskRepo.withActiveExecutorAttempt(
+      params.executorTaskId,
+      params.executorAttemptId,
+      work
+    );
+    if (result === null) throw new Conflict('Executor attempt no longer owns transcript writes');
+    return result;
+  }
+
+  override async create(
+    data: Partial<Message> | Partial<Message>[],
+    params?: MessageParams
+  ): Promise<Message | Message[]> {
+    if (!params?.executorAttemptId) return super.create(data, params);
+    return this.withExecutorAttempt(params, async (db) => {
+      const repo = new MessagesRepository(db);
+      return Array.isArray(data)
+        ? repo.createMany(data as Message[])
+        : repo.create(data as Message);
+    });
+  }
+
+  override async patch(
+    id: string | null,
+    data: Partial<Message>,
+    params?: MessageParams
+  ): Promise<Message | Message[]> {
+    if (!params?.executorAttemptId) return super.patch(id, data, params);
+    if (!id) throw new Conflict('Executor transcript patches require a message ID');
+    return this.withExecutorAttempt(params, async (db) => {
+      const repo = new MessagesRepository(db);
+      const existing = await repo.findById(id as MessageID);
+      if (!existing || existing.task_id !== params.executorTaskId) {
+        throw new Conflict('Executor attempt does not own this message');
+      }
+      return repo.update(id, data);
+    });
   }
 
   protected async fetchData(query: Query, params?: MessageParams): Promise<Message[]> {
@@ -181,8 +236,11 @@ export class MessagesService extends DrizzleService<Message, Partial<Message>, M
   /**
    * Custom method: Bulk insert messages
    */
-  async createMany(messages: Message[]): Promise<Message[]> {
-    return this.messagesRepo.createMany(messages);
+  async createMany(messages: Message[], params?: MessageParams): Promise<Message[]> {
+    if (!params?.executorAttemptId) return this.messagesRepo.createMany(messages);
+    return this.withExecutorAttempt(params, (db) =>
+      new MessagesRepository(db).createMany(messages)
+    );
   }
 }
 

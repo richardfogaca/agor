@@ -243,7 +243,7 @@ export interface BoardsServiceImpl extends Service<Board, Partial<Board>, Feathe
  * Messages service with custom methods (server-side implementation)
  */
 export interface MessagesServiceImpl extends Service<Message, Partial<Message>, FeathersParams> {
-  createMany(data: Array<Partial<Message>>): Promise<Message[]>;
+  createMany(data: Array<Partial<Message>>, params?: FeathersParams): Promise<Message[]>;
 }
 
 /**

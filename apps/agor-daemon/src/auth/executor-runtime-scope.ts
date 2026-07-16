@@ -203,8 +203,12 @@ export function executorRuntimeScopeGuard() {
       branchId: payload.branch_id,
     };
     if (scope.executorAttemptId) {
-      (context.params as Params & { executorAttemptId?: string }).executorAttemptId =
-        scope.executorAttemptId;
+      const params = context.params as Params & {
+        executorAttemptId?: string;
+        executorTaskId?: string;
+      };
+      params.executorAttemptId = scope.executorAttemptId;
+      params.executorTaskId = scope.taskId;
     }
     const data = (context.data ?? {}) as Record<string, unknown>;
     const query = ((context.params as Params).query ?? {}) as Record<string, unknown>;

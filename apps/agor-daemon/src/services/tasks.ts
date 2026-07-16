@@ -32,11 +32,11 @@ import type {
 } from '@agor/core/types';
 import {
   finalizeTerminalTaskPatch,
+  isNaturalCompletion,
   isTaskTurnHolding,
   isTerminalTaskStatus,
   SessionStatus,
   sanitizeExecutorPulse,
-  type TaskMetadata,
   TaskStatus,
 } from '@agor/core/types';
 import { DrizzleService, type Query } from '../adapters/drizzle';
@@ -74,11 +74,8 @@ export type TaskParams = QueryParams<{
   _agorSqlSessionAccessUserId?: UUID;
   /** Authenticated executor attempt; injected by the runtime scope hook. */
   executorAttemptId?: string;
+  executorTaskId?: string;
 };
-
-interface CompletionCallbackDispatchResult {
-  callbackTask?: Task;
-}
 
 /**
  * Extended tasks service with custom methods
@@ -88,10 +85,6 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   private app: Application;
   private db: TenantScopeAwareDatabase;
   private heartbeatCallbackRunner: ExecutorHeartbeatCallbackRunner;
-  private completionCallbackDispatches = new Map<
-    string,
-    Promise<CompletionCallbackDispatchResult>
-  >();
 
   constructor(
     db: TenantScopeAwareDatabase,
@@ -364,14 +357,53 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     );
   }
 
-  private async dispatchCompletionCallbacksAfterCommit(
-    task: Task,
-    session: Session,
-    params?: TaskParams
-  ): Promise<void> {
-    await this.runAfterTenantDatabaseCommit('dispatchCompletionCallbacks', () =>
-      this.dispatchCompletionCallbacks(task, session, params)
-    );
+  /** Run causally visible completion effects only after the turn is safe to continue. */
+  private async settleTaskCompletion(task: Task, params?: TaskParams): Promise<void> {
+    const session = await this.app.service('sessions').get(task.session_id, params);
+    if (session.branch_id) {
+      this.app
+        .service('branches')
+        .get(session.branch_id, params)
+        .then((branch) =>
+          branch?.repo_id
+            ? ensureRepoOriginAlignedById(this.app, branch.repo_id, params)
+            : undefined
+        )
+        .catch((error: unknown) =>
+          console.warn(
+            `⚠️  [TasksService] Repository realignment failed for session ${shortId(task.session_id)}:`,
+            error instanceof Error ? error.message : String(error)
+          )
+        );
+    }
+
+    // Executor release projects this state atomically with released_at. Legacy
+    // turns have no release record, so terminal is their settlement boundary.
+    if (!task.executor_attempt) {
+      await this.app.service('sessions').patch(
+        task.session_id,
+        {
+          status: task.status === TaskStatus.FAILED ? SessionStatus.FAILED : SessionStatus.IDLE,
+          ready_for_prompt: true,
+        },
+        params
+      );
+    }
+
+    const naturalCompletion = isNaturalCompletion(task.status);
+    if (naturalCompletion) await this.dispatchCompletionCallbacks(task, session, params);
+
+    if (session.fork_origin === 'btw' && isCompletionSideEffectTaskStatus(task.status)) {
+      await this.app
+        .service('sessions')
+        .patch(session.session_id, { archived: true, archived_reason: 'btw_completed' })
+        .catch((error: unknown) =>
+          console.warn('⚠️  [TasksService] Failed to auto-archive btw fork:', error)
+        );
+      if (naturalCompletion) await this.injectBtwResultMessage(task, session, params);
+    }
+
+    await this.triggerQueueProcessingAfterCommit(task.session_id, params);
   }
 
   /**
@@ -446,113 +478,14 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     // executor turns. Timeout paths patch session state separately and should not
     // enqueue callbacks, mark sessions promptable, archive forks, or drain queues here.
     if (isCompletionSideEffectTransition) {
-      // Since tasks are patched one at a time, result is always a single Task (not an array)
       const task = result as Task;
       const awaitingExecutorRelease = isTaskTurnHolding(task) && isTerminalTaskStatus(task.status);
-
-      if (task.session_id && this.app) {
-        try {
-          // CRITICAL: Check if THIS task is still the current/latest task before updating session
-          // If a new task has started, we must NOT set the session to IDLE
-          const session = await this.app.service('sessions').get(task.session_id, params);
-
-          // Realign on terminal transition — decoupled from session-state
-          // updates and callback delivery so an error there doesn't skip it.
-          if (session.branch_id) {
-            this.app
-              .service('branches')
-              .get(session.branch_id, params)
-              .then((branch) => {
-                const repoId = branch?.repo_id;
-                if (!repoId) return;
-                return ensureRepoOriginAlignedById(this.app, repoId, params);
-              })
-              .catch((err: unknown) => {
-                const message = err instanceof Error ? err.message : String(err);
-                console.warn(
-                  `⚠️  [TasksService] ensureRepoOriginAlignedById failed for session ${task.session_id ? shortId(task.session_id) : 'unknown'}: ${message}`
-                );
-              });
-          }
-
-          const latestTaskId = session.tasks?.[session.tasks.length - 1];
-
-          // STOPPED tasks (user-cancelled or daemon-shutdown cleanup) never notify
-          // parent sessions. A stopped child represents abandoned work — the parent
-          // should not resume or be informed; it has its own lifecycle.
-          const isStop = data.status === TaskStatus.STOPPED;
-
-          if (latestTaskId && latestTaskId !== task.task_id) {
-            console.log(
-              `⏭️ [TasksService] Skipping session terminal-state update - task ${shortId(task.task_id)} is not the latest (latest: ${shortId(latestTaskId)})`
-            );
-            // Process completion callbacks only for naturally-terminal tasks (COMPLETED/FAILED).
-            // STOPPED means the work was abandoned — don't notify the parent.
-            if (!isStop) {
-              await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
-            }
-            return result;
-          }
-
-          // Executor-backed terminal work stays gated until release.
-          if (awaitingExecutorRelease) {
-            console.log(
-              `⏳ [TasksService] Task ${shortId(task.task_id)} is terminal; waiting for executor release`
-            );
-          } else {
-            await this.app.service('sessions').patch(
-              task.session_id,
-              {
-                status:
-                  data.status === TaskStatus.FAILED ? SessionStatus.FAILED : SessionStatus.IDLE,
-                ready_for_prompt: true,
-              },
-              params
-            );
-
-            console.log(
-              `✅ [TasksService] Session ${shortId(task.session_id)} status updated after terminal task (task ${shortId(task.task_id)} ${data.status})`
-            );
-          }
-
-          if (!isStop) {
-            await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
-          }
-
-          // "btw" fork origin: auto-archive the ephemeral fork after task completion.
-          // Runs regardless of callback success — btw forks should always be cleaned up.
-          // Administrative STOPPED transitions skip parent callbacks/result injection,
-          // but still archive the ephemeral session.
-          if (session.fork_origin === 'btw') {
-            try {
-              await this.app.service('sessions').patch(session.session_id, {
-                archived: true,
-                archived_reason: 'btw_completed',
-              });
-              console.log(
-                `📦 [TasksService] Auto-archived btw fork session ${shortId(session.session_id)}`
-              );
-            } catch (error) {
-              console.warn(`⚠️  [TasksService] Failed to auto-archive btw fork:`, error);
-            }
-
-            if (!isStop) {
-              // Inject a result message into the parent session's conversation.
-              // This is a non-prompt system message — it shows up in the UI but doesn't
-              // trigger a new prompt cycle. The parent's agent never sees it.
-              await this.injectBtwResultMessage(task, session, params);
-            }
-          }
-
-          // Fire queue processing after the outer transaction commits. spawnTaskExecutor
-          // (called inside the queue processor) does significant I/O that would otherwise
-          // extend this transaction and cause proxy CONNECTION_CLOSED kills.
-          if (!awaitingExecutorRelease) {
-            await this.triggerQueueProcessingAfterCommit(task.session_id, params);
-          }
-        } catch (error) {
-          console.error('❌ [TasksService] Failed to process task completion:', error);
-        }
+      if (awaitingExecutorRelease) {
+        console.log(`⏳ [TasksService] Task ${shortId(task.task_id)} awaits executor release`);
+      } else {
+        await this.settleTaskCompletion(task, params).catch((error) =>
+          console.error('❌ [TasksService] Failed to settle task completion:', error)
+        );
       }
     }
 
@@ -705,14 +638,14 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     const targetSessionId = this.resolveCompletionCallbackTarget(childSession);
     if (!targetSessionId) return;
 
-    const dispatchResult = await this.dispatchCompletionCallbackOnce(
+    const callbackTask = await this.queueCallbackToSession(
       task,
       childSession,
       targetSessionId,
       params
     );
 
-    if (dispatchResult.callbackTask) {
+    if (callbackTask) {
       // CRITICAL: After queuing callback, ALWAYS trigger target's queue processing.
       // The queue processor uses a promise-based lock that will:
       // - If target is busy: wait for current processing, then retry (self-healing)
@@ -743,7 +676,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     // Default to "persistent" for backward compat — legacy sessions without
     // callback_mode should continue firing on every completion as they always have.
     const callbackMode = childSession.callback_config?.callback_mode ?? 'persistent';
-    if (dispatchResult.callbackTask && callbackMode === 'once') {
+    if (callbackTask && callbackMode === 'once') {
       try {
         await this.app.service('sessions').patch(childSession.session_id, {
           callback_config: {
@@ -768,100 +701,6 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     return (
       childSession.callback_config?.callback_session_id ?? childSession.genealogy?.parent_session_id
     );
-  }
-
-  private callbackDispatchMetadataKey(targetSessionId: SessionID): string {
-    return `session_completion:${targetSessionId}`;
-  }
-
-  private hasCompletionCallbackDispatch(
-    metadata: TaskMetadata | undefined,
-    targetSessionId: SessionID
-  ): boolean {
-    return (metadata?.callback_dispatches ?? []).some(
-      (dispatch) =>
-        dispatch.event === 'session_completion' && dispatch.target_session_id === targetSessionId
-    );
-  }
-
-  private async markCompletionCallbackDispatched(
-    task: Task,
-    targetSessionId: SessionID,
-    queuedTaskId: TaskID | undefined,
-    params?: TaskParams
-  ): Promise<void> {
-    const latestTask = (await this.taskRepo.findById(task.task_id)) ?? task;
-    if (this.hasCompletionCallbackDispatch(latestTask.metadata, targetSessionId)) return;
-
-    const metadata: TaskMetadata = {
-      ...(latestTask.metadata ?? {}),
-      callback_dispatches: [
-        ...(latestTask.metadata?.callback_dispatches ?? []),
-        {
-          event: 'session_completion',
-          target_session_id: targetSessionId,
-          queued_task_id: queuedTaskId,
-          dispatched_at: new Date().toISOString(),
-        },
-      ],
-    };
-
-    await super.patch(task.task_id, { metadata } as Partial<Task>, params);
-  }
-
-  private async dispatchCompletionCallbackOnce(
-    task: Task,
-    childSession: Session,
-    targetSessionId: SessionID,
-    params?: TaskParams
-  ): Promise<CompletionCallbackDispatchResult> {
-    const dispatchKey = `${task.task_id}:${this.callbackDispatchMetadataKey(targetSessionId)}`;
-    const existingDispatch = this.completionCallbackDispatches.get(dispatchKey);
-    if (existingDispatch) {
-      await existingDispatch;
-      return {};
-    }
-
-    const dispatch = (async (): Promise<CompletionCallbackDispatchResult> => {
-      const latestTask = (await this.taskRepo.findById(task.task_id)) ?? task;
-      if (this.hasCompletionCallbackDispatch(latestTask.metadata, targetSessionId)) {
-        console.log(
-          `⏭️  [TasksService] Completion callback for task ${shortId(task.task_id)} to ${shortId(targetSessionId)} already dispatched`
-        );
-        return {};
-      }
-
-      const queuedCallbackTask = await this.queueCallbackToSession(
-        task,
-        childSession,
-        targetSessionId,
-        params
-      );
-      if (queuedCallbackTask) {
-        try {
-          await this.markCompletionCallbackDispatched(
-            task,
-            targetSessionId,
-            queuedCallbackTask.task_id,
-            params
-          );
-        } catch (error) {
-          console.warn(
-            `⚠️  [TasksService] Failed to mark completion callback dispatched for task ${shortId(task.task_id)} to ${shortId(targetSessionId)} after queueing:`,
-            error
-          );
-        }
-      }
-
-      return { callbackTask: queuedCallbackTask };
-    })();
-
-    this.completionCallbackDispatches.set(dispatchKey, dispatch);
-    try {
-      return await dispatch;
-    } finally {
-      this.completionCallbackDispatches.delete(dispatchKey);
-    }
   }
 
   /**
@@ -997,7 +836,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       }
 
       // Create QUEUED task on the target session carrying the callback prompt.
-      // The metadata bag survives the queue → run transition: spawnTaskExecutor
+      // The metadata bag survives the queue → run transition: startClaimedTask
       // re-stamps `is_agor_callback` and `source` onto the synthesized
       // user-message row so the UI's callback styling (MessageBlock.tsx) holds.
       //
@@ -1007,11 +846,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       // for backward compat (legacy sessions without callback_created_by).
       const callbackCreator =
         childSession.callback_config?.callback_created_by ?? targetSession.created_by;
-      const callbackTask = await this.taskRepo.createPending({
-        session_id: targetSessionId,
-        full_prompt: callbackMessage,
-        created_by: callbackCreator,
-        status: TaskStatus.QUEUED,
+      const callbackTask = await this.taskRepo.createCompletionCallback({
+        sourceTaskId: task.task_id,
+        targetSessionId,
+        fullPrompt: callbackMessage,
+        createdBy: callbackCreator,
         metadata: {
           is_agor_callback: true,
           source: 'agor',
@@ -1020,6 +859,13 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           queued_by_user_id: callbackCreator,
         },
       });
+
+      if (!callbackTask) {
+        console.log(
+          `⏭️  [TasksService] Completion callback for task ${shortId(task.task_id)} to ${shortId(targetSessionId)} already dispatched`
+        );
+        return undefined;
+      }
 
       // Emit so reactive-session subscribers see the new queued task.
       this.emit?.('queued', callbackTask);
@@ -1118,7 +964,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       this.emit?.('patched', result.task);
       const session = await this.app.service('sessions').get(result.task.session_id, params);
       this.app.service('sessions').emit('patched', session);
-      await this.triggerQueueProcessingAfterCommit(result.task.session_id, params);
+      await this.settleTaskCompletion(result.task, params);
     }
     return result.task;
   }
