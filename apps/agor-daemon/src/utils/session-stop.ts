@@ -62,6 +62,7 @@ export async function stopSessionPreserveQueue(
   console.log(
     `🛑 [Stop] Stopping task ${shortId(latestTask.task_id)} for session ${shortId(sessionId)}${options.reason ? ` (reason: ${options.reason})` : ''}`
   );
+  const internalParams = { ...params, provider: undefined };
 
   if (!isTerminalTaskStatus(latestTask.status)) {
     await deps.tasksService.patch(
@@ -70,7 +71,7 @@ export async function stopSessionPreserveQueue(
         status: TaskStatus.STOPPED,
         completed_at: new Date().toISOString(),
       },
-      params
+      internalParams
     );
   }
 
@@ -81,7 +82,7 @@ export async function stopSessionPreserveQueue(
           task_id: latestTask.task_id,
           executor_attempt_id: latestTask.executor_attempt.id,
         },
-        params
+        internalParams
       );
     } catch (error) {
       console.warn('[Stop] Cleanup remains fenced for supervisor retry:', error);

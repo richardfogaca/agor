@@ -1407,6 +1407,11 @@ describe('TaskRepository executor turn transitions', () => {
     expect(telemetry?.latest_executor_pulse?.kind).toBe('thinking.progress');
     expect(await tasks.recordExecutorTelemetry(task.task_id, generateId(), {})).toBeNull();
 
+    expect(await tasks.update(task.task_id, { error_message: 'stale' }, generateId())).toBeNull();
+    expect(
+      await tasks.update(task.task_id, { error_message: 'current attempt' }, attemptId)
+    ).toMatchObject({ error_message: 'current attempt' });
+
     expect(
       await tasks.patchExecutorAttempt(task.task_id, attemptId, {
         workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
@@ -1424,6 +1429,27 @@ describe('TaskRepository executor turn transitions', () => {
         workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 1 },
       })
     ).toBeNull();
+  });
+
+  dbTest('replaces the complete attempt snapshot when admitting queued work', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const queued = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    await tasks.update(queued.task_id, {
+      executor_attempt: {
+        id: generateId(),
+        released_at: new Date().toISOString(),
+        workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
+      },
+    });
+    const attemptId = generateId();
+
+    const admitted = await tasks.claimNextExecutorTurn({
+      sessionId,
+      patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: attemptId } },
+    });
+
+    expect(admitted?.executor_attempt).toEqual({ id: attemptId });
   });
 
   dbTest('does not reconnect or project runtime over a reserved stop', async ({ db }) => {
@@ -1551,5 +1577,39 @@ describe('TaskRepository executor turn transitions', () => {
     });
     expect(admitted?.status).toBe(TaskStatus.DISPATCHING);
     expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.RUNNING);
+  });
+
+  dbTest('atomically releases and enqueues exactly one completion callback', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const sessions = new SessionRepository(db);
+    const sourceSessionId = await createSessionWithDeps(db);
+    const targetSessionId = await createSessionWithDeps(db);
+    const source = await tasks.createPending(createPendingInput({ session_id: sourceSessionId }));
+    const attemptId = generateId();
+    await tasks.claimNextExecutorTurn({
+      sessionId: sourceSessionId,
+      patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: attemptId } },
+    });
+    await tasks.connectExecutor(source.task_id, attemptId);
+    await tasks.update(source.task_id, { status: TaskStatus.COMPLETED });
+    const callback = {
+      sourceTaskId: source.task_id,
+      targetSessionId,
+      fullPrompt: 'child completed',
+      createdBy: 'test-user',
+      metadata: { is_agor_callback: true },
+    };
+
+    const released = await tasks.releaseExecutorTurn(source.task_id, attemptId, callback);
+    const repeated = await tasks.releaseExecutorTurn(source.task_id, attemptId, callback);
+
+    expect(released).toMatchObject({ released: true, callbackTask: { status: TaskStatus.QUEUED } });
+    expect(repeated).toMatchObject({ released: false });
+    expect(await tasks.findQueued(targetSessionId)).toHaveLength(1);
+    expect((await tasks.findById(source.task_id))?.metadata?.callback_dispatches).toHaveLength(1);
+    expect(await sessions.findById(sourceSessionId)).toMatchObject({
+      status: SessionStatus.IDLE,
+      ready_for_prompt: true,
+    });
   });
 });

@@ -50,6 +50,7 @@ import {
   AGENTIC_TOOL_CAPABILITIES,
   ExecutorWorkloadKind,
   isTaskExecuting,
+  isTerminalTaskStatus,
   ROLES,
   TaskStatus,
 } from '@agor/core/types';
@@ -144,7 +145,7 @@ import {
   shouldExposeMCPServerSecretsForSessionToken,
 } from './utils/mcp-header-secrets.js';
 import { pullIfNeeded } from './utils/session-state-hooks.js';
-import { spawnExecutor } from './utils/spawn-executor.js';
+import { isAuthoritativeLauncherExit, spawnExecutor } from './utils/spawn-executor.js';
 
 const EXECUTOR_LAUNCH_CANCELLED_MESSAGE = 'Executor launch was cancelled before payload delivery';
 const EXECUTOR_LAUNCH_CANCELLED_STATUS = 'cancelled';
@@ -250,7 +251,6 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       'find',
       'get',
       'create',
-      'update',
       'patch',
       'remove',
       'connectExecutor',
@@ -786,14 +786,8 @@ function createExecuteHandler(
     }
 
     // Generate session token for executor authentication
-    const appWithExecutor = app as unknown as {
-      sessionTokenService?: import('./services/session-token-service.js').SessionTokenService;
-    };
-    if (!appWithExecutor.sessionTokenService) {
-      throw new Error('Session token service not initialized');
-    }
     // Hook chain enforces auth before we get here.
-    const sessionToken = await appWithExecutor.sessionTokenService.generateToken(
+    const sessionToken = await sessionTokenService.generateToken(
       sessionId,
       (params as AuthenticatedParams).user!.user_id,
       {
@@ -956,7 +950,7 @@ function createExecuteHandler(
       );
     };
     const cancelLaunch = () => {
-      appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+      sessionTokenService.revokeToken(sessionToken);
       return {
         success: false,
         taskId,
@@ -1024,6 +1018,9 @@ function createExecuteHandler(
     if (workloadUnixUser && workloadUid === undefined) {
       throw new Error(`Could not resolve executor UID for ${workloadUnixUser}`);
     }
+    const workloadKind = config.execution?.executor_command_template
+      ? ExecutorWorkloadKind.TEMPLATED
+      : ExecutorWorkloadKind.LOCAL;
     let workloadRegistration: Promise<Task | null> = Promise.resolve(null);
     spawnExecutor(executorPayload, {
       cwd,
@@ -1040,9 +1037,7 @@ function createExecuteHandler(
       onSpawn: (child) => {
         if (!child.pid) throw new Error('Executor workload has no PID');
         const workload = {
-          kind: config.execution?.executor_command_template
-            ? ExecutorWorkloadKind.TEMPLATED
-            : ExecutorWorkloadKind.LOCAL,
+          kind: workloadKind,
           pid: child.pid,
           ...(workloadUnixUser ? { unix_user: workloadUnixUser, uid: workloadUid } : {}),
         } satisfies ExecutorWorkloadRef;
@@ -1067,37 +1062,57 @@ function createExecuteHandler(
       },
       onExit: async (code) => {
         console.log(`${logPrefix} Exited with code ${code}`);
+        let authoritative = isAuthoritativeLauncherExit(workloadKind, code, false);
         try {
           await workloadRegistration.catch(() => null);
           const currentTask = await tasksService.get(taskId, params);
+          authoritative = isAuthoritativeLauncherExit(
+            workloadKind,
+            code,
+            !!currentTask.executor_connected_at
+          );
+          if (!authoritative) return;
           if (isTaskExecuting(currentTask)) {
             const stopping = currentTask.status === TaskStatus.STOPPING;
-            await tasksService.patch(
-              taskId,
-              {
-                status: stopping ? TaskStatus.STOPPED : TaskStatus.FAILED,
-                ...(!stopping
-                  ? {
-                      error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
-                    }
-                  : {}),
-              },
-              params
-            );
+            try {
+              await tasksService.patch(
+                taskId,
+                {
+                  status: stopping ? TaskStatus.STOPPED : TaskStatus.FAILED,
+                  ...(!stopping
+                    ? {
+                        error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
+                      }
+                    : {}),
+                },
+                params
+              );
+            } catch (error) {
+              // Stop may have committed after the read; repository fencing made it authoritative.
+              if (!isTerminalTaskStatus((await tasksService.get(taskId, params)).status)) {
+                throw error;
+              }
+            }
           }
-          await runWithTenantDatabaseScope(db, tenantId, () =>
-            tasksService.finalizeExecutorTurn(
-              {
-                task_id: taskId,
-                executor_attempt_id: data.executorAttemptId,
-              },
-              params
-            )
-          );
+          // Keep a failed barrier inside the transaction so its repair marker commits.
+          const finalizationError = await runWithTenantDatabaseScope(db, tenantId, async () => {
+            try {
+              await tasksService.finalizeExecutorTurn(
+                {
+                  task_id: taskId,
+                  executor_attempt_id: data.executorAttemptId,
+                },
+                params
+              );
+            } catch (error) {
+              return error;
+            }
+          });
+          if (finalizationError) throw finalizationError;
         } catch (error) {
           console.error(`❌ [Executor] Failed to finalize task ${shortId(taskId)}:`, error);
         } finally {
-          appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+          if (authoritative) sessionTokenService.revokeToken(sessionToken);
         }
       },
     });

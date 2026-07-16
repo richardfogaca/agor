@@ -26,7 +26,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgorExecutionSettings } from '@agor/core/config';
-import type { AuthenticatedParams } from '@agor/core/types';
+import { type AuthenticatedParams, ExecutorWorkloadKind } from '@agor/core/types';
 import {
   attachEnvFileCleanup,
   buildSpawnArgs,
@@ -39,6 +39,14 @@ import { issueRuntimeToken } from '../auth/runtime-tokens.js';
 import { withResolvedConfig } from './build-resolved-config-slice.js';
 
 let configuredDaemonUrl: string | null = null;
+
+export function isAuthoritativeLauncherExit(
+  kind: ExecutorWorkloadKind,
+  code: number | null,
+  connected: boolean
+): boolean {
+  return kind === ExecutorWorkloadKind.LOCAL || (!connected && code !== 0);
+}
 
 function resolveExecutorLogLevel(env: Record<string, string>): string {
   return env.LOG_LEVEL || getCurrentLogLevel();

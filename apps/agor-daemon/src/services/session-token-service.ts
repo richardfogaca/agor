@@ -218,18 +218,22 @@ export class SessionTokenService {
    * Revoke all tokens for a session
    */
   revokeSessionTokens(sessionId: string): void {
-    let count = 0;
-
-    for (const [token, data] of this.tokens.entries()) {
-      if (data.session_id === sessionId) {
-        this.tokens.delete(token);
-        count++;
-      }
-    }
-
+    const count = this.revokeTokens(({ session_id }) => session_id === sessionId);
     if (count > 0) {
       console.debug(`[SessionTokenService] Revoked ${count} tokens for session=${sessionId}`);
     }
+  }
+
+  revokeExecutorAttemptTokens(attemptId: string): void {
+    this.revokeTokens(({ executor_attempt_id }) => executor_attempt_id === attemptId);
+  }
+
+  private revokeTokens(match: (data: SessionTokenData) => boolean): number {
+    let count = 0;
+    for (const [token, data] of this.tokens) {
+      if (match(data) && this.tokens.delete(token)) count++;
+    }
+    return count;
   }
 
   /**

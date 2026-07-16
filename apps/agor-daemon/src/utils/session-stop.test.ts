@@ -36,6 +36,7 @@ describe('stopSessionPreserveQueue', () => {
       findQueued: vi.fn(async () => [queuedTask]),
     };
     const params = { provider: 'rest' };
+    const internalParams = { provider: undefined };
 
     const result = await stopSessionPreserveQueue(
       {
@@ -56,7 +57,7 @@ describe('stopSessionPreserveQueue', () => {
     });
     expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
       { task_id: runningTask.task_id, executor_attempt_id: 'attempt-1' },
-      params
+      internalParams
     );
     expect(tasksService.patch).toHaveBeenCalledTimes(1);
     expect(tasksService.patch.mock.invocationCallOrder[0]).toBeLessThan(
@@ -65,7 +66,7 @@ describe('stopSessionPreserveQueue', () => {
     expect(tasksService.patch).toHaveBeenCalledWith(
       runningTask.task_id,
       expect.objectContaining({ status: 'stopped' }),
-      params
+      internalParams
     );
     expect(tasksService.reserveExecutorStop).toHaveBeenCalledWith(sessionId, params);
   });
@@ -116,12 +117,12 @@ describe('stopSessionPreserveQueue', () => {
     });
     expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
       { task_id: awaitingInputTask.task_id, executor_attempt_id: 'attempt-2' },
-      {}
+      { provider: undefined }
     );
     expect(tasksService.patch).toHaveBeenCalledWith(
       awaitingInputTask.task_id,
       expect.objectContaining({ status: 'stopped' }),
-      {}
+      { provider: undefined }
     );
   });
 
@@ -160,7 +161,7 @@ describe('stopSessionPreserveQueue', () => {
     expect(result.status).toBe('stopping');
     expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
       { task_id: completedTask.task_id, executor_attempt_id: 'attempt-3' },
-      {}
+      { provider: undefined }
     );
     expect(tasksService.patch).not.toHaveBeenCalled();
   });

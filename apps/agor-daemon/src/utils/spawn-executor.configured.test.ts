@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Writable } from 'node:stream';
+import { ExecutorWorkloadKind } from '@agor/core/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { spawnMock } = vi.hoisted(() => ({
@@ -62,6 +63,17 @@ describe('configured executor spawning', () => {
 
     const { configureExecutor } = await import('./spawn-executor');
     configureExecutor(null);
+  });
+
+  it.each([
+    [ExecutorWorkloadKind.LOCAL, 0, false, true],
+    [ExecutorWorkloadKind.LOCAL, 1, true, true],
+    [ExecutorWorkloadKind.TEMPLATED, 0, false, false],
+    [ExecutorWorkloadKind.TEMPLATED, 1, false, true],
+    [ExecutorWorkloadKind.TEMPLATED, 1, true, false],
+  ])('classifies %s launcher exit code=%s connected=%s as authoritative=%s', async (kind, code, connected, expected) => {
+    const { isAuthoritativeLauncherExit } = await import('./spawn-executor');
+    expect(isAuthoritativeLauncherExit(kind, code, connected)).toBe(expected);
   });
 
   it('uses execution.executor_command_template configured at startup', async () => {

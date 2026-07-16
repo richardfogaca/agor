@@ -48,6 +48,14 @@ function taskTurnHoldingWhere(db: Database, sessionId?: SessionID) {
   return sessionId ? and(eq(tasks.session_id, sessionId), holding) : holding;
 }
 
+export interface CompletionCallbackInput {
+  sourceTaskId: TaskID;
+  targetSessionId: SessionID;
+  fullPrompt: string;
+  createdBy: string;
+  metadata: TaskMetadata;
+}
+
 /**
  * Task repository implementation
  */
@@ -429,6 +437,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         if (current.status !== TaskStatus.QUEUED) return null;
 
         const admitted = deepMerge(current, input.patch);
+        admitted.executor_attempt = input.patch.executor_attempt;
         admitted.queue_position = undefined;
         const data = this.taskToInsert(admitted);
         await update(db, tasks)
@@ -679,21 +688,35 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
   /** Release admission only after the attempt is terminal and its external effects are settled. */
   async releaseExecutorTurn(
     id: string,
-    attemptId: string
-  ): Promise<{ task: Task; released: boolean } | null> {
+    attemptId: string,
+    callback?: CompletionCallbackInput & { disableAfterDelivery?: boolean }
+  ): Promise<{ task: Task; released: boolean; callbackTask?: Task } | null> {
     const { fullId, task: known } = await this.resolveExisting(id);
     return runDatabaseTransaction(
       this.db,
       async (db) => {
-        await this.lockSession(db, known.session_id);
+        const sessionIds = [...new Set([known.session_id, callback?.targetSessionId])]
+          .filter((sessionId): sessionId is SessionID => !!sessionId)
+          .sort();
+        for (const sessionId of sessionIds) await this.lockSession(db, sessionId);
         const current = await this.loadLockedTask(db, fullId, id);
         if (current.executor_attempt?.id !== attemptId || !isTerminalTaskStatus(current.status)) {
           return null;
         }
         if (current.executor_attempt.released_at) return { task: current, released: false };
 
+        const callbackTarget = callback
+          ? await select(db)
+              .from(sessions)
+              .where(eq(sessions.session_id, callback.targetSessionId))
+              .one()
+          : undefined;
+        const enqueued =
+          callback && callbackTarget
+            ? await this.enqueueCompletionCallback(db, current, callback)
+            : undefined;
         const task = {
-          ...current,
+          ...(enqueued?.source ?? current),
           executor_attempt: {
             ...current.executor_attempt,
             released_at: new Date().toISOString(),
@@ -702,6 +725,9 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         } satisfies Task;
         const data = this.taskToInsert(task);
         await update(db, tasks).set({ data: data.data }).where(eq(tasks.task_id, fullId)).run();
+        const session = callback?.disableAfterDelivery
+          ? await select(db).from(sessions).where(eq(sessions.session_id, task.session_id)).one()
+          : undefined;
         await update(db, sessions)
           .set({
             status:
@@ -712,10 +738,18 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
                   : SessionStatus.IDLE,
             ready_for_prompt: true,
             updated_at: new Date(),
+            ...(session
+              ? {
+                  data: {
+                    ...session.data,
+                    callback_config: { ...session.data.callback_config, enabled: false },
+                  },
+                }
+              : {}),
           })
           .where(eq(sessions.session_id, task.session_id))
           .run();
-        return { task, released: true };
+        return { task, released: true, callbackTask: enqueued?.callback };
       },
       { sqliteImmediate: true }
     );
@@ -727,7 +761,13 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
    * Uses a transaction to ensure read-merge-write is atomic, preventing race conditions
    * when multiple updates happen concurrently (e.g., task status + message_range updates).
    */
-  async update(id: string, updates: Partial<Task>): Promise<Task> {
+  async update(id: string, updates: Partial<Task>): Promise<Task>;
+  async update(id: string, updates: Partial<Task>, expectedAttemptId: string): Promise<Task | null>;
+  async update(
+    id: string,
+    updates: Partial<Task>,
+    expectedAttemptId?: string
+  ): Promise<Task | null> {
     try {
       const fullId = await this.resolveId(id);
 
@@ -739,6 +779,17 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         this.db,
         async (db) => {
           const current = await this.loadLockedTask(db, fullId, id);
+
+          if (
+            expectedAttemptId &&
+            (current.executor_attempt?.id !== expectedAttemptId ||
+              current.executor_attempt.released_at ||
+              !current.executor_connected_at ||
+              isTerminalTaskStatus(current.status) ||
+              (current.status === TaskStatus.STOPPING && updates.status !== TaskStatus.STOPPED))
+          ) {
+            return null;
+          }
 
           if (
             isTerminalTaskStatus(current.status) &&
@@ -855,13 +906,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
   }
 
   /** Atomically enqueue a completion callback and record its idempotency marker. */
-  async createCompletionCallback(input: {
-    sourceTaskId: TaskID;
-    targetSessionId: SessionID;
-    fullPrompt: string;
-    createdBy: string;
-    metadata: TaskMetadata;
-  }): Promise<Task | null> {
+  async createCompletionCallback(input: CompletionCallbackInput): Promise<Task | null> {
     const { fullId, task: known } = await this.resolveExisting(input.sourceTaskId);
     return runDatabaseTransaction(
       this.db,
@@ -876,56 +921,62 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         ) {
           throw new RepositoryError('Completion callback source has not settled');
         }
-        if (
-          source.metadata?.callback_dispatches?.some(
-            (dispatch) =>
-              dispatch.event === SESSION_COMPLETION_CALLBACK_EVENT &&
-              dispatch.target_session_id === input.targetSessionId
-          )
-        ) {
-          return null;
-        }
-
-        const callbackData = this.queuedTaskInsert(
-          {
-            sessionId: input.targetSessionId,
-            fullPrompt: input.fullPrompt,
-            createdBy: input.createdBy,
-            metadata: input.metadata,
-          },
-          await this.nextQueuePosition(db, input.targetSessionId)
-        );
-        await insert(db, tasks).values(callbackData).run();
-
-        const sourceData = this.taskToInsert({
-          ...source,
-          metadata: {
-            ...source.metadata,
-            callback_dispatches: [
-              ...(source.metadata?.callback_dispatches ?? []),
-              {
-                event: SESSION_COMPLETION_CALLBACK_EVENT,
-                target_session_id: input.targetSessionId,
-                queued_task_id: callbackData.task_id as TaskID,
-                dispatched_at: new Date().toISOString(),
-              },
-            ],
-          },
-        });
-        await update(db, tasks)
-          .set({ data: sourceData.data })
-          .where(eq(tasks.task_id, fullId))
-          .run();
-
-        const row = await select(db)
-          .from(tasks)
-          .where(eq(tasks.task_id, callbackData.task_id))
-          .one();
-        if (!row) throw new RepositoryError('Failed to retrieve queued completion callback');
-        return this.rowToTask(row);
+        return (await this.enqueueCompletionCallback(db, source, input))?.callback ?? null;
       },
       { sqliteImmediate: true }
     );
+  }
+
+  private async enqueueCompletionCallback(
+    db: Database,
+    source: Task,
+    input: CompletionCallbackInput
+  ): Promise<{ source: Task; callback: Task } | null> {
+    if (
+      source.metadata?.callback_dispatches?.some(
+        (dispatch) =>
+          dispatch.event === SESSION_COMPLETION_CALLBACK_EVENT &&
+          dispatch.target_session_id === input.targetSessionId
+      )
+    ) {
+      return null;
+    }
+    const callbackData = this.queuedTaskInsert(
+      {
+        sessionId: input.targetSessionId,
+        fullPrompt: input.fullPrompt,
+        createdBy: input.createdBy,
+        metadata: input.metadata,
+      },
+      await this.nextQueuePosition(db, input.targetSessionId)
+    );
+    await insert(db, tasks).values(callbackData).run();
+    const callbackRow = await select(db)
+      .from(tasks)
+      .where(eq(tasks.task_id, callbackData.task_id))
+      .one();
+    if (!callbackRow) throw new RepositoryError('Failed to retrieve queued completion callback');
+    const callback = this.rowToTask(callbackRow);
+    const updatedSource = {
+      ...source,
+      metadata: {
+        ...source.metadata,
+        callback_dispatches: [
+          ...(source.metadata?.callback_dispatches ?? []),
+          {
+            event: SESSION_COMPLETION_CALLBACK_EVENT,
+            target_session_id: input.targetSessionId,
+            queued_task_id: callback.task_id,
+            dispatched_at: new Date().toISOString(),
+          },
+        ],
+      },
+    } satisfies Task;
+    await update(db, tasks)
+      .set({ data: this.taskToInsert(updatedSource).data })
+      .where(eq(tasks.task_id, source.task_id))
+      .run();
+    return { source: updatedSource, callback };
   }
 
   /** Move an explicit CREATED draft into the same durable FIFO as every prompt. */

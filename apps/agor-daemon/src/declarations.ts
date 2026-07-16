@@ -138,6 +138,7 @@ export interface TasksServiceImpl extends Service<Task, Partial<Task>, TaskParam
   ): Promise<Task>;
   fail(id: string, data: { error?: string }, params?: TaskParams): Promise<Task>;
   getOrphaned(params?: TaskParams): Promise<Task[]>;
+  getQueuedSessionIds(params?: TaskParams): Promise<SessionID[]>;
 }
 
 /**

@@ -1,4 +1,4 @@
-import type { HookContext } from '@agor/core/types';
+import { type HookContext, TaskStatus } from '@agor/core/types';
 import { describe, expect, it } from 'vitest';
 import { executorRuntimeScopeGuard, scopeExecutorRuntimeAuth } from './executor-runtime-scope';
 
@@ -21,6 +21,96 @@ function ctx(overrides: Partial<HookContext>): HookContext {
 }
 
 describe('executorRuntimeScopeGuard', () => {
+  it.each([
+    'connectExecutor',
+    'reportExecutorTelemetry',
+  ])('rejects ordinary user auth for %s', async (method) => {
+    const context = ctx({
+      method,
+      data: { task_id: 'task-1', executor_attempt_id: 'attempt-1' },
+      params: {
+        authentication: { payload: { sub: 'user-1' } },
+        query: {},
+        provider: 'socketio',
+      },
+    });
+
+    await expect(executorRuntimeScopeGuard()(context)).rejects.toThrow(
+      /Executor-scoped authentication/
+    );
+  });
+
+  it.each([
+    ['create', { status: TaskStatus.RUNNING }],
+    ['create', { session_id: 'session-1', executor_attempt: { id: 'forged' } }],
+    ['patch', { executor_attempt: { id: 'forged', released_at: new Date().toISOString() } }],
+    ['patch', { last_executor_heartbeat_at: new Date().toISOString() }],
+    ['patch', { report: { path: 'forged' } }],
+  ])('rejects daemon-owned task fields on external %s', async (method, data) => {
+    const context = ctx({
+      method,
+      data,
+      params: {
+        authentication: { payload: { sub: 'user-1' } },
+        query: {},
+        provider: 'socketio',
+      },
+    });
+
+    await expect(executorRuntimeScopeGuard()(context)).rejects.toThrow(
+      /limited to drafts|daemon-owned/
+    );
+  });
+
+  it('rejects executor attempts mutating their ownership snapshot', async () => {
+    const context = ctx({
+      method: 'patch',
+      id: 'task-1',
+      data: { executor_attempt: { id: 'attempt-1', workload: { kind: 'local', pid: 1 } } },
+    });
+
+    await expect(executorRuntimeScopeGuard()(context)).rejects.toThrow(/daemon-owned/);
+  });
+
+  it('allows only explicit executor result fields', async () => {
+    const context = ctx({
+      method: 'patch',
+      id: 'task-1',
+      data: { status: TaskStatus.COMPLETED, model: 'model-1' },
+    });
+
+    await expect(executorRuntimeScopeGuard()(context)).resolves.toBe(context);
+    await expect(
+      executorRuntimeScopeGuard()(ctx({ method: 'patch', id: 'task-1', data: { metadata: {} } }))
+    ).rejects.toThrow(/daemon-owned/);
+  });
+
+  it.each([
+    [TaskStatus.QUEUED, true],
+    [TaskStatus.RUNNING, false],
+  ])('allows external removal only while a task is pending (%s)', async (status, allowed) => {
+    const context = ctx({
+      method: 'remove',
+      id: 'task-1',
+      params: {
+        authentication: { payload: { sub: 'user-1' } },
+        query: {},
+        provider: 'socketio',
+      },
+      service: { findByIdForScopeCheck: async () => ({ status }) },
+    });
+    const result = expect(executorRuntimeScopeGuard()(context));
+
+    if (allowed) await result.resolves.toBe(context);
+    else await result.rejects.toThrow(/pending tasks/);
+  });
+
+  it('rejects task removal by an executor token', async () => {
+    await expect(
+      executorRuntimeScopeGuard()(ctx({ method: 'remove', id: 'task-1' }))
+    ).rejects.toThrow(/cannot remove/);
+  });
+
   it('narrows find queries to executor token scope', async () => {
     const context = ctx({ path: 'messages', method: 'find' });
 
@@ -395,6 +485,15 @@ describe('executorRuntimeScopeGuard', () => {
       executorAttemptId: 'attempt-1',
       executorTaskId: 'task-1',
     });
+  });
+
+  it('rejects an executor lifecycle claim for another attempt', async () => {
+    const context = ctx({
+      method: 'connectExecutor',
+      data: { task_id: 'task-1', executor_attempt_id: 'attempt-2' },
+    });
+
+    await expect(executorRuntimeScopeGuard()(context)).rejects.toThrow(/attempt scope/);
   });
 
   it('rejects API key resolution for another task under executor token auth', async () => {

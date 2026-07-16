@@ -20,7 +20,15 @@ import {
   shortId,
   type TenantScopeAwareDatabase,
 } from '@agor/core/db';
-import type { Id, Paginated, Session, SessionID, Task, TenantContext } from '@agor/core/types';
+import type {
+  Id,
+  Paginated,
+  Params,
+  Session,
+  SessionID,
+  Task,
+  TenantContext,
+} from '@agor/core/types';
 import { isTerminalTaskStatus, SessionStatus, TaskStatus } from '@agor/core/types';
 import type { Application, SessionsServiceImpl, TasksServiceImpl } from './declarations.js';
 import { ExecutorHeartbeatSupervisor } from './services/executor-heartbeat-supervisor.js';
@@ -114,7 +122,7 @@ async function readAndClearSentinel(): Promise<boolean> {
 // Orphan cleanup
 // ---------------------------------------------------------------------------
 
-function startupTenantParams(config: AgorConfig): { tenant: TenantContext } {
+function startupTenantParams(config: AgorConfig): Params & { tenant: TenantContext } {
   const multiTenancy = resolveMultiTenancyConfig(config);
   return {
     tenant: {
@@ -446,6 +454,15 @@ export function runPostStartJob(name: string, job: () => Promise<void> | void): 
     });
 }
 
+export async function startRecoveredQueueProcessing(ctx: StartupContext): Promise<void> {
+  const tasks = ctx.app.service('tasks') as unknown as TasksServiceImpl;
+  const params = startupTenantParams(ctx.config);
+  for (const sessionId of await tasks.getQueuedSessionIds(params)) {
+    await ctx.sessionsService.triggerQueueProcessing(sessionId, params);
+  }
+  await ctx.sessionsService.startQueueProcessing();
+}
+
 // ---------------------------------------------------------------------------
 // Master secret
 // ---------------------------------------------------------------------------
@@ -495,7 +512,6 @@ export async function startup(ctx: StartupContext): Promise<void> {
     DAEMON_HOST,
     safeService,
     getSocketServer,
-    sessionsService,
     terminalsService,
   } = ctx;
 
@@ -534,7 +550,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
     try {
       await injectRestartNotices(ctx, orphanCleanupResult);
     } finally {
-      await runStartupTenantDatabaseScope(ctx, () => sessionsService.startQueueProcessing());
+      await runStartupTenantDatabaseScope(ctx, () => startRecoveredQueueProcessing(ctx));
     }
   });
 

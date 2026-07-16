@@ -79,4 +79,24 @@ describe('SessionTokenService runtime scoping', () => {
 
     expect(decoded.tenant_id).toBe('tenant-a');
   });
+
+  it('revokes only tokens owned by the released executor attempt', async () => {
+    const service = new SessionTokenService({ expiration_ms: 60_000, max_uses: -1 });
+    service.setJwtSecret('session-token-test-secret');
+    const released = await service.generateToken('session-1', 'user-1', {
+      taskId: 'task-1',
+      executorAttemptId: 'attempt-1',
+    });
+    const active = await service.generateToken('session-1', 'user-1', {
+      taskId: 'task-2',
+      executorAttemptId: 'attempt-2',
+    });
+
+    service.revokeExecutorAttemptTokens('attempt-1');
+
+    await expect(service.validateToken(released)).resolves.toBeNull();
+    await expect(service.validateToken(active)).resolves.toMatchObject({
+      executor_attempt_id: 'attempt-2',
+    });
+  });
 });

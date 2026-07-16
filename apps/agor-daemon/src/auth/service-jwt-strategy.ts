@@ -10,7 +10,7 @@
  * service user with elevated privileges.
  */
 
-import { JWTStrategy } from '@agor/core/feathers';
+import { JWTStrategy, NotAuthenticated } from '@agor/core/feathers';
 import type { Params, UserAuthMetadata } from '@agor/core/types';
 import jwt from 'jsonwebtoken';
 import type { SessionTokenService } from '../services/session-token-service.js';
@@ -187,11 +187,11 @@ export class ServiceJWTStrategy extends JWTStrategy {
 
     if (payload?.type === 'executor-session') {
       if (!isExecutorSessionTokenPayload(payload)) {
-        throw new Error('Invalid executor token purpose');
+        throw new NotAuthenticated('Invalid executor token purpose');
       }
       const token = authentication?.accessToken;
       if (!token || !this.sessionTokenService) {
-        throw new Error('Executor token validation unavailable');
+        throw new NotAuthenticated('Executor token validation unavailable');
       }
       const sessionId = getExecutorSessionTokenSessionId(payload);
       const sessionInfo = await this.sessionTokenService.validateToken(token, {
@@ -201,7 +201,7 @@ export class ServiceJWTStrategy extends JWTStrategy {
         branchId: payload.branch_id,
       });
       if (!sessionInfo) {
-        throw new Error('Invalid or expired executor token');
+        throw new NotAuthenticated('Invalid or expired executor token');
       }
       persistExecutorJwtPayloadOnConnection(params, token, payload);
       return {

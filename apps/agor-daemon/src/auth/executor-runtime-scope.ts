@@ -1,5 +1,6 @@
 import { Forbidden } from '@agor/core/feathers';
 import type { AuthenticatedParams, HookContext, Params } from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
 import {
   EXECUTOR_SESSION_TOKEN_PURPOSE,
   EXECUTOR_SESSION_TOKEN_TYPE,
@@ -14,6 +15,39 @@ type Scope = {
   executorAttemptId?: string;
   branchId?: string;
 };
+
+const TASK_LIFECYCLE_FIELDS = new Set([
+  'task_id',
+  'session_id',
+  'created_by',
+  'created_at',
+  'status',
+  'executor_attempt',
+  'queue_position',
+  'started_at',
+  'executor_connected_at',
+  'last_executor_heartbeat_at',
+  'latest_executor_pulse',
+  'completed_at',
+  'session_md5',
+]);
+const DRAFT_TASK_FIELDS = new Set(['session_id', 'status']);
+const EXECUTOR_TASK_FIELDS = new Set([
+  'status',
+  'completed_at',
+  'message_range',
+  'tool_use_count',
+  'git_state',
+  'duration_ms',
+  'agent_session_id',
+  'error_message',
+  'model',
+  'raw_sdk_response',
+  'normalized_sdk_response',
+  'computed_context_window',
+  'report',
+  'permission_request',
+]);
 
 function scopedPayload(context: HookContext): ExecutorSessionTokenPayload | null {
   const params = context.params as AuthenticatedParams & ExecutorSessionTokenPayload;
@@ -194,6 +228,49 @@ export function executorRuntimeScopeGuard() {
     if (!(context.params as Params).provider) return context;
 
     const payload = scopedPayload(context);
+    const data = (context.data ?? {}) as Record<string, unknown>;
+    const path = normalizePath(context.path);
+
+    if (path === 'tasks') {
+      const executorMethod =
+        context.method === 'connectExecutor' || context.method === 'reportExecutorTelemetry';
+      if (executorMethod && !payload) {
+        throw new Forbidden('Executor-scoped authentication is required');
+      }
+      if (context.method === 'create') {
+        if (payload) throw new Forbidden('Executors cannot create tasks');
+        if (data.status !== undefined && data.status !== TaskStatus.CREATED) {
+          throw new Forbidden('External task creation is limited to drafts');
+        }
+        const forbidden = Object.keys(data).filter(
+          (field) => TASK_LIFECYCLE_FIELDS.has(field) && !DRAFT_TASK_FIELDS.has(field)
+        );
+        if (forbidden.length) {
+          throw new Forbidden(`Task lifecycle fields are daemon-owned: ${forbidden.join(', ')}`);
+        }
+      } else if (context.method === 'patch') {
+        const forbidden = Object.keys(data).filter(
+          (field) => !payload || !EXECUTOR_TASK_FIELDS.has(field)
+        );
+        if (forbidden.length) {
+          throw new Forbidden(`Task lifecycle fields are daemon-owned: ${forbidden.join(', ')}`);
+        }
+      } else if (context.method === 'remove') {
+        if (payload) throw new Forbidden('Executors cannot remove tasks');
+        const existing = asRecord(
+          await (
+            context.service as { findByIdForScopeCheck?: (id: string) => Promise<unknown> }
+          ).findByIdForScopeCheck?.(String(context.id))
+        );
+        if (
+          !existing ||
+          (existing.status !== TaskStatus.CREATED && existing.status !== TaskStatus.QUEUED)
+        ) {
+          throw new Forbidden('Only pending tasks can be removed externally');
+        }
+      }
+    }
+
     if (!payload) return context;
 
     const scope = {
@@ -210,11 +287,9 @@ export function executorRuntimeScopeGuard() {
       params.executorAttemptId = scope.executorAttemptId;
       params.executorTaskId = scope.taskId;
     }
-    const data = (context.data ?? {}) as Record<string, unknown>;
     const query = ((context.params as Params).query ?? {}) as Record<string, unknown>;
     (context.params as Params).query = query;
     const id = typeof context.id === 'string' ? context.id : undefined;
-    const path = normalizePath(context.path);
 
     if (path === 'sessions') {
       const sessionId = expectClaim(scope.sessionId, 'session');

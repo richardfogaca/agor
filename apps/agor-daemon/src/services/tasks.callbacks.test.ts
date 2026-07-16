@@ -1,3 +1,4 @@
+import { NotFound } from '@agor/core/feathers';
 import { type Session, type Task, TaskStatus } from '@agor/core/types';
 import { describe, expect, it, vi } from 'vitest';
 import { TasksService } from './tasks';
@@ -66,6 +67,7 @@ function makeService(
     task?: Partial<Task>;
     childSession?: Partial<Session>;
     parentSession?: Partial<Session>;
+    parentGetError?: Error;
   } = {}
 ) {
   const initialTask = makeTask(options.task);
@@ -142,19 +144,26 @@ function makeService(
     findAll: vi.fn(async () => [...tasksById.values()]),
     delete: vi.fn(),
     createCompletionCallback,
-    releaseExecutorTurn: vi.fn(async (id: string, attemptId: string) => {
-      const current = tasksById.get(id);
-      if (current?.executor_attempt?.id !== attemptId) return null;
-      const task = {
-        ...current,
-        executor_attempt: {
-          ...current.executor_attempt,
-          released_at: '2026-01-01T00:00:06.000Z',
-        },
-      } as Task;
-      tasksById.set(id, task);
-      return { task, released: true };
-    }),
+    releaseExecutorTurn: vi.fn(
+      async (
+        id: string,
+        attemptId: string,
+        callback?: Parameters<typeof createCompletionCallback>[0]
+      ) => {
+        const current = tasksById.get(id);
+        if (current?.executor_attempt?.id !== attemptId) return null;
+        const callbackTask = callback ? await createCompletionCallback(callback) : null;
+        const task = {
+          ...(tasksById.get(id) ?? current),
+          executor_attempt: {
+            ...current.executor_attempt,
+            released_at: '2026-01-01T00:00:06.000Z',
+          },
+        } as Task;
+        tasksById.set(id, task);
+        return { task, released: true, callbackTask: callbackTask ?? undefined };
+      }
+    ),
   };
 
   const sessionsPatch = vi.fn(async (id: string, updates: Partial<Session>) => {
@@ -186,7 +195,10 @@ function makeService(
     service: vi.fn((name: string) => {
       if (name === 'sessions') {
         return {
-          get: vi.fn(async (id: string) => (id === parentSessionId ? parentSession : childSession)),
+          get: vi.fn(async (id: string) => {
+            if (id === parentSessionId && options.parentGetError) throw options.parentGetError;
+            return id === parentSessionId ? parentSession : childSession;
+          }),
           patch: sessionsPatch,
           emit: vi.fn(),
           triggerQueueProcessing,
@@ -242,6 +254,21 @@ describe('TasksService completion callbacks', () => {
       executor_attempt_id: 'attempt-1',
     });
 
+    expect(createCompletionCallback).not.toHaveBeenCalled();
+  });
+
+  it('releases without a callback when its target was deleted', async () => {
+    const { service, repository, createCompletionCallback } = makeService({
+      task: { status: TaskStatus.COMPLETED, executor_attempt: { id: 'attempt-1' } },
+      parentGetError: new NotFound('callback target deleted'),
+    });
+
+    await service.releaseExecutorTurn({
+      task_id: taskId,
+      executor_attempt_id: 'attempt-1',
+    });
+
+    expect(repository.releaseExecutorTurn).toHaveBeenCalledWith(taskId, 'attempt-1', undefined);
     expect(createCompletionCallback).not.toHaveBeenCalled();
   });
 

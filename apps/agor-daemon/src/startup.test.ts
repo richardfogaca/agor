@@ -2,7 +2,11 @@ import { createTenantScopedDatabaseProxy, MissingTenantDatabaseScopeError } from
 import type { Session, Task } from '@agor/core/types';
 import { SessionStatus, TaskStatus } from '@agor/core/types';
 import { describe, expect, it, vi } from 'vitest';
-import { cleanupOrphanStatuses, type StartupContext } from './startup.js';
+import {
+  cleanupOrphanStatuses,
+  type StartupContext,
+  startRecoveredQueueProcessing,
+} from './startup.js';
 
 interface StartupFixtures {
   orphanedTasks?: Task[];
@@ -12,6 +16,7 @@ interface StartupFixtures {
   /** Lookup table for tasksService.get / sessionsService.get */
   tasksById?: Record<string, Task>;
   sessionsById?: Record<string, Session>;
+  queuedSessionIds?: Session['session_id'][];
 }
 
 function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
@@ -48,6 +53,7 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
     }),
     patch: vi.fn(),
     finalizeExecutorTurn: vi.fn(),
+    getQueuedSessionIds: vi.fn(async () => fixtures.queuedSessionIds ?? []),
   };
   const sessionsService = {
     find: vi.fn(async (params: { query?: { status?: string; ready_for_prompt?: boolean } }) => {
@@ -69,6 +75,8 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
       return session;
     }),
     patch: vi.fn(),
+    triggerQueueProcessing: vi.fn(),
+    startQueueProcessing: vi.fn(),
   };
   const services = new Map<string, unknown>([
     ['tasks', tasksService],
@@ -120,6 +128,23 @@ function makeSession(overrides: Partial<Session>): Session {
 }
 
 describe('startup tenant database scope', () => {
+  it('rebuilds durable queue wake-ups before enabling queue processing', async () => {
+    const { ctx, sessionsService } = makeStartupContextWithGuardedDb({
+      queuedSessionIds: ['session-1', 'session-2'] as Session['session_id'][],
+    });
+
+    await startRecoveredQueueProcessing(ctx);
+
+    expect(sessionsService.triggerQueueProcessing.mock.calls.map(([id]) => id)).toEqual([
+      'session-1',
+      'session-2',
+    ]);
+    expect(sessionsService.startQueueProcessing).toHaveBeenCalledOnce();
+    expect(sessionsService.triggerQueueProcessing.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      sessionsService.startQueueProcessing.mock.invocationCallOrder[0]
+    );
+  });
+
   it('runs orphan cleanup inside an explicit startup tenant DB scope', async () => {
     const { ctx, baseDb } = makeStartupContextWithGuardedDb();
 

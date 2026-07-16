@@ -12,12 +12,13 @@ import {
 } from '@agor/core/callbacks/child-completion-template';
 import { PAGINATION, resolveExecutorHeartbeatConfig } from '@agor/core/config';
 import {
+  type CompletionCallbackInput,
   enqueueTenantDatabasePostCommitCallback,
   shortId,
   TaskRepository,
   type TenantScopeAwareDatabase,
 } from '@agor/core/db';
-import { type Application, BadRequest, Conflict } from '@agor/core/feathers';
+import { type Application, BadRequest, Conflict, Forbidden, NotFound } from '@agor/core/feathers';
 import type {
   ContentBlock,
   ExecutorClaim,
@@ -66,6 +67,16 @@ function isCompletionSideEffectTaskStatus(status: Task['status'] | undefined): b
   return status !== undefined && COMPLETION_SIDE_EFFECT_TASK_STATUSES.has(status);
 }
 
+function authenticatedExecutorClaim(data: ExecutorClaim, params?: TaskParams): ExecutorClaim {
+  const taskId = params?.executorTaskId;
+  const attemptId = params?.executorAttemptId;
+  if (!taskId || !attemptId) throw new Forbidden('Executor-scoped authentication is required');
+  if (data.task_id !== taskId || data.executor_attempt_id !== attemptId) {
+    throw new Forbidden('Executor claim does not match authenticated scope');
+  }
+  return { task_id: taskId, executor_attempt_id: attemptId };
+}
+
 export type TaskParams = QueryParams<{
   session_id?: string;
   status?: Task['status'];
@@ -107,6 +118,17 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     this.db = db;
     const heartbeatConfig = resolveExecutorHeartbeatConfig(app.get?.('config')?.execution);
     this.heartbeatCallbackRunner = new ExecutorHeartbeatCallbackRunner(heartbeatConfig);
+  }
+
+  private async patchStoredTask(
+    id: string,
+    data: Partial<Task>,
+    params?: TaskParams
+  ): Promise<Task> {
+    if (!params?.executorAttemptId) return super.patch(id, data, params) as Promise<Task>;
+    const task = await this.taskRepo.update(id, data, params.executorAttemptId);
+    if (!task) throw new Conflict('Executor no longer owns task mutations');
+    return task;
   }
 
   /**
@@ -358,7 +380,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   }
 
   /** Run causally visible completion effects only after the turn is safe to continue. */
-  private async settleTaskCompletion(task: Task, params?: TaskParams): Promise<void> {
+  private async settleTaskCompletion(
+    task: Task,
+    params?: TaskParams,
+    callbacksSettled = false
+  ): Promise<void> {
     const session = await this.app.service('sessions').get(task.session_id, params);
     if (session.branch_id) {
       this.app
@@ -391,7 +417,9 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     }
 
     const naturalCompletion = isNaturalCompletion(task.status);
-    if (naturalCompletion) await this.dispatchCompletionCallbacks(task, session, params);
+    if (naturalCompletion && !callbacksSettled) {
+      await this.dispatchCompletionCallbacks(task, session, params);
+    }
 
     if (session.fork_origin === 'btw' && isCompletionSideEffectTaskStatus(task.status)) {
       await this.app
@@ -429,7 +457,9 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       );
       if (!transitioned) throw new Conflict('Executor no longer owns this task state');
       const { status: _status, ...rest } = data;
-      const result = Object.keys(rest).length ? await super.patch(id, rest, params) : transitioned;
+      const result = Object.keys(rest).length
+        ? await this.patchStoredTask(id, rest, params)
+        : transitioned;
       if (nextStatus === TaskStatus.RUNNING) this.trackTaskStarted(result as Task);
       return result;
     }
@@ -457,7 +487,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       data = finalizeTerminalTaskPatch(currentTask, data);
     }
 
-    const result = await super.patch(id, data, params);
+    const result = await this.patchStoredTask(id, data, params);
 
     if (isRunningTransition && !Array.isArray(result)) {
       this.trackTaskStarted(result as Task);
@@ -637,38 +667,14 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   ): Promise<void> {
     const targetSessionId = this.resolveCompletionCallbackTarget(childSession);
     if (!targetSessionId) return;
-
-    const callbackTask = await this.queueCallbackToSession(
-      task,
-      childSession,
-      targetSessionId,
-      params
-    );
-
-    if (callbackTask) {
-      // CRITICAL: After queuing callback, ALWAYS trigger target's queue processing.
-      // The queue processor uses a promise-based lock that will:
-      // - If target is busy: wait for current processing, then retry (self-healing)
-      // - If target is promptable: immediately process the callback
-      // - If target becomes promptable while waiting: the retry will catch it
-      //
-      // DO NOT check target status before triggering - let the queue processor handle it.
-      // This ensures callbacks are never missed due to timing issues.
-      try {
-        console.log(
-          `🔄 [TasksService] Triggering callback target queue processing for ${shortId(targetSessionId)} (callback queued)`
-        );
-        // Pass empty params to avoid leaking child's auth context to target.
-        // The queue processor reconstructs target auth from queued task metadata.
-        await this.triggerQueueProcessingAfterCommit(targetSessionId, {});
-      } catch (error) {
-        // Don't throw - target issues shouldn't break child queue processing.
-        console.warn(
-          `⚠️  [TasksService] Failed to trigger callback target queue processing (target may be deleted):`,
-          error
-        );
-      }
-    }
+    const input = await this.prepareCompletionCallback(task, childSession, targetSessionId, params);
+    if (!input) return;
+    const callbackTask = await this.taskRepo.createCompletionCallback(input).catch((error) => {
+      console.error(`❌ [TasksService] Failed to queue callback to ${targetSessionId}:`, error);
+      return null;
+    });
+    if (!callbackTask) return;
+    await this.publishCompletionCallback(callbackTask);
 
     // Post-callback cleanup: only runs after a callback task was actually
     // queued. "once" means "after firing" — do not permanently disable a
@@ -676,7 +682,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     // Default to "persistent" for backward compat — legacy sessions without
     // callback_mode should continue firing on every completion as they always have.
     const callbackMode = childSession.callback_config?.callback_mode ?? 'persistent';
-    if (callbackTask && callbackMode === 'once') {
+    if (callbackMode === 'once') {
       try {
         await this.app.service('sessions').patch(childSession.session_id, {
           callback_config: {
@@ -691,6 +697,16 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
         console.warn(`⚠️  [TasksService] Failed to auto-disable callback:`, error);
       }
     }
+  }
+
+  private async publishCompletionCallback(task: Task): Promise<void> {
+    this.emit?.('queued', task);
+    console.log(
+      `🔔 Queued callback task ${shortId(task.task_id)} on session ${shortId(task.session_id)}`
+    );
+    await this.triggerQueueProcessingAfterCommit(task.session_id, {}).catch((error) =>
+      console.warn(`⚠️  [TasksService] Callback queue wake-up deferred to recovery:`, error)
+    );
   }
 
   private resolveCompletionCallbackTarget(childSession: Session): SessionID | undefined {
@@ -708,183 +724,161 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
    * The target is always callback_config.callback_session_id, set by both
    * spawn (defaults to parent) and create (when enableCallback is true).
    */
-  private async queueCallbackToSession(
+  private async prepareCompletionCallback(
     task: Task,
     childSession: Session,
     targetSessionId: SessionID,
     params?: TaskParams
-  ): Promise<Task | undefined> {
+  ): Promise<CompletionCallbackInput | undefined> {
     if (!targetSessionId) return undefined;
-
-    try {
-      // Get target session to check callback config
-      // NOTE: DO NOT pass params here - params are from child session context (executor),
-      // but we need to access target session without child's authentication constraints
-      const targetSession = await this.app.service('sessions').get(targetSessionId);
-
-      // Check callback config - child overrides take precedence over target defaults
-      // For subsessions (parent_session_id), default is enabled=true
-      // For remote sessions (callback_session_id), enabled is explicitly set at creation time
-      const callbackEnabled =
-        childSession.callback_config?.enabled ?? targetSession.callback_config?.enabled ?? true;
-
-      if (!callbackEnabled) {
-        console.log(
-          `⏭️  [TasksService] Callbacks disabled for child session ${shortId(childSession.session_id)}`
-        );
-        return undefined;
-      }
-
-      // Check if we should include original spawn prompt - child overrides take precedence
-      const includeOriginalPrompt =
-        childSession.callback_config?.include_original_prompt ??
-        targetSession.callback_config?.include_original_prompt ??
-        false;
-
-      // Get the original prompt from the completed task. When requested, it is
-      // rendered as a section inside the single templated callback body (never
-      // queued as its own callback/message).
-      const spawnPrompt = includeOriginalPrompt
-        ? task.full_prompt || '(no prompt available)'
-        : undefined;
-
-      // Fetch last assistant message from child session (if callback config allows)
-      let lastAssistantMessage: string | undefined;
-
-      // Check if we should include last message - child overrides take precedence
-      const includeLastMessage =
-        childSession.callback_config?.include_last_message ??
-        targetSession.callback_config?.include_last_message ??
-        true;
-
-      if (includeLastMessage) {
-        try {
-          // Query messages service for last assistant message in this task
-          const messagesService = this.app.service('messages');
-          const messages = await messagesService.find({
-            ...params,
-            query: {
-              session_id: childSession.session_id,
-              task_id: task.task_id,
-            },
-          });
-
-          // MessagesService.find() ignores role/sort/limit when task_id is present
-          // So we need to filter and sort manually
-          const allMessages = messages.data || messages;
-          const assistantMessages = (Array.isArray(allMessages) ? allMessages : [])
-            // biome-ignore lint/suspicious/noExplicitAny: Message type varies based on service response format
-            .filter((msg: any) => msg.role === 'assistant')
-            // biome-ignore lint/suspicious/noExplicitAny: Message type varies based on service response format
-            .sort((a: any, b: any) => (b.index || 0) - (a.index || 0)); // Descending by index
-
-          if (assistantMessages.length > 0) {
-            const lastMsg = assistantMessages[0];
-            // Extract text content from content blocks or string
-            if (typeof lastMsg.content === 'string') {
-              lastAssistantMessage = lastMsg.content;
-            } else if (Array.isArray(lastMsg.content)) {
-              // Find text blocks and concatenate
-              const textBlocks = lastMsg.content
-                // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
-                .filter((block: any) => block.type === 'text')
-                // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
-                .map((block: any) => block.text || '')
-                .join('\n\n');
-              lastAssistantMessage = textBlocks || undefined;
-            }
-          }
-        } catch (error) {
-          console.warn(
-            `⚠️  [TasksService] Could not fetch last assistant message for callback:`,
-            error
-          );
-          // Continue without last message - not critical
-        }
-      }
-
-      // Build callback context
-      const context: ChildCompletionContext = {
-        childSessionId: shortId(childSession.session_id),
-        childSessionFullId: childSession.session_id,
-        childTaskId: shortId(task.task_id),
-        childTaskFullId: task.task_id,
-        parentSessionId: shortId(targetSessionId), // backward compat
-        callbackSessionId: shortId(targetSessionId),
-        spawnPrompt,
-        status: task.status, // COMPLETED, FAILED, etc.
-        completedAt: task.completed_at || new Date().toISOString(),
-        messageCount:
-          task.message_range?.end_index !== undefined &&
-          task.message_range?.start_index !== undefined
-            ? task.message_range.end_index - task.message_range.start_index + 1
-            : 0,
-        toolUseCount: task.tool_use_count || 0,
-        lastAssistantMessage,
-      };
-
-      // Render callback message using template
-      const customTemplate = targetSession.callback_config?.template;
-      const callbackMessage = renderChildCompletionCallback(context, customTemplate);
-
-      // Validate target session has a creator for authentication
-      if (!targetSession.created_by) {
-        console.warn(
-          `⚠️  [TasksService] Cannot queue callback: target session ${shortId(targetSessionId)} has no creator (anonymous session)`
-        );
-        return undefined;
-      }
-
-      // Create QUEUED task on the target session carrying the callback prompt.
-      // The metadata bag survives the queue → run transition: startClaimedTask
-      // re-stamps `is_agor_callback` and `source` onto the synthesized
-      // user-message row so the UI's callback styling (MessageBlock.tsx) holds.
-      //
-      // IMPORTANT: queued_by_user_id = the person who set up the callback
-      // (task attribution), NOT the target session owner. Execution still runs
-      // as the target session's Unix user. Falls back to target session creator
-      // for backward compat (legacy sessions without callback_created_by).
-      const callbackCreator =
-        childSession.callback_config?.callback_created_by ?? targetSession.created_by;
-      const callbackTask = await this.taskRepo.createCompletionCallback({
-        sourceTaskId: task.task_id,
-        targetSessionId,
-        fullPrompt: callbackMessage,
-        createdBy: callbackCreator,
-        metadata: {
-          is_agor_callback: true,
-          source: 'agor',
-          child_session_id: childSession.session_id,
-          child_task_id: task.task_id,
-          queued_by_user_id: callbackCreator,
-        },
+    // Get target session to check callback config
+    // NOTE: DO NOT pass params here - params are from child session context (executor),
+    // but we need to access target session without child's authentication constraints
+    const targetSession = await this.app
+      .service('sessions')
+      .get(targetSessionId)
+      .catch((error) => {
+        if (error instanceof NotFound) return undefined;
+        throw error;
       });
+    if (!targetSession) return undefined;
 
-      if (!callbackTask) {
-        console.log(
-          `⏭️  [TasksService] Completion callback for task ${shortId(task.task_id)} to ${shortId(targetSessionId)} already dispatched`
-        );
-        return undefined;
-      }
+    // Check callback config - child overrides take precedence over target defaults
+    // For subsessions (parent_session_id), default is enabled=true
+    // For remote sessions (callback_session_id), enabled is explicitly set at creation time
+    const callbackEnabled =
+      childSession.callback_config?.enabled ?? targetSession.callback_config?.enabled ?? true;
 
-      // Emit so reactive-session subscribers see the new queued task.
-      this.emit?.('queued', callbackTask);
-
+    if (!callbackEnabled) {
       console.log(
-        `🔔 Queued callback task ${shortId(callbackTask.task_id)} on session ${shortId(targetSessionId)} from child ${shortId(childSession.session_id)}`
+        `⏭️  [TasksService] Callbacks disabled for child session ${shortId(childSession.session_id)}`
       );
-
-      // NOTE: Queue processing is handled by the centralized dispatcher after
-      // it confirms a callback task was actually queued.
-      return callbackTask;
-    } catch (error) {
-      console.error(
-        `❌ [TasksService] Failed to queue callback to ${targetSessionId} for session ${childSession.session_id}:`,
-        error
-      );
-      // Don't throw - callback failure shouldn't break task completion
       return undefined;
     }
+
+    // Check if we should include original spawn prompt - child overrides take precedence
+    const includeOriginalPrompt =
+      childSession.callback_config?.include_original_prompt ??
+      targetSession.callback_config?.include_original_prompt ??
+      false;
+
+    // Get the original prompt from the completed task. When requested, it is
+    // rendered as a section inside the single templated callback body (never
+    // queued as its own callback/message).
+    const spawnPrompt = includeOriginalPrompt
+      ? task.full_prompt || '(no prompt available)'
+      : undefined;
+
+    // Fetch last assistant message from child session (if callback config allows)
+    let lastAssistantMessage: string | undefined;
+
+    // Check if we should include last message - child overrides take precedence
+    const includeLastMessage =
+      childSession.callback_config?.include_last_message ??
+      targetSession.callback_config?.include_last_message ??
+      true;
+
+    if (includeLastMessage) {
+      try {
+        // Query messages service for last assistant message in this task
+        const messagesService = this.app.service('messages');
+        const messages = await messagesService.find({
+          ...params,
+          query: {
+            session_id: childSession.session_id,
+            task_id: task.task_id,
+          },
+        });
+
+        // MessagesService.find() ignores role/sort/limit when task_id is present
+        // So we need to filter and sort manually
+        const allMessages = messages.data || messages;
+        const assistantMessages = (Array.isArray(allMessages) ? allMessages : [])
+          // biome-ignore lint/suspicious/noExplicitAny: Message type varies based on service response format
+          .filter((msg: any) => msg.role === 'assistant')
+          // biome-ignore lint/suspicious/noExplicitAny: Message type varies based on service response format
+          .sort((a: any, b: any) => (b.index || 0) - (a.index || 0)); // Descending by index
+
+        if (assistantMessages.length > 0) {
+          const lastMsg = assistantMessages[0];
+          // Extract text content from content blocks or string
+          if (typeof lastMsg.content === 'string') {
+            lastAssistantMessage = lastMsg.content;
+          } else if (Array.isArray(lastMsg.content)) {
+            // Find text blocks and concatenate
+            const textBlocks = lastMsg.content
+              // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+              .filter((block: any) => block.type === 'text')
+              // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+              .map((block: any) => block.text || '')
+              .join('\n\n');
+            lastAssistantMessage = textBlocks || undefined;
+          }
+        }
+      } catch (error) {
+        console.warn(
+          `⚠️  [TasksService] Could not fetch last assistant message for callback:`,
+          error
+        );
+        // Continue without last message - not critical
+      }
+    }
+
+    // Build callback context
+    const context: ChildCompletionContext = {
+      childSessionId: shortId(childSession.session_id),
+      childSessionFullId: childSession.session_id,
+      childTaskId: shortId(task.task_id),
+      childTaskFullId: task.task_id,
+      parentSessionId: shortId(targetSessionId), // backward compat
+      callbackSessionId: shortId(targetSessionId),
+      spawnPrompt,
+      status: task.status, // COMPLETED, FAILED, etc.
+      completedAt: task.completed_at || new Date().toISOString(),
+      messageCount:
+        task.message_range?.end_index !== undefined && task.message_range?.start_index !== undefined
+          ? task.message_range.end_index - task.message_range.start_index + 1
+          : 0,
+      toolUseCount: task.tool_use_count || 0,
+      lastAssistantMessage,
+    };
+
+    // Render callback message using template
+    const customTemplate = targetSession.callback_config?.template;
+    const callbackMessage = renderChildCompletionCallback(context, customTemplate);
+
+    // Validate target session has a creator for authentication
+    if (!targetSession.created_by) {
+      console.warn(
+        `⚠️  [TasksService] Cannot queue callback: target session ${shortId(targetSessionId)} has no creator (anonymous session)`
+      );
+      return undefined;
+    }
+
+    // Create QUEUED task on the target session carrying the callback prompt.
+    // The metadata bag survives the queue → run transition: startClaimedTask
+    // re-stamps `is_agor_callback` and `source` onto the synthesized
+    // user-message row so the UI's callback styling (MessageBlock.tsx) holds.
+    //
+    // IMPORTANT: queued_by_user_id = the person who set up the callback
+    // (task attribution), NOT the target session owner. Execution still runs
+    // as the target session's Unix user. Falls back to target session creator
+    // for backward compat (legacy sessions without callback_created_by).
+    const callbackCreator =
+      childSession.callback_config?.callback_created_by ?? targetSession.created_by;
+    return {
+      sourceTaskId: task.task_id,
+      targetSessionId,
+      fullPrompt: callbackMessage,
+      createdBy: callbackCreator,
+      metadata: {
+        is_agor_callback: true,
+        source: 'agor',
+        child_session_id: childSession.session_id,
+        child_task_id: task.task_id,
+        queued_by_user_id: callbackCreator,
+      },
+    };
   }
 
   /**
@@ -899,6 +893,14 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
    */
   async getOrphaned(_params?: TaskParams): Promise<Task[]> {
     return this.taskRepo.findOrphaned();
+  }
+
+  async getQueuedSessionIds(_params?: TaskParams): Promise<SessionID[]> {
+    return [
+      ...new Set(
+        (await this.taskRepo.findByStatus(TaskStatus.QUEUED)).map((task) => task.session_id)
+      ),
+    ];
   }
 
   async findByIdForScopeCheck(taskId: TaskID): Promise<Task | null> {
@@ -917,9 +919,13 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   }
 
   /** Claim a dispatched task after task-scoped executor authentication. */
-  async connectExecutor(data: ExecutorClaim, _params?: TaskParams): Promise<Task> {
+  async connectExecutor(data: ExecutorClaim, params?: TaskParams): Promise<Task> {
     if (!data.task_id || !data.executor_attempt_id) throw new BadRequest('Invalid executor claim');
-    const connection = await this.taskRepo.connectExecutor(data.task_id, data.executor_attempt_id);
+    const claim = authenticatedExecutorClaim(data, params);
+    const connection = await this.taskRepo.connectExecutor(
+      claim.task_id,
+      claim.executor_attempt_id
+    );
     if (!connection) throw new Conflict('Executor does not own this dispatched task');
     if (connection.transitioned) {
       this.trackTaskStarted(connection.task);
@@ -929,21 +935,19 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   }
 
   /** Stamp bounded executor liveness/progress with daemon time. */
-  async reportExecutorTelemetry(
-    data: ExecutorTelemetryReport,
-    _params?: TaskParams
-  ): Promise<Task> {
+  async reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: TaskParams): Promise<Task> {
     if (!data.task_id || !data.executor_attempt_id || typeof data.heartbeat !== 'boolean') {
       throw new BadRequest('Invalid executor telemetry');
     }
     const pulse = data.pulse === undefined ? undefined : sanitizeExecutorPulse(data.pulse);
     if (data.pulse !== undefined && !pulse) throw new BadRequest('Invalid executor pulse');
     if (!data.heartbeat && !pulse) throw new BadRequest('Executor telemetry is empty');
+    const claim = authenticatedExecutorClaim(data, params);
 
     const observedAt = new Date().toISOString();
     const task = await this.taskRepo.recordExecutorTelemetry(
-      data.task_id,
-      data.executor_attempt_id,
+      claim.task_id,
+      claim.executor_attempt_id,
       {
         ...(data.heartbeat ? { last_executor_heartbeat_at: observedAt } : {}),
         ...(pulse ? { latest_executor_pulse: { ...pulse, at: observedAt } } : {}),
@@ -958,13 +962,35 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   async releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task> {
     if (!data.task_id || !data.executor_attempt_id)
       throw new BadRequest('Invalid executor release');
-    const result = await this.taskRepo.releaseExecutorTurn(data.task_id, data.executor_attempt_id);
+    const current = await this.get(data.task_id, params);
+    const session = await this.app.service('sessions').get(current.session_id, params);
+    const target = isNaturalCompletion(current.status)
+      ? this.resolveCompletionCallbackTarget(session)
+      : undefined;
+    const callback = target
+      ? await this.prepareCompletionCallback(current, session, target, params)
+      : undefined;
+    const result = await this.taskRepo.releaseExecutorTurn(
+      data.task_id,
+      data.executor_attempt_id,
+      callback && {
+        ...callback,
+        disableAfterDelivery: session.callback_config?.callback_mode === 'once',
+      }
+    );
     if (!result) throw new Conflict('Executor turn is not releasable');
     if (result.released) {
+      (
+        this.app as Application & {
+          sessionTokenService?: { revokeExecutorAttemptTokens(attemptId: string): void };
+        }
+      ).sessionTokenService?.revokeExecutorAttemptTokens(data.executor_attempt_id);
       this.emit?.('patched', result.task);
-      const session = await this.app.service('sessions').get(result.task.session_id, params);
-      this.app.service('sessions').emit('patched', session);
-      await this.settleTaskCompletion(result.task, params);
+      if (result.callbackTask) await this.publishCompletionCallback(result.callbackTask);
+      this.app
+        .service('sessions')
+        .emit('patched', await this.app.service('sessions').get(result.task.session_id, params));
+      await this.settleTaskCompletion(result.task, params, true);
     }
     return result.task;
   }

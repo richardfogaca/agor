@@ -3,6 +3,27 @@ import { describe, expect, it, vi } from 'vitest';
 import { TasksService } from './tasks';
 
 describe('TasksService executor heartbeat helpers', () => {
+  it.each([
+    ['connectExecutor', { task_id: 'task-1', executor_attempt_id: 'attempt-1' }],
+    [
+      'reportExecutorTelemetry',
+      { task_id: 'task-1', executor_attempt_id: 'attempt-1', heartbeat: true },
+    ],
+  ])('validates authenticated ownership inside %s', async (method, data) => {
+    const service = Object.create(TasksService.prototype) as TasksService;
+    const invoke = service[method as 'connectExecutor'] as unknown as (
+      data: Record<string, unknown>,
+      params: object
+    ) => Promise<unknown>;
+
+    await expect(
+      invoke.call(service, data, {
+        executorTaskId: 'task-1',
+        executorAttemptId: 'attempt-2',
+      })
+    ).rejects.toThrow(/authenticated scope/);
+  });
+
   it('does not bypass executor release when using the complete helper', async () => {
     const completedTask = {
       task_id: '018f0000-0000-7000-8000-000000000099',
