@@ -1,7 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { promisify } from 'node:util';
-import type { ExecutorWorkloadRef } from '@agor/core/types';
+import type { ExecutorProcessIdentity, ExecutorWorkloadRef } from '@agor/core/types';
 import { buildSpawnArgs, getUidFromUsername, isValidUnixUsername } from '@agor/core/unix';
 
 export const EXECUTOR_ATTEMPT_ENV_VAR = 'AGOR_EXECUTOR_ATTEMPT_ID';
@@ -26,6 +27,99 @@ const CROSS_USER_MARKER_SCAN = [
 interface CrossUserIdentity {
   unixUser: string;
   uid: number;
+}
+
+async function processSnapshot(
+  pid: number
+): Promise<{ identity: ExecutorProcessIdentity; command: string }> {
+  if (process.platform === 'win32') {
+    const script =
+      `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}';` +
+      `if($null -eq $p){exit 3};$o=Invoke-CimMethod -InputObject $p -MethodName GetOwner;` +
+      `[pscustomobject]@{started_at=$p.CreationDate.ToUniversalTime().ToString('o');` +
+      `owner_id=($o.Domain+'\\'+$o.User);command=$p.CommandLine}|ConvertTo-Json -Compress`;
+    const { stdout } = await execFileAsync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      script,
+    ]);
+    const value = JSON.parse(stdout) as {
+      started_at: string;
+      owner_id: string;
+      command: string;
+    };
+    return {
+      identity: processIdentity('win32', value.started_at, value.command, value.owner_id),
+      command: value.command,
+    };
+  }
+  if (process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error(`Executor process identity is unsupported on ${process.platform}`);
+  }
+  const { stdout } = await execFileAsync('ps', [
+    '-ww',
+    '-p',
+    String(pid),
+    '-o',
+    'uid=,pgid=,lstart=,command=',
+  ]);
+  const match = stdout
+    .trim()
+    .match(/^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/);
+  if (!match) throw new Error(`Could not read executor process identity for PID ${pid}`);
+  return {
+    identity: processIdentity(process.platform, match[3], match[4], match[1], Number(match[2])),
+    command: match[4],
+  };
+}
+
+function processIdentity(
+  platform: ExecutorProcessIdentity['platform'],
+  startedAt: string,
+  command: string,
+  ownerId?: string,
+  groupId?: number
+): ExecutorProcessIdentity {
+  return {
+    platform,
+    started_at: startedAt,
+    command_hash: createHash('sha256').update(command).digest('hex'),
+    ...(ownerId ? { owner_id: ownerId } : {}),
+    ...(groupId === undefined ? {} : { group_id: groupId }),
+  };
+}
+
+export async function captureExecutorProcessIdentity(
+  pid: number
+): Promise<ExecutorProcessIdentity> {
+  return (await processSnapshot(pid)).identity;
+}
+
+async function verifyPersistedProcess(
+  attemptId: string,
+  workload: ExecutorWorkloadRef
+): Promise<boolean> {
+  if (!isAlive(workload.pid)) {
+    if (process.platform !== 'win32' && isAlive(-workload.pid)) {
+      throw new Error(`Cannot verify executor process group ${workload.pid} after leader exit`);
+    }
+    return false;
+  }
+  const expected = workload.identity;
+  if (!expected) throw new Error(`Executor workload ${attemptId} has no process identity`);
+  const current = await processSnapshot(workload.pid);
+  if (
+    current.identity.platform !== expected.platform ||
+    current.identity.started_at !== expected.started_at ||
+    current.identity.command_hash !== expected.command_hash ||
+    current.identity.owner_id !== expected.owner_id ||
+    current.identity.group_id !== expected.group_id ||
+    (workload.kind === 'local' && !current.command.includes(`--executor-attempt-id ${attemptId}`))
+  ) {
+    throw new Error(`Executor workload ${attemptId} no longer matches its process identity`);
+  }
+  return true;
 }
 
 function asUser(command: string, args: string[], unixUser: string) {
@@ -145,6 +239,19 @@ async function signal(
   value: NodeJS.Signals,
   crossUser?: CrossUserIdentity
 ): Promise<void> {
+  if (process.platform === 'win32') {
+    try {
+      await execFileAsync('taskkill.exe', [
+        '/PID',
+        String(pid),
+        '/T',
+        ...(value === 'SIGKILL' ? ['/F'] : []),
+      ]);
+    } catch (error) {
+      if (isAlive(pid)) throw error;
+    }
+    return;
+  }
   try {
     process.kill(pid, value);
   } catch (error) {
@@ -218,7 +325,7 @@ export async function ensureExecutorWorkloadStopped(
 ): Promise<void> {
   const tracked = trackedProcesses.get(attemptId);
   if (!tracked && workload?.pid && process.platform !== 'linux') {
-    throw new Error(`Cannot verify executor workload ${attemptId} after restart on this platform`);
+    if (!(await verifyPersistedProcess(attemptId, workload))) return;
   }
   const rootPid = tracked?.pid ?? workload?.pid;
   const crossUser = crossUserIdentity(workload);

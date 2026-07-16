@@ -187,9 +187,19 @@ export interface ExecutorWorkloadRef {
   kind: ExecutorWorkloadKind;
   /** PID and process-group ID of the attempt's local workload leader. */
   pid: number;
+  /** Kernel-backed identity used to reject PID reuse after daemon restart. */
+  identity?: ExecutorProcessIdentity;
   /** Actual local owner used to inspect and signal isolated Linux workloads. */
   unix_user?: string;
   uid?: number;
+}
+
+export interface ExecutorProcessIdentity {
+  platform: 'linux' | 'darwin' | 'win32';
+  started_at: string;
+  command_hash: string;
+  owner_id?: string;
+  group_id?: number;
 }
 
 export interface ExecutorAttempt {
@@ -366,3 +376,9 @@ export interface Task {
   latest_executor_pulse?: ExecutorPulse;
   completed_at?: string; // When task reached terminal status (UTC ISO string)
 }
+
+/** Historical transcript data that cannot manufacture a live executor turn. */
+export type HistoricalTaskImport = Pick<
+  Task,
+  'session_id' | 'full_prompt' | 'message_range' | 'git_state' | 'tool_use_count' | 'model'
+>;

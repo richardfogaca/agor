@@ -299,21 +299,10 @@ export interface TasksService extends AgorService<Task> {
   connectExecutor(data: ExecutorClaim, params?: Params): Promise<Task>;
   finishExecutorAttempt(data: ExecutorClaim, params?: Params): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: Params): Promise<Task>;
-  /**
-   * Create multiple tasks in a single request
-   * Returns array of created tasks with IDs
-   */
-  createMany(data: Partial<Task>[]): Promise<Task[]>;
+}
 
-  /**
-   * Mark a task as completed
-   */
-  complete(id: string, data: { report?: unknown }, params?: Params): Promise<Task>;
-
-  /**
-   * Mark a task as failed
-   */
-  fail(id: string, data: { error: string }, params?: Params): Promise<Task>;
+export interface TasksImportService {
+  create(data: import('../types').HistoricalTaskImport[]): Promise<Task[]>;
 }
 
 /**
@@ -597,7 +586,7 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
 
   // Bulk operation endpoints
   service(path: 'messages/bulk'): MessagesService;
-  service(path: 'tasks/bulk'): TasksService;
+  service(path: 'tasks/import'): TasksImportService;
 
   // Standard services (CRUD only)
   service(path: 'cards'): AgorService<CardWithType>;

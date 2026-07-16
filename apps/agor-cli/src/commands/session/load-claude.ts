@@ -176,7 +176,7 @@ export default class SessionLoadClaude extends BaseCommand {
       this.log(`${chalk.blue('●')} Extracting ${tasks.length} tasks from user messages...`);
 
       // Bulk insert tasks in batches
-      const tasksBulkService = client.service('tasks/bulk');
+      const tasksImportService = client.service('tasks/import');
       const taskBatchSize = 100;
       const totalTasks = tasks.length;
       const createdTasks = [];
@@ -185,7 +185,7 @@ export default class SessionLoadClaude extends BaseCommand {
         const end = Math.min(i + taskBatchSize, totalTasks);
         const batch = tasks.slice(i, end);
 
-        const batchResult = await tasksBulkService.createMany(batch);
+        const batchResult = await tasksImportService.create(batch);
         createdTasks.push(...batchResult);
 
         this.log(`${chalk.blue('●')} Created ${end}/${totalTasks} tasks...`);

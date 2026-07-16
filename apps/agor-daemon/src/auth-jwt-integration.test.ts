@@ -315,59 +315,21 @@ describe('JWT Authentication Integration - Protected Endpoints', () => {
   });
 
   describe('Task Endpoints - Authentication Required', () => {
-    it('POST /tasks/bulk rejects unauthenticated requests', async () => {
-      const tasksBulkService = {
+    it('POST /tasks/import rejects unauthenticated requests', async () => {
+      const tasksImportService = {
         async create() {
           return [];
         },
       };
 
-      app.use('/tasks/bulk', tasksBulkService);
-      app.service('/tasks/bulk').hooks({
+      app.use('/tasks/import', tasksImportService);
+      app.service('/tasks/import').hooks({
         before: {
           create: [requireAuth, requireMinimumRole(ROLES.MEMBER, 'create tasks')],
         },
       });
 
-      await expect(app.service('/tasks/bulk').create([], { provider: 'rest' })).rejects.toThrow();
-    });
-
-    it('POST /tasks/:id/complete rejects unauthenticated requests', async () => {
-      const tasksCompleteService = {
-        async create() {
-          return { completed: true };
-        },
-      };
-
-      app.use('/tasks/:id/complete', tasksCompleteService);
-      app.service('/tasks/:id/complete').hooks({
-        before: {
-          create: [populateRouteParams, requireAuth, requireMinimumRole(ROLES.MEMBER, 'complete')],
-        },
-      });
-
-      await expect(
-        app.service('/tasks/:id/complete').create({}, { provider: 'rest' })
-      ).rejects.toThrow();
-    });
-
-    it('POST /tasks/:id/fail rejects unauthenticated requests', async () => {
-      const tasksFailService = {
-        async create() {
-          return { failed: true };
-        },
-      };
-
-      app.use('/tasks/:id/fail', tasksFailService);
-      app.service('/tasks/:id/fail').hooks({
-        before: {
-          create: [populateRouteParams, requireAuth, requireMinimumRole(ROLES.MEMBER, 'fail')],
-        },
-      });
-
-      await expect(
-        app.service('/tasks/:id/fail').create({}, { provider: 'rest' })
-      ).rejects.toThrow();
+      await expect(app.service('/tasks/import').create([], { provider: 'rest' })).rejects.toThrow();
     });
 
     it('POST /tasks/:id/run rejects unauthenticated requests', async () => {

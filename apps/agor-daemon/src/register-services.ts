@@ -64,6 +64,7 @@ import type {
   SessionsServiceImpl,
 } from './declarations.js';
 import {
+  captureExecutorProcessIdentity,
   EXECUTOR_ATTEMPT_ENV_VAR,
   ensureExecutorWorkloadStopped,
   markExecutorProcessExited,
@@ -1037,14 +1038,15 @@ function createExecuteHandler(
         executor_attempt_id: data.executorAttemptId,
         unix_user: executorUnixUser || undefined,
       },
-      onSpawn: (child) => {
+      onSpawn: async (child) => {
         if (!child.pid) throw new Error('Executor workload has no PID');
+        trackExecutorProcess(data.executorAttemptId, child.pid);
         const workload = {
           kind: workloadKind,
           pid: child.pid,
+          identity: await captureExecutorProcessIdentity(child.pid),
           ...(workloadUnixUser ? { unix_user: workloadUnixUser, uid: workloadUid } : {}),
         } satisfies ExecutorWorkloadRef;
-        trackExecutorProcess(data.executorAttemptId, child.pid);
         workloadRegistration = taskRepo.patchExecutorAttempt(taskId, data.executorAttemptId, {
           workload,
         });

@@ -226,15 +226,22 @@ describe('configured executor spawning', () => {
   it('propagates an explicit LOG_LEVEL to local executor processes at startup', async () => {
     const proc = createMockProcess();
     spawnMock.mockReturnValue(proc);
+    const unix = await import('@agor/core/unix');
     const { spawnExecutor } = await import('./spawn-executor');
 
     spawnExecutor(
       { command: 'prompt' },
       {
         env: { PATH: '/usr/bin', LOG_LEVEL: 'warn' },
+        templateVariables: { executor_attempt_id: 'attempt-1' },
       }
     );
 
+    expect(unix.buildSpawnArgs).toHaveBeenCalledWith(
+      'node',
+      [expect.any(String), '--stdin', '--executor-attempt-id', 'attempt-1'],
+      expect.any(Object)
+    );
     expect(spawnMock).toHaveBeenCalledWith(
       'node',
       ['executor', '--stdin'],

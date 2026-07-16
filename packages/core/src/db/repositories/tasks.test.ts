@@ -4,7 +4,7 @@
  * Tests for type-safe CRUD operations on tasks with short ID support.
  */
 
-import type { Task, UUID } from '@agor/core/types';
+import type { HistoricalTaskImport, Task, UUID } from '@agor/core/types';
 import {
   ExecutorWorkloadKind,
   SessionStatus,
@@ -44,6 +44,21 @@ function createTaskData(overrides?: Partial<Task>): Partial<Task> {
       sha_at_start: 'abc123',
     },
     model: 'claude-sonnet-4-6',
+    ...overrides,
+  };
+}
+
+function historicalTaskData(
+  sessionId: UUID,
+  overrides?: Partial<HistoricalTaskImport>
+): HistoricalTaskImport {
+  const now = new Date().toISOString();
+  return {
+    session_id: sessionId,
+    full_prompt: 'Imported prompt',
+    message_range: { start_index: 0, end_index: 0, start_timestamp: now },
+    git_state: { ref_at_start: 'main', sha_at_start: 'abc123' },
+    tool_use_count: 0,
     ...overrides,
   };
 }
@@ -268,77 +283,31 @@ describe('TaskRepository.create', () => {
 });
 
 // ============================================================================
-// CreateMany
+// Historical imports
 // ============================================================================
 
-describe('TaskRepository.createMany', () => {
-  dbTest('should create multiple tasks in bulk', async ({ db }) => {
+describe('TaskRepository.importHistorical', () => {
+  dbTest('creates terminal history in input order with server-owned identity', async ({ db }) => {
     const taskRepo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);
     const tasks = [
-      createTaskData({ session_id: sessionId, full_prompt: 'Task 1' }),
-      createTaskData({ session_id: sessionId, full_prompt: 'Task 2' }),
-      createTaskData({ session_id: sessionId, full_prompt: 'Task 3' }),
+      historicalTaskData(sessionId, { full_prompt: 'Task 1' }),
+      historicalTaskData(sessionId, { full_prompt: 'Task 2' }),
+      historicalTaskData(sessionId, { full_prompt: 'Task 3' }),
     ];
 
-    const created = await taskRepo.createMany(tasks);
+    const created = await taskRepo.importHistorical(tasks, 'importer');
 
     expect(created).toHaveLength(3);
-    expect(created[0].full_prompt).toBe('Task 1');
-    expect(created[1].full_prompt).toBe('Task 2');
-    expect(created[2].full_prompt).toBe('Task 3');
+    expect(created.map((task) => task.full_prompt)).toEqual(['Task 1', 'Task 2', 'Task 3']);
+    expect(created.every((task) => task.status === TaskStatus.COMPLETED)).toBe(true);
+    expect(created.every((task) => task.created_by === 'importer')).toBe(true);
+    expect(created.every((task) => !task.executor_attempt)).toBe(true);
   });
 
-  dbTest('should handle empty array', async ({ db }) => {
+  dbTest('handles an empty import', async ({ db }) => {
     const taskRepo = new TaskRepository(db);
-
-    const created = await taskRepo.createMany([]);
-
-    expect(created).toEqual([]);
-  });
-
-  dbTest('should create tasks with different sessions', async ({ db }) => {
-    const taskRepo = new TaskRepository(db);
-    const session1 = await createSessionWithDeps(db);
-    const session2 = await createSessionWithDeps(db);
-    const tasks = [
-      createTaskData({ session_id: session1 }),
-      createTaskData({ session_id: session2 }),
-    ];
-
-    const created = await taskRepo.createMany(tasks);
-
-    expect(created).toHaveLength(2);
-    expect(created[0].session_id).toBe(session1);
-    expect(created[1].session_id).toBe(session2);
-  });
-
-  dbTest('should preserve all task data in bulk create', async ({ db }) => {
-    const taskRepo = new TaskRepository(db);
-    const sessionId = await createSessionWithDeps(db);
-    const tasks = [
-      createTaskData({
-        session_id: sessionId,
-        status: TaskStatus.RUNNING,
-        tool_use_count: 5,
-        git_state: { ref_at_start: 'main', sha_at_start: 'abc123' },
-      }),
-      createTaskData({
-        session_id: sessionId,
-        status: TaskStatus.COMPLETED,
-        tool_use_count: 10,
-        git_state: { ref_at_start: 'develop', sha_at_start: 'def456' },
-      }),
-    ];
-
-    const created = await taskRepo.createMany(tasks);
-
-    expect(created[0].status).toBe(TaskStatus.RUNNING);
-    expect(created[0].tool_use_count).toBe(5);
-    expect(created[0].git_state.ref_at_start).toBe('main');
-    expect(created[1].status).toBe(TaskStatus.COMPLETED);
-    expect(created[1].tool_use_count).toBe(10);
-    expect(created[1].git_state.ref_at_start).toBe('develop');
+    await expect(taskRepo.importHistorical([], 'importer')).resolves.toEqual([]);
   });
 });
 

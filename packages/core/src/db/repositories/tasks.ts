@@ -4,7 +4,14 @@
  * Type-safe CRUD operations for tasks with short ID support.
  */
 
-import type { SessionID, Task, TaskID, TaskMetadata, UUID } from '@agor/core/types';
+import type {
+  HistoricalTaskImport,
+  SessionID,
+  Task,
+  TaskID,
+  TaskMetadata,
+  UUID,
+} from '@agor/core/types';
 import {
   EXECUTING_TASK_STATUSES,
   finalizeTerminalTaskPatch,
@@ -238,17 +245,19 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     }
   }
 
-  /**
-   * Bulk create multiple tasks (for imports)
-   */
-  async createMany(taskList: Partial<Task>[]): Promise<Task[]> {
+  /** Import terminal transcript history without accepting live lifecycle state. */
+  async importHistorical(taskList: HistoricalTaskImport[], createdBy: string): Promise<Task[]> {
     try {
-      // Handle empty array
-      if (taskList.length === 0) {
-        return [];
-      }
-
-      const inserts = taskList.map((task) => this.taskToInsert(task));
+      if (taskList.length === 0) return [];
+      const inserts = taskList.map((task) => ({
+        ...this.taskToInsert({
+          ...task,
+          created_by: createdBy,
+          status: TaskStatus.COMPLETED,
+          completed_at: task.message_range.end_timestamp,
+        }),
+        created_at: new Date(task.message_range.start_timestamp),
+      }));
 
       // Bulk insert all tasks
       await insert(this.db, tasks).values(inserts).run();
@@ -267,7 +276,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       return taskIds.map((id) => this.rowToTask(rowsById.get(id) as TaskRow));
     } catch (error) {
       throw new RepositoryError(
-        `Failed to bulk create tasks: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to import tasks: ${error instanceof Error ? error.message : String(error)}`,
         error
       );
     }

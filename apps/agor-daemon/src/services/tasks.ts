@@ -24,6 +24,7 @@ import type {
   ContentBlock,
   ExecutorClaim,
   ExecutorTelemetryReport,
+  HistoricalTaskImport,
   NullableId,
   Paginated,
   QueryParams,
@@ -63,6 +64,37 @@ const COMPLETION_SIDE_EFFECT_TASK_STATUSES = new Set<Task['status']>([
   TaskStatus.FAILED,
   TaskStatus.STOPPED,
 ]);
+const HISTORICAL_TASK_IMPORT_FIELDS: ReadonlySet<keyof HistoricalTaskImport> = new Set([
+  'session_id',
+  'full_prompt',
+  'message_range',
+  'git_state',
+  'tool_use_count',
+  'model',
+]);
+
+function historicalTaskImports(data: unknown): HistoricalTaskImport[] {
+  if (!Array.isArray(data)) throw new BadRequest('Historical tasks must be an array');
+  for (const task of data) {
+    if (!task || typeof task !== 'object' || Array.isArray(task)) {
+      throw new BadRequest('Historical tasks must be objects');
+    }
+    if (
+      typeof (task as HistoricalTaskImport).session_id !== 'string' ||
+      typeof (task as HistoricalTaskImport).full_prompt !== 'string' ||
+      typeof (task as HistoricalTaskImport).tool_use_count !== 'number' ||
+      typeof (task as HistoricalTaskImport).message_range !== 'object' ||
+      typeof (task as HistoricalTaskImport).git_state !== 'object'
+    ) {
+      throw new BadRequest('Historical task fields are invalid');
+    }
+    const fields = Object.keys(task).filter(
+      (field) => !HISTORICAL_TASK_IMPORT_FIELDS.has(field as keyof HistoricalTaskImport)
+    );
+    if (fields.length) throw new Forbidden(`Historical task fields are not allowed: ${fields}`);
+  }
+  return data as HistoricalTaskImport[];
+}
 
 function isAnalyticsTerminalTaskStatus(status: Task['status'] | undefined): boolean {
   return isTerminalTaskStatus(status);
@@ -1036,48 +1068,9 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     return this.finalizeTurn(data, params);
   }
 
-  /**
-   * Custom method: Bulk create tasks (for imports)
-   */
-  async createMany(taskList: Partial<Task>[]): Promise<Task[]> {
-    return this.taskRepo.createMany(taskList);
-  }
-
-  /**
-   * Custom method: Complete a task
-   */
-  async complete(
-    id: string,
-    data: { report?: Task['report'] },
-    params?: TaskParams
-  ): Promise<Task> {
-    // duration_ms and end_timestamp are auto-computed by patch() hook
-    const completedTask = (await this.patch(
-      id,
-      {
-        status: TaskStatus.COMPLETED,
-        completed_at: new Date().toISOString(),
-        report: data.report,
-      },
-      params
-    )) as Task;
-
-    return completedTask;
-  }
-
-  /**
-   * Custom method: Fail a task
-   */
-  async fail(id: string, _data: { error?: string }, params?: TaskParams): Promise<Task> {
-    // duration_ms and end_timestamp are auto-computed by patch() hook
-    return this.patch(
-      id,
-      {
-        status: TaskStatus.FAILED,
-        completed_at: new Date().toISOString(),
-      },
-      params
-    ) as Promise<Task>;
+  /** Import transcript history through a DTO that excludes every live lifecycle field. */
+  async importHistorical(data: unknown, createdBy: string): Promise<Task[]> {
+    return this.taskRepo.importHistorical(historicalTaskImports(data), createdBy);
   }
 }
 

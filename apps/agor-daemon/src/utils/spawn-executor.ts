@@ -311,6 +311,7 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
     onSpawn,
     preparedEnv,
     preparedEnvFilePath,
+    templateVariables,
   } = options;
   const asUser = rawAsUser || undefined;
 
@@ -354,7 +355,14 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
       : prepareImpersonationEnv({ asUser, env: envWithDaemonUrl })
     : { inlineEnv: undefined, envFilePath: undefined };
 
-  const { cmd, args } = buildSpawnArgs('node', [executorPath, '--stdin'], {
+  const executorArgs = [
+    executorPath,
+    '--stdin',
+    ...(templateVariables?.executor_attempt_id
+      ? ['--executor-attempt-id', templateVariables.executor_attempt_id]
+      : []),
+  ];
+  const { cmd, args } = buildSpawnArgs('node', executorArgs, {
     asUser,
     env: asUser ? prepared.inlineEnv : undefined, // Non-secret env only; secrets are sourced from envFilePath
     envFilePath: prepared.envFilePath,

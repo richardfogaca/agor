@@ -131,13 +131,7 @@ export interface TasksServiceImpl extends Service<Task, Partial<Task>, TaskParam
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: TaskParams): Promise<Task>;
   releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
   finalizeExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
-  createMany(data: Array<Partial<Task>>): Promise<Task[]>;
-  complete(
-    id: string,
-    data: { git_state?: { sha_at_end?: string; commit_message?: string } },
-    params?: TaskParams
-  ): Promise<Task>;
-  fail(id: string, data: { error?: string }, params?: TaskParams): Promise<Task>;
+  importHistorical(data: unknown, createdBy: string): Promise<Task[]>;
   getOrphaned(params?: TaskParams): Promise<Task[]>;
   getQueuedSessionIds(params?: TaskParams): Promise<SessionID[]>;
 }

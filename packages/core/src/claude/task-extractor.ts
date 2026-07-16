@@ -4,31 +4,7 @@
  * Converts user messages into Task records with message ranges.
  */
 
-import { generateId } from '../lib/ids';
-import type { Message, SessionID, Task, UUID } from '../types';
-import { TaskStatus } from '../types';
-
-export interface ExtractedTask {
-  task_id: string;
-  session_id: SessionID;
-  full_prompt: string;
-  description: string;
-  status: typeof TaskStatus.COMPLETED;
-  message_range: {
-    start_index: number;
-    end_index: number;
-    start_timestamp: string;
-    end_timestamp?: string;
-  };
-  git_state: {
-    ref_at_start: string;
-    sha_at_start: string;
-  };
-  model?: string;
-  tool_use_count: number;
-  created_at: string;
-  completed_at?: string;
-}
+import type { HistoricalTaskImport, Message, SessionID } from '../types';
 
 /**
  * Extract tasks from conversation messages
@@ -37,8 +13,8 @@ export interface ExtractedTask {
 export function extractTasksFromMessages(
   messages: Message[],
   sessionId: SessionID
-): Partial<Task>[] {
-  const tasks: Partial<Task>[] = [];
+): HistoricalTaskImport[] {
+  const tasks: HistoricalTaskImport[] = [];
 
   // Find all user messages (these become task boundaries)
   const userMessageIndices = messages
@@ -89,10 +65,8 @@ export function extractTasksFromMessages(
 
     // Create task
     tasks.push({
-      task_id: generateId() as UUID,
       session_id: sessionId,
       full_prompt: fullPrompt,
-      status: TaskStatus.COMPLETED, // Imported sessions are historical
       message_range: {
         start_index: startIndex,
         end_index: endIndex,
@@ -105,8 +79,6 @@ export function extractTasksFromMessages(
       },
       ...(model ? { model } : {}),
       tool_use_count: toolUseCount,
-      created_at: startTimestamp,
-      completed_at: endTimestamp,
     });
   }
 

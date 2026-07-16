@@ -2291,54 +2291,38 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   );
 
   // ============================================================================
-  // Tasks custom routes
+  // Historical task import
   // ============================================================================
 
   registerAuthenticatedRoute(
     app,
-    '/tasks/bulk',
+    '/tasks/import',
     {
       async create(data: unknown, params: RouteParams) {
-        return tasksService.createMany(data as Partial<Task>[]);
+        if (!Array.isArray(data) || !data.length) return [];
+        const sessionIds = new Set(
+          data.map((task) =>
+            task && typeof task === 'object' && !Array.isArray(task)
+              ? String((task as { session_id?: unknown }).session_id ?? '')
+              : ''
+          )
+        );
+        if (sessionIds.size !== 1 || sessionIds.has('')) {
+          throw new BadRequest('Historical tasks must belong to one session');
+        }
+        const user = params.user;
+        if (!user?.user_id) throw new NotAuthenticated('Authentication required');
+        if (isServiceAccountRoute(params)) throw new Forbidden('Executors cannot import tasks');
+        const session = await sessionsService.get([...sessionIds][0], params);
+        checkSessionOwnerOrAdmin(user, session, superadminOpts);
+        if (session.status !== SessionStatus.COMPLETED) {
+          throw new Conflict('Historical tasks can only be imported into completed sessions');
+        }
+        return tasksService.importHistorical(data, user.user_id);
       },
     },
     {
-      create: { role: ROLES.MEMBER, action: 'create tasks' },
-    },
-    requireAuth
-  );
-
-  registerAuthenticatedRoute(
-    app,
-    '/tasks/:id/complete',
-    {
-      async create(
-        data: { git_state?: { sha_at_end?: string; commit_message?: string } },
-        params: RouteParams
-      ) {
-        const id = params.route?.id;
-        if (!id) throw new Error('Task ID required');
-        return tasksService.complete(id, data, params);
-      },
-    },
-    {
-      create: { role: ROLES.MEMBER, action: 'complete tasks' },
-    },
-    requireAuth
-  );
-
-  registerAuthenticatedRoute(
-    app,
-    '/tasks/:id/fail',
-    {
-      async create(data: { error?: string }, params: RouteParams) {
-        const id = params.route?.id;
-        if (!id) throw new Error('Task ID required');
-        return tasksService.fail(id, data, params);
-      },
-    },
-    {
-      create: { role: ROLES.MEMBER, action: 'fail tasks' },
+      create: { role: ROLES.MEMBER, action: 'import tasks' },
     },
     requireAuth
   );
