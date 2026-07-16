@@ -10,7 +10,7 @@ const GRACE_MS = 3_000;
 const FORCE_MS = 1_000;
 const POLL_MS = 50;
 const STOP_COMMAND_TIMEOUT_MS = 10_000;
-const trackedPids = new Map<string, number>();
+const trackedProcesses = new Map<string, { pid: number; exited: boolean }>();
 const execFileAsync = promisify(execFile);
 const CROSS_USER_MARKER_SCAN = [
   'set -eu',
@@ -33,7 +33,12 @@ function asUser(command: string, args: string[], unixUser: string) {
 }
 
 export function trackExecutorProcess(attemptId: string, pid: number): void {
-  trackedPids.set(attemptId, pid);
+  trackedProcesses.set(attemptId, { pid, exited: false });
+}
+
+export function markExecutorProcessExited(attemptId: string): void {
+  const tracked = trackedProcesses.get(attemptId);
+  if (tracked) tracked.exited = true;
 }
 
 export async function stopTemplatedExecutor(command: string): Promise<void> {
@@ -168,12 +173,16 @@ async function ownedPids(
   rootPid?: number,
   crossUser?: CrossUserIdentity
 ): Promise<number[]> {
-  const tracked = trackedPids.has(attemptId);
+  const tracked = trackedProcesses.get(attemptId);
   const roots = rootPid
     ? process.platform === 'win32'
-      ? [rootPid]
+      ? tracked?.exited
+        ? []
+        : [rootPid]
       : tracked
-        ? [rootPid, -rootPid]
+        ? tracked.exited
+          ? [-rootPid]
+          : [rootPid, -rootPid]
         : process.platform === 'linux'
           ? []
           : [-rootPid]
@@ -207,11 +216,15 @@ export async function ensureExecutorWorkloadStopped(
   attemptId: string,
   workload?: ExecutorWorkloadRef
 ): Promise<void> {
-  const rootPid = trackedPids.get(attemptId) ?? workload?.pid;
+  const tracked = trackedProcesses.get(attemptId);
+  if (!tracked && workload?.pid && process.platform !== 'linux') {
+    throw new Error(`Cannot verify executor workload ${attemptId} after restart on this platform`);
+  }
+  const rootPid = tracked?.pid ?? workload?.pid;
   const crossUser = crossUserIdentity(workload);
   const graceful = await ownedPids(attemptId, rootPid, crossUser);
   if (!graceful.some(isAlive)) {
-    trackedPids.delete(attemptId);
+    trackedProcesses.delete(attemptId);
     return;
   }
 
@@ -226,5 +239,5 @@ export async function ensureExecutorWorkloadStopped(
       throw new Error(`Executor workload for attempt ${attemptId} is still alive`);
     }
   }
-  trackedPids.delete(attemptId);
+  trackedProcesses.delete(attemptId);
 }

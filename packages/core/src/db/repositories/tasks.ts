@@ -7,6 +7,7 @@
 import type { SessionID, Task, TaskID, TaskMetadata, UUID } from '@agor/core/types';
 import {
   EXECUTING_TASK_STATUSES,
+  finalizeTerminalTaskPatch,
   isTaskTurnHolding,
   isTerminalTaskStatus,
   SessionStatus,
@@ -515,22 +516,25 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         const current = await this.loadLockedTask(db, row.task_id);
         if (!isTaskTurnHolding(current)) return { task: null, transitioned: false };
 
-        const transitioned =
-          !isTerminalTaskStatus(current.status) && current.status !== TaskStatus.STOPPING;
-        const task = isTerminalTaskStatus(current.status)
-          ? current
-          : { ...current, status: TaskStatus.STOPPING };
+        const transitioned = !isTerminalTaskStatus(current.status);
+        const task: Task = transitioned
+          ? {
+              ...current,
+              ...finalizeTerminalTaskPatch(current, { status: TaskStatus.STOPPED }),
+            }
+          : current;
         if (transitioned) {
+          const data = this.taskToInsert(task);
           await update(db, tasks)
-            .set({ status: TaskStatus.STOPPING })
+            .set({ status: data.status, completed_at: data.completed_at, data: data.data })
             .where(eq(tasks.task_id, task.task_id))
             .run();
         }
 
         await update(db, sessions)
           .set({
-            status: SessionStatus.STOPPING,
-            ready_for_prompt: false,
+            status: task.executor_attempt ? SessionStatus.STOPPING : SessionStatus.IDLE,
+            ready_for_prompt: !task.executor_attempt,
             updated_at: new Date(),
           })
           .where(eq(sessions.session_id, sessionId))

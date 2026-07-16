@@ -1,3 +1,4 @@
+import { tenantDatabaseScope } from '@agor/core/db';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -83,6 +84,17 @@ describe('executor turn finalizer', () => {
     expect(mocks.pushSessionState.mock.invocationCallOrder[0]).toBeLessThan(
       releaseExecutorTurn.mock.invocationCallOrder[0]
     );
+  });
+
+  it('rejects process cleanup inside a database transaction', async () => {
+    const { finalizer, services } = setup(false);
+
+    await expect(
+      tenantDatabaseScope.run({ db: {} as never, kind: 'tenant', tenantId: 'tenant-1' }, () =>
+        finalizer({ task_id: 'task-1', executor_attempt_id: 'attempt-1' })
+      )
+    ).rejects.toThrow('Executor finalization must run outside a database transaction');
+    expect(services.tasks.get).not.toHaveBeenCalled();
   });
 
   it('does not release when required persistence fails', async () => {

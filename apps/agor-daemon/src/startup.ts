@@ -15,6 +15,7 @@ import {
 } from '@agor/core/config';
 import {
   MessagesRepository,
+  runWithTenantContext,
   runWithTenantDatabaseScope,
   SessionRepository,
   shortId,
@@ -142,6 +143,10 @@ async function runStartupTenantDatabaseScope<T>(
   return runWithTenantDatabaseScope(ctx.db, startupTenantParams(ctx.config).tenant.tenant_id, work);
 }
 
+function runStartupTenantContext<T>(ctx: Pick<StartupContext, 'config'>, work: () => T): T {
+  return runWithTenantContext(startupTenantParams(ctx.config).tenant.tenant_id, work);
+}
+
 interface OrphanCleanupResult {
   wasGraceful: boolean;
   orphanedTasks: Task[];
@@ -150,7 +155,7 @@ interface OrphanCleanupResult {
 }
 
 export async function cleanupOrphanStatuses(ctx: StartupContext): Promise<OrphanCleanupResult> {
-  return runStartupTenantDatabaseScope(ctx, () => cleanupOrphanStatusesInTenantScope(ctx));
+  return runStartupTenantContext(ctx, () => cleanupOrphanStatusesInTenantScope(ctx));
 }
 
 async function cleanupOrphanStatusesInTenantScope(
@@ -596,7 +601,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
   const heartbeatSupervisor = new ExecutorHeartbeatSupervisor({
     app,
     config: heartbeatConfig,
-    runInTenantScope: (work) => runStartupTenantDatabaseScope(ctx, work),
+    runInTenantScope: (work) => runStartupTenantContext(ctx, work),
   });
   heartbeatSupervisor.start();
   if (heartbeatConfig.enabled) {
@@ -604,7 +609,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
       `💓 Executor heartbeat supervisor started (interval: ${heartbeatConfig.interval_ms}ms, stale after: ${heartbeatConfig.stale_after_ms}ms)`
     );
   } else {
-    console.log('💓 Executor heartbeat disabled');
+    console.log('💓 Executor reconciliation started (active heartbeat monitoring disabled)');
   }
 
   // 6. Start scheduler service (background worker)

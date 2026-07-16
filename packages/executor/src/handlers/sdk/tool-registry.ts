@@ -7,7 +7,7 @@
 
 import type { MessageSource, PermissionMode, SessionID, TaskID } from '@agor/core/types';
 import { TOOL_API_KEY_NAMES } from '@agor/core/types';
-import type { ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
+import type { ExecutorRuntime } from '../../executor-heartbeat.js';
 import type { ResolvedConfigSlice } from '../../payload-types.js';
 import type { AgorClient } from '../../services/feathers-client.js';
 
@@ -29,7 +29,7 @@ export type ToolRunner = (params: {
   messageSource?: MessageSource;
   /** Daemon-resolved config slice. Undefined in legacy CLI mode. */
   resolvedConfig?: ResolvedConfigSlice;
-  runtime?: ExecutorRuntimeObserver;
+  runtime?: ExecutorRuntime;
 }) => Promise<void>;
 
 /**
@@ -106,7 +106,7 @@ export class ToolRegistry {
       abortController: AbortController;
       messageSource?: MessageSource;
       resolvedConfig?: ResolvedConfigSlice;
-      runtime?: ExecutorRuntimeObserver;
+      runtime?: ExecutorRuntime;
     }
   ): Promise<void> {
     const config = ToolRegistry.get(tool);

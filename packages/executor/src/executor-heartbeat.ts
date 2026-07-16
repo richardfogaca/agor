@@ -16,20 +16,18 @@ export interface ExecutorRuntimeObserver {
   observe(kind: ExecutorPulseKind, id?: string): void;
 }
 
-export interface ExecutorHeartbeatHandle extends ExecutorRuntimeObserver {
-  flush(): Promise<void>;
+export interface ExecutorRuntime extends ExecutorRuntimeObserver {
+  finish(): Promise<void>;
   stop(): void;
 }
 
 const DEFAULT_INTERVAL_MS = 10_000;
 const DEFAULT_STALE_AFTER_MS = 30_000;
 
-export function startExecutorRuntimeOverseer(
-  options: ExecutorHeartbeatOptions
-): ExecutorHeartbeatHandle {
+export function startExecutorRuntimeOverseer(options: ExecutorHeartbeatOptions): ExecutorRuntime {
   const enabled = options.enabled ?? true;
   if (!enabled) {
-    return { observe() {}, async flush() {}, stop() {} };
+    return { observe() {}, async finish() {}, stop() {} };
   }
 
   const intervalMs =
@@ -110,7 +108,11 @@ export function startExecutorRuntimeOverseer(
     observe(kind, id) {
       pulse = { kind, ...(id ? { id } : {}) };
     },
-    flush: emit,
+    async finish() {
+      await emit();
+      stopped = true;
+      if (timer) clearInterval(timer);
+    },
     stop() {
       stopped = true;
       if (timer) clearInterval(timer);

@@ -172,38 +172,13 @@ describe('ExecutorHeartbeatSupervisor', () => {
     });
   });
 
-  it('waits for a fresh terminal attempt to exit before finalizing', async () => {
+  it('reconciles terminal attempts immediately when heartbeat monitoring is disabled', async () => {
+    vi.useFakeTimers();
     const task = {
       task_id: '018f0000-0000-7000-8000-000000000021',
       session_id: '018f0000-0000-7000-8000-000000000022',
       status: 'completed',
       completed_at: '2026-01-01T00:00:04.500Z',
-      executor_attempt: { id: 'attempt-3' },
-    };
-    const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
-    const app = {
-      service: () => ({
-        getOrphaned: vi.fn().mockResolvedValue([task]),
-        finalizeExecutorTurn,
-      }),
-    } as any;
-    const supervisor = new ExecutorHeartbeatSupervisor({
-      app,
-      config,
-      now: () => new Date('2026-01-01T00:00:05.000Z'),
-    });
-
-    await supervisor.checkOnce();
-
-    expect(finalizeExecutorTurn).not.toHaveBeenCalled();
-  });
-
-  it('releases a terminal turn after its executor lease becomes stale', async () => {
-    const task = {
-      task_id: '018f0000-0000-7000-8000-000000000021',
-      session_id: '018f0000-0000-7000-8000-000000000022',
-      status: 'completed',
-      completed_at: '2026-01-01T00:00:00.000Z',
       executor_attempt: { id: 'attempt-3' },
     };
     const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
@@ -216,16 +191,49 @@ describe('ExecutorHeartbeatSupervisor', () => {
     } as any;
     const supervisor = new ExecutorHeartbeatSupervisor({
       app,
-      config,
+      config: { ...config, enabled: false },
+      tickIntervalMs: 1,
       now: () => new Date('2026-01-01T00:00:05.000Z'),
     });
 
-    await supervisor.checkOnce();
+    supervisor.start();
+    await vi.advanceTimersByTimeAsync(1);
+    supervisor.stop();
+    vi.useRealTimers();
 
     expect(finalizeExecutorTurn).toHaveBeenCalledWith({
       task_id: task.task_id,
       executor_attempt_id: 'attempt-3',
     });
+  });
+
+  it('does not expire active attempts when heartbeat monitoring is disabled', async () => {
+    const task = {
+      task_id: '018f0000-0000-7000-8000-000000000021',
+      session_id: '018f0000-0000-7000-8000-000000000022',
+      status: 'running',
+      last_executor_heartbeat_at: '2026-01-01T00:00:00.000Z',
+      executor_attempt: { id: 'attempt-3' },
+    };
+    const patch = vi.fn();
+    const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
+    const app = {
+      service: () => ({
+        getOrphaned: vi.fn().mockResolvedValue([task]),
+        patch,
+        finalizeExecutorTurn,
+      }),
+    } as any;
+    const supervisor = new ExecutorHeartbeatSupervisor({
+      app,
+      config: { ...config, enabled: false },
+      now: () => new Date('2026-01-01T00:00:05.000Z'),
+    });
+
+    await supervisor.checkOnce();
+
+    expect(patch).not.toHaveBeenCalled();
+    expect(finalizeExecutorTurn).not.toHaveBeenCalled();
   });
 
   it('does not let one fenced turn starve later retries', async () => {

@@ -207,9 +207,14 @@ describe('executeToolTask failure finalization', () => {
             throw new Error('expected failure');
           }),
         }),
+        runtime: {
+          observe: vi.fn(),
+          finish: vi.fn(async () => calls.push('runtime-finished')),
+          stop: vi.fn(),
+        },
       })
     ).rejects.toThrow('expected failure');
 
-    expect(calls).toEqual(['message', 'terminal']);
+    expect(calls).toEqual(['message', 'runtime-finished', 'terminal']);
   });
 });

@@ -51,7 +51,7 @@ describe('startExecutorRuntimeOverseer', () => {
     }
   });
 
-  it('coalesces semantic progress and flushes the latest pulse', async () => {
+  it('flushes the latest pulse before finishing the runtime', async () => {
     const reportExecutorTelemetry = vi.fn().mockResolvedValue({});
     const client = { service: () => ({ reportExecutorTelemetry }) } as any;
     const handle = startExecutorRuntimeOverseer({
@@ -64,7 +64,7 @@ describe('startExecutorRuntimeOverseer', () => {
 
     handle.observe('assistant.stream', 'message-1');
     handle.observe('thinking.progress', 'message-2');
-    await handle.flush();
+    await handle.finish();
 
     expect(reportExecutorTelemetry).toHaveBeenLastCalledWith({
       task_id: 'task-1',
@@ -72,7 +72,6 @@ describe('startExecutorRuntimeOverseer', () => {
       heartbeat: true,
       pulse: { kind: 'thinking.progress', id: 'message-2' },
     });
-    handle.stop();
   });
 
   it('abandons the lease immediately when the attempt is rejected', async () => {

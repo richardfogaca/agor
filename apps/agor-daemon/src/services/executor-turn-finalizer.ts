@@ -1,5 +1,10 @@
 import type { AgorConfig } from '@agor/core/config';
-import { TaskRepository, type TenantScopeAwareDatabase } from '@agor/core/db';
+import {
+  bindRepositoryToTenantUnitOfWork,
+  getCurrentTenantDatabase,
+  TaskRepository,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
 import type { ExecutorClaim, Params, Task } from '@agor/core/types';
 import { ExecutorWorkloadKind, isTerminalTaskStatus, TaskStatus } from '@agor/core/types';
 import {
@@ -27,10 +32,13 @@ export function createExecutorTurnFinalizer(options: {
   db: TenantScopeAwareDatabase;
   config: AgorConfig;
 }): ExecutorTurnFinalizer {
-  const attemptRepo = new TaskRepository(options.db);
+  const attemptRepo = bindRepositoryToTenantUnitOfWork(options.db, new TaskRepository(options.db));
   const active = new Map<string, Promise<Task>>();
 
   const finalize: ExecutorTurnFinalizer = async (claim, params) => {
+    if (getCurrentTenantDatabase()) {
+      throw new Error('Executor finalization must run outside a database transaction');
+    }
     const internalParams = daemonParams(params);
     const tasks = options.app.service('tasks') as unknown as TasksServiceImpl;
     const task = await tasks.get(claim.task_id, internalParams);

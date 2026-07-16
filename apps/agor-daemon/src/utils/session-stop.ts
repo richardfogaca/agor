@@ -1,11 +1,6 @@
 import { shortId, type TaskRepository } from '@agor/core/db';
 import type { Params, SessionID } from '@agor/core/types';
-import {
-  isSessionExecuting,
-  isTerminalTaskStatus,
-  SessionStatus,
-  TaskStatus,
-} from '@agor/core/types';
+import { isSessionExecuting, SessionStatus } from '@agor/core/types';
 import type { SessionsServiceImpl, TasksServiceImpl } from '../declarations.js';
 
 export interface StopSessionResult {
@@ -19,7 +14,7 @@ export interface StopSessionResult {
 export interface StopSessionDeps {
   taskRepo: Pick<TaskRepository, 'findQueued'>;
   sessionsService: Pick<SessionsServiceImpl, 'get'>;
-  tasksService: Pick<TasksServiceImpl, 'patch' | 'reserveExecutorStop' | 'finalizeExecutorTurn'>;
+  tasksService: Pick<TasksServiceImpl, 'reserveExecutorStop' | 'finalizeExecutorTurn'>;
 }
 
 /**
@@ -63,17 +58,6 @@ export async function stopSessionPreserveQueue(
     `🛑 [Stop] Stopping task ${shortId(latestTask.task_id)} for session ${shortId(sessionId)}${options.reason ? ` (reason: ${options.reason})` : ''}`
   );
   const internalParams = { ...params, provider: undefined };
-
-  if (!isTerminalTaskStatus(latestTask.status)) {
-    await deps.tasksService.patch(
-      latestTask.task_id,
-      {
-        status: TaskStatus.STOPPED,
-        completed_at: new Date().toISOString(),
-      },
-      internalParams
-    );
-  }
 
   if (latestTask.executor_attempt) {
     try {

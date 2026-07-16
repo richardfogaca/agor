@@ -24,7 +24,7 @@ import type {
 } from '@agor/core/types';
 import { ExecutorPulseKind, MessageRole, PROVIDER_CREDENTIAL_FIELDS } from '@agor/core/types';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
-import type { ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
+import type { ExecutorRuntime, ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
 import { getCurrentBranch, getGitState } from '../../git/index.js';
 import type { StreamingCallbacks } from '../../sdk-handlers/base/types.js';
 import { normalizeRawSdkResponse } from '../../sdk-handlers/normalizer-factory.js';
@@ -461,7 +461,7 @@ export async function executeToolTask(params: {
   }
 
   // Create execution context
-  const runtime = (params as typeof params & { runtime?: ExecutorRuntimeObserver }).runtime;
+  const runtime = (params as typeof params & { runtime?: ExecutorRuntime }).runtime;
   const ctx = createExecutionContext(client, toolName, sessionId, runtime);
 
   // Create tool instance using factory function
@@ -616,6 +616,7 @@ export async function executeToolTask(params: {
     // Update task status to completed/stopped with git SHA and SDK responses
     // Note: The stop endpoint may have already patched task to STOPPED via process kill.
     // The tasks.ts patch hook guards against double-updates (wasAlreadyTerminal check).
+    await runtime?.finish();
     await client.service('tasks').patch(taskId, patchData);
   } catch (error) {
     const err = error as Error;
@@ -671,6 +672,7 @@ export async function executeToolTask(params: {
       console.error(`[${toolName}] Failed to create error message:`, msgErr);
     }
 
+    await runtime?.finish();
     await client.service('tasks').patch(taskId, patchData);
 
     throw err;

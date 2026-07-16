@@ -7,7 +7,7 @@ describe('stopSessionPreserveQueue', () => {
     const runningTask = {
       task_id: 'task-running',
       session_id: sessionId,
-      status: 'running',
+      status: 'stopped',
       created_at: '2026-01-01T00:00:00.000Z',
       started_at: '2026-01-01T00:00:00.000Z',
       executor_attempt: { id: 'attempt-1' },
@@ -29,7 +29,6 @@ describe('stopSessionPreserveQueue', () => {
     };
     const tasksService = {
       reserveExecutorStop: vi.fn(async () => runningTask),
-      patch: vi.fn(async (id, data) => ({ task_id: id, ...data })),
       finalizeExecutorTurn: vi.fn(async () => runningTask),
     };
     const taskRepo = {
@@ -59,15 +58,6 @@ describe('stopSessionPreserveQueue', () => {
       { task_id: runningTask.task_id, executor_attempt_id: 'attempt-1' },
       internalParams
     );
-    expect(tasksService.patch).toHaveBeenCalledTimes(1);
-    expect(tasksService.patch.mock.invocationCallOrder[0]).toBeLessThan(
-      tasksService.finalizeExecutorTurn.mock.invocationCallOrder[0]
-    );
-    expect(tasksService.patch).toHaveBeenCalledWith(
-      runningTask.task_id,
-      expect.objectContaining({ status: 'stopped' }),
-      internalParams
-    );
     expect(tasksService.reserveExecutorStop).toHaveBeenCalledWith(sessionId, params);
   });
 
@@ -76,7 +66,7 @@ describe('stopSessionPreserveQueue', () => {
     const awaitingInputTask = {
       task_id: 'task-awaiting-input',
       session_id: sessionId,
-      status: 'awaiting_input',
+      status: 'stopped',
       created_at: '2026-01-01T00:00:00.000Z',
       started_at: '2026-01-01T00:00:00.000Z',
       executor_attempt: { id: 'attempt-2' },
@@ -91,7 +81,6 @@ describe('stopSessionPreserveQueue', () => {
     };
     const tasksService = {
       reserveExecutorStop: vi.fn(async () => awaitingInputTask),
-      patch: vi.fn(async (id, data) => ({ task_id: id, ...data })),
       finalizeExecutorTurn: vi.fn(async () => awaitingInputTask),
     };
     const taskRepo = {
@@ -119,11 +108,6 @@ describe('stopSessionPreserveQueue', () => {
       { task_id: awaitingInputTask.task_id, executor_attempt_id: 'attempt-2' },
       { provider: undefined }
     );
-    expect(tasksService.patch).toHaveBeenCalledWith(
-      awaitingInputTask.task_id,
-      expect.objectContaining({ status: 'stopped' }),
-      { provider: undefined }
-    );
   });
 
   it('does not overwrite a terminal task that is still releasing its executor', async () => {
@@ -145,7 +129,6 @@ describe('stopSessionPreserveQueue', () => {
     };
     const tasksService = {
       reserveExecutorStop: vi.fn(async () => completedTask),
-      patch: vi.fn(),
       finalizeExecutorTurn: vi.fn(async () => completedTask),
     };
 
@@ -163,7 +146,6 @@ describe('stopSessionPreserveQueue', () => {
       { task_id: completedTask.task_id, executor_attempt_id: 'attempt-3' },
       { provider: undefined }
     );
-    expect(tasksService.patch).not.toHaveBeenCalled();
   });
 
   it('keeps a stopped turn fenced for supervisor retry when finalization fails', async () => {
@@ -181,7 +163,6 @@ describe('stopSessionPreserveQueue', () => {
         sessionsService: { get: vi.fn(async () => ({ status: 'running' })) } as never,
         tasksService: {
           reserveExecutorStop: vi.fn(async () => task),
-          patch: vi.fn(async () => task),
           finalizeExecutorTurn: vi.fn(async () => {
             throw new Error('cleanup pending');
           }),
@@ -219,7 +200,6 @@ describe('stopSessionPreserveQueue', () => {
       reserveExecutorStop: vi.fn(async () => {
         throw new Error('reservation denied');
       }),
-      patch: vi.fn(async (id, data) => ({ task_id: id, ...data })),
       finalizeExecutorTurn: vi.fn(),
     };
     const taskRepo = {
@@ -238,39 +218,6 @@ describe('stopSessionPreserveQueue', () => {
       )
     ).rejects.toThrow('reservation denied');
 
-    expect(tasksService.patch).not.toHaveBeenCalled();
     expect(tasksService.finalizeExecutorTurn).not.toHaveBeenCalled();
-  });
-
-  it('does not signal the executor if persisting the stopped task fails', async () => {
-    const sessionId = 'session-task-patch-fails';
-    const runningTask = {
-      task_id: 'task-running',
-      session_id: sessionId,
-      status: 'running',
-      created_at: '2026-01-01T00:00:00.000Z',
-    };
-    const finalizeExecutorTurn = vi.fn();
-
-    await expect(
-      stopSessionPreserveQueue(
-        {
-          taskRepo: { findQueued: vi.fn(async () => []) } as never,
-          sessionsService: {
-            get: vi.fn(async () => ({ status: 'running' })),
-          } as never,
-          tasksService: {
-            reserveExecutorStop: vi.fn(async () => runningTask),
-            patch: vi.fn(async () => {
-              throw new Error('task patch denied');
-            }),
-            finalizeExecutorTurn,
-          } as never,
-        },
-        sessionId as never
-      )
-    ).rejects.toThrow('task patch denied');
-
-    expect(finalizeExecutorTurn).not.toHaveBeenCalled();
   });
 });

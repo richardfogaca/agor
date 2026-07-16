@@ -1990,7 +1990,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Stop endpoint
   // ============================================================================
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/sessions/:id/stop',
     {
@@ -2006,7 +2006,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         return stopSessionPreserveQueue(
           {
-            taskRepo: new TaskRepository(db),
+            taskRepo: bindRepositoryToTenantUnitOfWork(db, new TaskRepository(db)),
             sessionsService: sessionsServiceWithHooks,
             tasksService,
           },

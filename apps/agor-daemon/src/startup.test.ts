@@ -1,4 +1,8 @@
-import { createTenantScopedDatabaseProxy, MissingTenantDatabaseScopeError } from '@agor/core/db';
+import {
+  createTenantScopedDatabaseProxy,
+  getCurrentTenantId,
+  MissingTenantDatabaseScopeError,
+} from '@agor/core/db';
 import type { Session, Task } from '@agor/core/types';
 import { SessionStatus, TaskStatus } from '@agor/core/types';
 import { describe, expect, it, vi } from 'vitest';
@@ -28,7 +32,8 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
     requireScope: true,
     label: 'startup test db',
   });
-  const touchDb = () => (db as unknown as { marker(): string }).marker();
+  const tenantIds: Array<string | undefined> = [];
+  const touchDb = () => tenantIds.push(getCurrentTenantId());
 
   const tasksService = {
     getOrphaned: vi.fn(async () => {
@@ -104,7 +109,7 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
     terminalsService: null,
   } as unknown as StartupContext;
 
-  return { ctx, baseDb, tasksService, sessionsService };
+  return { ctx, baseDb, tasksService, sessionsService, tenantIds };
 }
 
 function makeTask(overrides: Partial<Task>): Task {
@@ -145,14 +150,16 @@ describe('startup tenant database scope', () => {
     );
   });
 
-  it('runs orphan cleanup inside an explicit startup tenant DB scope', async () => {
-    const { ctx, baseDb } = makeStartupContextWithGuardedDb();
+  it('runs orphan cleanup with tenant identity and no long-lived DB scope', async () => {
+    const { ctx, baseDb, tenantIds } = makeStartupContextWithGuardedDb();
 
     await expect(cleanupOrphanStatuses(ctx)).resolves.toMatchObject({
       orphanedTasks: [],
       orphanedSessions: [],
     });
-    expect(baseDb.marker).toHaveBeenCalled();
+    expect(tenantIds).not.toHaveLength(0);
+    expect(new Set(tenantIds)).toEqual(new Set(['startup-tenant']));
+    expect(baseDb.marker).not.toHaveBeenCalled();
   });
 
   it('releases interrupted executor turns without draining before listen', async () => {

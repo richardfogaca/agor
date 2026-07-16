@@ -1485,19 +1485,20 @@ describe('TaskRepository executor turn transitions', () => {
     });
 
     const reserved = await tasks.reserveExecutorStop(sessionId);
-    expect(reserved.task?.status).toBe(TaskStatus.STOPPING);
+    expect(reserved.task).toMatchObject({ status: TaskStatus.STOPPED });
+    expect(reserved.task?.completed_at).toBeDefined();
     expect(reserved.transitioned).toBe(true);
     expect(
       await tasks.patchExecutorAttempt(task.task_id, attemptId, {
         workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
       })
-    ).toMatchObject({ status: TaskStatus.STOPPING });
+    ).toMatchObject({ status: TaskStatus.STOPPED });
     expect(await tasks.connectExecutor(task.task_id, attemptId)).toBeNull();
     expect(
       await tasks.transitionExecutorRuntime(task.task_id, attemptId, TaskStatus.AWAITING_PERMISSION)
     ).toBeNull();
     await expect(tasks.update(task.task_id, { status: TaskStatus.COMPLETED })).rejects.toThrow(
-      /stopping tasks/
+      /terminal task status/
     );
     expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.STOPPING);
   });

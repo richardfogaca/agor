@@ -11,7 +11,6 @@ const MAX_SUPERVISOR_TICK_MS = 30_000;
 
 function executorLeaseAgeMs(task: Task, nowMs: number): number | undefined {
   const observedAt =
-    (isTerminalTaskStatus(task.status) ? task.completed_at : undefined) ??
     task.last_executor_heartbeat_at ??
     task.executor_connected_at ??
     task.started_at ??
@@ -41,7 +40,7 @@ export class ExecutorHeartbeatSupervisor {
   }
 
   start(): void {
-    if (!this.options.config.enabled || this.timer) return;
+    if (this.timer) return;
     this.timer = setInterval(() => {
       void this.checkOnce();
     }, this.tickIntervalMs);
@@ -68,8 +67,12 @@ export class ExecutorHeartbeatSupervisor {
       for (const task of tasks) {
         const attempt = task.executor_attempt;
         if (!attempt || attempt.released_at) continue;
-        const ageMs = executorLeaseAgeMs(task, nowMs);
-        if (ageMs === undefined || ageMs <= this.options.config.stale_after_ms) continue;
+        const terminal = isTerminalTaskStatus(task.status);
+        if (!terminal) {
+          if (!this.options.config.enabled) continue;
+          const ageMs = executorLeaseAgeMs(task, nowMs);
+          if (ageMs === undefined || ageMs <= this.options.config.stale_after_ms) continue;
+        }
 
         try {
           const current = await tasksService.get(task.task_id);
@@ -80,12 +83,11 @@ export class ExecutorHeartbeatSupervisor {
           ) {
             continue;
           }
-          const currentAgeMs = executorLeaseAgeMs(current, nowMs);
-          if (currentAgeMs === undefined || currentAgeMs <= this.options.config.stale_after_ms) {
-            continue;
-          }
-
           if (!isTerminalTaskStatus(current.status)) {
+            const currentAgeMs = executorLeaseAgeMs(current, nowMs);
+            if (currentAgeMs === undefined || currentAgeMs <= this.options.config.stale_after_ms) {
+              continue;
+            }
             if (current.status === TaskStatus.STOPPING) {
               await tasksService.patch(task.task_id, {
                 status: TaskStatus.STOPPED,
@@ -103,14 +105,12 @@ export class ExecutorHeartbeatSupervisor {
             }
           }
 
-          // Process exit is the normal finalization signal. This path only
-          // recovers attempts whose executor lease went stale.
           await tasksService.finalizeExecutorTurn({
             task_id: task.task_id,
             executor_attempt_id: attempt.id,
           });
           console.warn(
-            `[executor-heartbeat] Reconciled stale task ${shortId(task.task_id)} (${currentAgeMs}ms old)`
+            `[executor-heartbeat] Reconciled ${terminal ? 'terminal' : 'stale'} task ${shortId(task.task_id)}`
           );
         } catch (error) {
           console.warn(

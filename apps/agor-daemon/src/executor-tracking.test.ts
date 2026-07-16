@@ -6,6 +6,7 @@ import {
   EXECUTOR_ATTEMPT_ENV_VAR,
   ensureExecutorWorkloadStopped,
   stopTemplatedExecutor,
+  trackExecutorProcess,
 } from './executor-tracking.js';
 
 const CROSS_USER = 'nobody';
@@ -21,7 +22,7 @@ const CAN_RUN_CROSS_USER_TEST = (() => {
 })();
 
 describe.skipIf(process.platform === 'win32')('executor workload cleanup', () => {
-  it('recovers and verifies a detached attempt from its persisted identity', async () => {
+  it('stops a process tracked by the current daemon', async () => {
     const attemptId = `attempt-${process.pid}-${Date.now()}`;
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       detached: true,
@@ -30,6 +31,7 @@ describe.skipIf(process.platform === 'win32')('executor workload cleanup', () =>
     });
     await once(child, 'spawn');
     expect(child.pid).toBeDefined();
+    trackExecutorProcess(attemptId, child.pid!);
 
     try {
       await ensureExecutorWorkloadStopped(attemptId, { kind: 'local', pid: child.pid! });
@@ -42,6 +44,53 @@ describe.skipIf(process.platform === 'win32')('executor workload cleanup', () =>
       }
     }
   });
+
+  it.skipIf(process.platform !== 'linux')(
+    'recovers a detached attempt from its persisted Linux marker',
+    async () => {
+      const attemptId = `attempt-recovery-${process.pid}-${Date.now()}`;
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, [EXECUTOR_ATTEMPT_ENV_VAR]: attemptId },
+      });
+      await once(child, 'spawn');
+
+      try {
+        await ensureExecutorWorkloadStopped(attemptId, { kind: 'local', pid: child.pid! });
+        expect(() => process.kill(child.pid!, 0)).toThrow();
+      } finally {
+        try {
+          process.kill(-child.pid!, 'SIGKILL');
+        } catch {
+          // Already verified gone.
+        }
+      }
+    }
+  );
+
+  it.skipIf(process.platform === 'linux')(
+    'fails closed instead of signaling an unverified persisted process',
+    async () => {
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      await once(child, 'spawn');
+
+      try {
+        await expect(
+          ensureExecutorWorkloadStopped('unverified-attempt', {
+            kind: 'local',
+            pid: child.pid!,
+          })
+        ).rejects.toThrow('Cannot verify executor workload');
+        expect(() => process.kill(child.pid!, 0)).not.toThrow();
+      } finally {
+        process.kill(-child.pid!, 'SIGKILL');
+      }
+    }
+  );
 
   it.skipIf(!CAN_RUN_CROSS_USER_TEST)(
     'recovers and verifies a detached attempt owned by another Unix user',

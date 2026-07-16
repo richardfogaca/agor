@@ -12,6 +12,7 @@ import {
 } from '@agor/core/callbacks/child-completion-template';
 import { PAGINATION, resolveExecutorHeartbeatConfig } from '@agor/core/config';
 import {
+  bindRepositoryToTenantUnitOfWork,
   type CompletionCallbackInput,
   enqueueTenantDatabasePostCommitCallback,
   shortId,
@@ -117,7 +118,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       multi: ['patch'],
     });
 
-    this.taskRepo = taskRepo;
+    this.taskRepo = bindRepositoryToTenantUnitOfWork(db, taskRepo);
     this.app = app;
     this.db = db;
     const heartbeatConfig = resolveExecutorHeartbeatConfig(app.get?.('config')?.execution);
@@ -917,11 +918,15 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
   /** Reserve Stop under the same database lock used by admission and release. */
   async reserveExecutorStop(sessionId: SessionID, params?: TaskParams): Promise<Task | null> {
     const result = await this.taskRepo.reserveExecutorStop(sessionId);
-    if (result.task && result.transitioned) this.emit?.('patched', result.task);
+    if (result.task && result.transitioned) {
+      this.trackTaskCompleted(result.task);
+      this.emit?.('patched', result.task);
+    }
 
     const session = await this.app.service('sessions').get(sessionId, params);
     this.app.service('sessions').emit('patched', session);
     if (!result.task) await this.triggerQueueProcessingAfterCommit(sessionId, params);
+    else if (!result.task.executor_attempt) await this.settleTaskCompletion(result.task, params);
     return result.task;
   }
 

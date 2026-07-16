@@ -21,6 +21,7 @@ import {
   inArray,
   isPostgresDatabase,
   MCPServerRepository,
+  runWithoutTenantDatabaseScope,
   runWithTenantDatabaseScope,
   SessionMCPServerRepository,
   type SessionMCPServerRow,
@@ -65,6 +66,7 @@ import type {
 import {
   EXECUTOR_ATTEMPT_ENV_VAR,
   ensureExecutorWorkloadStopped,
+  markExecutorProcessExited,
   trackExecutorProcess,
 } from './executor-tracking.js';
 import { runInOAuthTenantScope } from './oauth-auth-helpers.js';
@@ -1062,6 +1064,7 @@ function createExecuteHandler(
         })();
       },
       onExit: async (code) => {
+        markExecutorProcessExited(data.executorAttemptId);
         console.log(`${logPrefix} Exited with code ${code}`);
         let authoritative = isAuthoritativeLauncherExit(workloadKind, code, false);
         try {
@@ -1095,21 +1098,12 @@ function createExecuteHandler(
               }
             }
           }
-          // Keep a failed barrier inside the transaction so its repair marker commits.
-          const finalizationError = await runWithTenantDatabaseScope(db, tenantId, async () => {
-            try {
-              await tasksService.finalizeExecutorTurn(
-                {
-                  task_id: taskId,
-                  executor_attempt_id: data.executorAttemptId,
-                },
-                params
-              );
-            } catch (error) {
-              return error;
-            }
-          });
-          if (finalizationError) throw finalizationError;
+          await runWithoutTenantDatabaseScope(() =>
+            tasksService.finalizeExecutorTurn(
+              { task_id: taskId, executor_attempt_id: data.executorAttemptId },
+              params
+            )
+          );
         } catch (error) {
           console.error(`❌ [Executor] Failed to finalize task ${shortId(taskId)}:`, error);
         } finally {

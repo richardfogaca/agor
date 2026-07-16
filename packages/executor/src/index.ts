@@ -18,10 +18,7 @@ import type {
 } from '@agor/core/types';
 import { ExecutorPulseKind, TaskStatus } from '@agor/core/types';
 import { patchConsole } from '@agor/core/utils/logger';
-import {
-  type ExecutorHeartbeatHandle,
-  startExecutorRuntimeOverseer,
-} from './executor-heartbeat.js';
+import { type ExecutorRuntime, startExecutorRuntimeOverseer } from './executor-heartbeat.js';
 import type { ResolvedConfigSlice } from './payload-types.js';
 import { globalPermissionManager } from './permissions/permission-manager.js';
 import { type AgorClient, createFeathersClient } from './services/feathers-client.js';
@@ -57,7 +54,7 @@ export class AgorExecutor {
   private client: AgorClient | null = null;
   private abortController: AbortController;
   private isRunning = false;
-  private heartbeat: ExecutorHeartbeatHandle | null = null;
+  private heartbeat: ExecutorRuntime | null = null;
 
   constructor(private config: ExecutorConfig) {
     this.abortController = new AbortController();
@@ -212,7 +209,6 @@ export class AgorExecutor {
         runtime: this.heartbeat,
       });
     } finally {
-      await this.heartbeat?.flush();
       this.heartbeat?.stop();
       this.heartbeat = null;
       this.isRunning = false;
