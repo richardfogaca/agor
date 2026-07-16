@@ -65,10 +65,7 @@ describe('stopSessionPreserveQueue', () => {
     expect(tasksService.patch).toHaveBeenCalledWith(
       runningTask.task_id,
       expect.objectContaining({ status: 'stopped' }),
-      expect.objectContaining({
-        suppressTerminalQueueProcessing: true,
-        suppressCompletionCallbacks: true,
-      })
+      params
     );
     expect(tasksService.reserveExecutorStop).toHaveBeenCalledWith(sessionId, params);
   });
@@ -124,7 +121,7 @@ describe('stopSessionPreserveQueue', () => {
     expect(tasksService.patch).toHaveBeenCalledWith(
       awaitingInputTask.task_id,
       expect.objectContaining({ status: 'stopped' }),
-      expect.objectContaining({ suppressCompletionCallbacks: true })
+      {}
     );
   });
 

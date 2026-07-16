@@ -88,6 +88,7 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
       params?: FeathersParams
     ) => Promise<void>
   ): void;
+  startQueueProcessing(): Promise<void>;
   triggerQueueProcessing(id: string, params?: FeathersParams): Promise<void>;
   // Feathers/WebSocket executor architecture handlers
   setExecuteHandler(
@@ -137,11 +138,6 @@ export interface TasksServiceImpl extends Service<Task, Partial<Task>, TaskParam
   ): Promise<Task>;
   fail(id: string, data: { error?: string }, params?: TaskParams): Promise<Task>;
   getOrphaned(params?: TaskParams): Promise<Task[]>;
-  failForLostHeartbeat(
-    id: string,
-    data: { completed_at?: string; error_message: string },
-    params?: TaskParams
-  ): Promise<Task>;
 }
 
 /**

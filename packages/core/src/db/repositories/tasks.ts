@@ -61,6 +61,13 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     return lockRowForUpdate(db, this.db, sessions, eq(sessions.session_id, sessionId));
   }
 
+  private async loadLockedTask(db: Database, taskId: string, requestedId = taskId): Promise<Task> {
+    await this.lockTask(db, taskId);
+    const row = await select(db).from(tasks).where(eq(tasks.task_id, taskId)).one();
+    if (!row) throw new EntityNotFoundError('Task', requestedId);
+    return this.rowToTask(row);
+  }
+
   private async resolveExisting(id: string): Promise<{ fullId: string; task: Task }> {
     const fullId = await this.resolveId(id);
     const task = await this.findById(fullId);
@@ -481,10 +488,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
           return { task: null, transitioned: false };
         }
 
-        await this.lockTask(db, row.task_id);
-        const currentRow = await select(db).from(tasks).where(eq(tasks.task_id, row.task_id)).one();
-        if (!currentRow) throw new EntityNotFoundError('Task', row.task_id);
-        const current = this.rowToTask(currentRow);
+        const current = await this.loadLockedTask(db, row.task_id);
         if (!isTaskTurnHolding(current)) return { task: null, transitioned: false };
 
         const transitioned =
@@ -523,14 +527,11 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       this.db,
       async (db) => {
         await this.lockSession(db, known.session_id);
-        await this.lockTask(db, fullId);
+        const current = await this.loadLockedTask(db, fullId, id);
         const session = await select(db)
           .from(sessions)
           .where(eq(sessions.session_id, known.session_id))
           .one();
-        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
-        if (!row) throw new EntityNotFoundError('Task', id);
-        const current = this.rowToTask(row);
         if (
           session?.status === SessionStatus.STOPPING ||
           current.executor_attempt?.id !== attemptId
@@ -575,14 +576,11 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       this.db,
       async (db) => {
         await this.lockSession(db, known.session_id);
-        await this.lockTask(db, fullId);
+        const current = await this.loadLockedTask(db, fullId, id);
         const session = await select(db)
           .from(sessions)
           .where(eq(sessions.session_id, known.session_id))
           .one();
-        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
-        if (!row) throw new EntityNotFoundError('Task', id);
-        const current = this.rowToTask(row);
         if (
           current.executor_attempt?.id !== attemptId ||
           session?.status === SessionStatus.STOPPING ||
@@ -613,10 +611,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     return runDatabaseTransaction(
       this.db,
       async (db) => {
-        await this.lockTask(db, fullId);
-        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
-        if (!row) throw new EntityNotFoundError('Task', id);
-        const current = this.rowToTask(row);
+        const current = await this.loadLockedTask(db, fullId, id);
         if (
           current.executor_attempt?.id !== attemptId ||
           !current.executor_connected_at ||
@@ -650,10 +645,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     return runDatabaseTransaction(
       this.db,
       async (db) => {
-        await this.lockTask(db, fullId);
-        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
-        if (!row) throw new EntityNotFoundError('Task', id);
-        const current = this.rowToTask(row);
+        const current = await this.loadLockedTask(db, fullId, id);
         if (current.executor_attempt?.id !== attemptId || current.executor_attempt.released_at) {
           return null;
         }
@@ -679,10 +671,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       this.db,
       async (db) => {
         await this.lockSession(db, known.session_id);
-        await this.lockTask(db, fullId);
-        const row = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
-        if (!row) throw new EntityNotFoundError('Task', id);
-        const current = this.rowToTask(row);
+        const current = await this.loadLockedTask(db, fullId, id);
         if (current.executor_attempt?.id !== attemptId || !isTerminalTaskStatus(current.status)) {
           return null;
         }
@@ -734,13 +723,7 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       const result = await runDatabaseTransaction(
         this.db,
         async (db) => {
-          await this.lockTask(db, fullId);
-
-          const currentRow = await select(db).from(tasks).where(eq(tasks.task_id, fullId)).one();
-
-          if (!currentRow) throw new EntityNotFoundError('Task', id);
-
-          const current = this.rowToTask(currentRow);
+          const current = await this.loadLockedTask(db, fullId, id);
 
           if (
             isTerminalTaskStatus(current.status) &&

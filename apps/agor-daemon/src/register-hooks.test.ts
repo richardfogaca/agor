@@ -136,15 +136,6 @@ describe('shouldDrainQueueAfterSessionPostTurnPatch', () => {
     ).toBe(true);
   });
 
-  it('does not drain when terminal queue processing is explicitly suppressed', () => {
-    expect(
-      shouldDrainQueueAfterSessionPostTurnPatch(
-        { status: 'failed', ready_for_prompt: true },
-        { suppressTerminalQueueProcessing: true }
-      )
-    ).toBe(false);
-  });
-
   it('does not drain for promptable-but-not-ready acknowledgement states', () => {
     expect(
       shouldDrainQueueAfterSessionPostTurnPatch({ status: 'idle', ready_for_prompt: false })

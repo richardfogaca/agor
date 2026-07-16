@@ -70,27 +70,6 @@ export type TaskParams = QueryParams<{
   session_id?: string;
   status?: Task['status'];
 }> & {
-  /**
-   * Internal-only: terminal task patches normally transition the owning session
-   * back to a promptable terminal state. Heartbeat-loss handling marks the session failed instead.
-   */
-  suppressTerminalSessionStateUpdate?: boolean;
-  /**
-   * Internal-only: terminal task patches normally drain queued work for the
-   * owning session. Heartbeat-loss handling must not auto-start queued prompts.
-   */
-  suppressTerminalQueueProcessing?: boolean;
-  /**
-   * Internal-only: skip parent callback dispatch for terminal transitions that
-   * are administrative cancellation, not agent output. Does not disable BTW
-   * fork archival; those ephemeral sessions should still be cleaned up.
-   */
-  suppressCompletionCallbacks?: boolean;
-  /**
-   * Internal-only escape hatch for preserving an ephemeral BTW fork after
-   * terminal transition. Most callers should leave this unset.
-   */
-  suppressBtwCleanup?: boolean;
   /** Internal RBAC SQL pushdown marker set by register-hooks for external regular users. */
   _agorSqlSessionAccessUserId?: UUID;
   /** Authenticated executor attempt; injected by the runtime scope hook. */
@@ -309,54 +288,6 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     );
   }
 
-  async failForLostHeartbeat(
-    id: string,
-    data: { completed_at?: string; error_message: string },
-    params?: TaskParams
-  ): Promise<Task> {
-    const result = await this.patch(
-      id,
-      {
-        status: TaskStatus.FAILED,
-        completed_at: data.completed_at,
-        error_message: data.error_message,
-      },
-      {
-        ...params,
-        suppressTerminalSessionStateUpdate: true,
-        suppressTerminalQueueProcessing: true,
-        // Suppress callbacks here — dispatchCompletionCallbacks runs inside the
-        // tenantDatabaseScopeAround transaction (it does SELECT session_relationships +
-        // INSERT callback task), extending the transaction's idle time between statements.
-        // This triggered write CONNECTION_CLOSED + zombie idle-in-transaction connections.
-        // We dispatch manually below, after both patches commit, in their own transactions.
-        suppressCompletionCallbacks: true,
-      }
-    );
-    const failedTask = result as Task;
-    const heartbeatFailureWon =
-      failedTask.status === TaskStatus.FAILED &&
-      failedTask.error_message === data.error_message &&
-      (!data.completed_at || failedTask.completed_at === data.completed_at);
-    if (!heartbeatFailureWon) {
-      console.log(
-        `⏭️ [TasksService] Skipping heartbeat session failure for task ${shortId(failedTask.task_id)}; ` +
-          `heartbeat failure did not win (status=${failedTask.status})`
-      );
-      return failedTask;
-    }
-    const session = await this.app.service('sessions').get(failedTask.session_id, params);
-    void this.dispatchCompletionCallbacksAfterCommit(failedTask, session, params).catch(
-      (error: unknown) => {
-        console.warn(
-          `[executor-heartbeat] Failed to dispatch completion callbacks for task ${shortId(failedTask.task_id)}:`,
-          error instanceof Error ? error.message : String(error)
-        );
-      }
-    );
-    return failedTask;
-  }
-
   private async handleExecutorHeartbeat(task: Task, heartbeatAt: string): Promise<void> {
     const payload: ExecutorHeartbeatCallbackPayload = {
       event: 'executor_heartbeat',
@@ -546,9 +477,6 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
 
           const latestTaskId = session.tasks?.[session.tasks.length - 1];
 
-          const suppressCompletionCallbacks = params?.suppressCompletionCallbacks === true;
-          const suppressBtwCleanup = params?.suppressBtwCleanup === true;
-
           // STOPPED tasks (user-cancelled or daemon-shutdown cleanup) never notify
           // parent sessions. A stopped child represents abandoned work — the parent
           // should not resume or be informed; it has its own lifecycle.
@@ -560,25 +488,16 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             );
             // Process completion callbacks only for naturally-terminal tasks (COMPLETED/FAILED).
             // STOPPED means the work was abandoned — don't notify the parent.
-            if (!suppressCompletionCallbacks && !isStop) {
+            if (!isStop) {
               await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
             }
             return result;
           }
 
-          // Executor-backed terminal work stays gated until release. Internal cleanup
-          // may also suppress immediate queue processing explicitly.
+          // Executor-backed terminal work stays gated until release.
           if (awaitingExecutorRelease) {
             console.log(
               `⏳ [TasksService] Task ${shortId(task.task_id)} is terminal; waiting for executor release`
-            );
-          } else if (isStop && params?.suppressTerminalQueueProcessing) {
-            console.log(
-              `⏭️ [TasksService] Skipping session terminal-state update for STOPPED task ${shortId(task.task_id)} — caller suppresses terminal queue processing`
-            );
-          } else if (params?.suppressTerminalSessionStateUpdate) {
-            console.log(
-              `⏭️ [TasksService] Skipping session terminal-state update for task ${shortId(task.task_id)} (${data.status}) due to internal patch params`
             );
           } else {
             await this.app.service('sessions').patch(
@@ -596,30 +515,28 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             );
           }
 
-          if (!suppressCompletionCallbacks && !isStop) {
+          if (!isStop) {
             await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
           }
 
           // "btw" fork origin: auto-archive the ephemeral fork after task completion.
           // Runs regardless of callback success — btw forks should always be cleaned up.
-          // Administrative terminal patches may suppress parent callbacks/result injection,
-          // but still archive the ephemeral session unless explicitly told not to.
+          // Administrative STOPPED transitions skip parent callbacks/result injection,
+          // but still archive the ephemeral session.
           if (session.fork_origin === 'btw') {
-            if (!suppressBtwCleanup) {
-              try {
-                await this.app.service('sessions').patch(session.session_id, {
-                  archived: true,
-                  archived_reason: 'btw_completed',
-                });
-                console.log(
-                  `📦 [TasksService] Auto-archived btw fork session ${shortId(session.session_id)}`
-                );
-              } catch (error) {
-                console.warn(`⚠️  [TasksService] Failed to auto-archive btw fork:`, error);
-              }
+            try {
+              await this.app.service('sessions').patch(session.session_id, {
+                archived: true,
+                archived_reason: 'btw_completed',
+              });
+              console.log(
+                `📦 [TasksService] Auto-archived btw fork session ${shortId(session.session_id)}`
+              );
+            } catch (error) {
+              console.warn(`⚠️  [TasksService] Failed to auto-archive btw fork:`, error);
             }
 
-            if (!suppressCompletionCallbacks && !isStop) {
+            if (!isStop) {
               // Inject a result message into the parent session's conversation.
               // This is a non-prompt system message — it shows up in the UI but doesn't
               // trigger a new prompt cycle. The parent's agent never sees it.
@@ -630,12 +547,8 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           // Fire queue processing after the outer transaction commits. spawnTaskExecutor
           // (called inside the queue processor) does significant I/O that would otherwise
           // extend this transaction and cause proxy CONNECTION_CLOSED kills.
-          if (!awaitingExecutorRelease && !params?.suppressTerminalQueueProcessing) {
+          if (!awaitingExecutorRelease) {
             await this.triggerQueueProcessingAfterCommit(task.session_id, params);
-          } else if (params?.suppressTerminalQueueProcessing) {
-            console.log(
-              `⏭️  [TasksService] Queue trigger suppressed for session ${shortId(task.session_id)} (suppressTerminalQueueProcessing)`
-            );
           }
         } catch (error) {
           console.error('❌ [TasksService] Failed to process task completion:', error);
@@ -1205,9 +1118,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       this.emit?.('patched', result.task);
       const session = await this.app.service('sessions').get(result.task.session_id, params);
       this.app.service('sessions').emit('patched', session);
-      if (!params?.suppressTerminalQueueProcessing) {
-        await this.triggerQueueProcessingAfterCommit(result.task.session_id, params);
-      }
+      await this.triggerQueueProcessingAfterCommit(result.task.session_id, params);
     }
     return result.task;
   }

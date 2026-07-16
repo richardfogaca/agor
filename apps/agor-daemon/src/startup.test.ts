@@ -6,6 +6,7 @@ import { cleanupOrphanStatuses, type StartupContext } from './startup.js';
 
 interface StartupFixtures {
   orphanedTasks?: Task[];
+  activeSessions?: Session[];
   /** Returned by the IDLE + ready_for_prompt=false sweep query */
   idleNotReadySessions?: Session[];
   /** Lookup table for tasksService.get / sessionsService.get */
@@ -31,7 +32,11 @@ function makeStartupContextWithGuardedDb(fixtures: StartupFixtures = {}) {
     }),
     find: vi.fn(async () => {
       touchDb();
-      return { data: [] };
+      return {
+        data: (fixtures.activeSessions ?? []).filter(
+          (session) => session.status === params?.query?.status
+        ),
+      };
     }),
     get: vi.fn(async (id: string) => {
       touchDb();
@@ -137,7 +142,7 @@ describe('startup tenant database scope', () => {
     expect(tasksService.patch).not.toHaveBeenCalled();
     expect(tasksService.finalizeExecutorTurn).toHaveBeenCalledWith(
       { task_id: task.task_id, executor_attempt_id: 'attempt-1' },
-      expect.objectContaining({ suppressTerminalQueueProcessing: true })
+      expect.objectContaining({ tenant: expect.any(Object) })
     );
   });
 
@@ -146,7 +151,11 @@ describe('startup tenant database scope', () => {
       status: TaskStatus.COMPLETED,
       executor_attempt: { id: 'attempt-fenced' },
     });
-    const { ctx, tasksService } = makeStartupContextWithGuardedDb({ orphanedTasks: [task] });
+    const session = makeSession({ status: SessionStatus.RUNNING, ready_for_prompt: false });
+    const { ctx, tasksService, sessionsService } = makeStartupContextWithGuardedDb({
+      orphanedTasks: [task],
+      activeSessions: [session],
+    });
     tasksService.finalizeExecutorTurn.mockRejectedValueOnce(new Error('cleanup pending'));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
@@ -156,6 +165,7 @@ describe('startup tenant database scope', () => {
       expect.stringContaining('remains fenced for supervisor retry'),
       expect.any(Error)
     );
+    expect(sessionsService.patch).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 
@@ -170,10 +180,14 @@ describe('startup tenant database scope', () => {
 });
 
 describe('stuck-idle sweep (IDLE + ready_for_prompt=false)', () => {
-  it('unblocks an interrupted session whose latest task was orphan-stopped this boot', async () => {
+  it('leaves an executor-owned session fenced until orphan finalization succeeds', async () => {
     // Kill-during-stop race: stop path wrote status=idle but died before
     // ready_for_prompt=true; the executing task is orphaned at boot.
-    const task = makeTask({ task_id: 'task-1', session_id: 'session-1' });
+    const task = makeTask({
+      task_id: 'task-1',
+      session_id: 'session-1',
+      executor_attempt: { id: 'attempt-1' },
+    });
     const session = makeSession({
       session_id: 'session-1',
       tasks: ['task-1'] as Session['tasks'],
@@ -186,11 +200,7 @@ describe('stuck-idle sweep (IDLE + ready_for_prompt=false)', () => {
 
     await cleanupOrphanStatuses(ctx);
 
-    expect(sessionsService.patch).toHaveBeenCalledWith(
-      'session-1',
-      { ready_for_prompt: true },
-      expect.anything()
-    );
+    expect(sessionsService.patch).not.toHaveBeenCalled();
   });
 
   it('unblocks a session whose latest task is still in a non-terminal state', async () => {

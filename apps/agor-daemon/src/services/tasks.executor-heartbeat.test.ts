@@ -28,6 +28,7 @@ describe('TasksService executor heartbeat helpers', () => {
       session_id: sessionId,
       status: TaskStatus.RUNNING,
       created_at: '2026-01-01T00:00:00.000Z',
+      executor_attempt: { id: 'attempt-heartbeat' },
     };
     const failedTask = {
       ...currentTask,
@@ -65,9 +66,10 @@ describe('TasksService executor heartbeat helpers', () => {
       },
     };
 
-    const result = await service.failForLostHeartbeat(
+    const result = await service.patch(
       taskId,
       {
+        status: TaskStatus.FAILED,
         completed_at: '2026-01-01T00:00:05.000Z',
         error_message: 'Executor heartbeat lost',
       },
@@ -120,7 +122,8 @@ describe('TasksService executor heartbeat helpers', () => {
       },
     };
 
-    const result = await service.failForLostHeartbeat(taskId, {
+    const result = await service.patch(taskId, {
+      status: TaskStatus.FAILED,
       completed_at: '2026-01-01T00:00:05.000Z',
       error_message: 'Executor heartbeat lost',
     });
@@ -161,7 +164,8 @@ describe('TasksService executor heartbeat helpers', () => {
       },
     };
 
-    const result = await service.failForLostHeartbeat(taskId, {
+    const result = await service.patch(taskId, {
+      status: TaskStatus.FAILED,
       completed_at: '2026-01-01T00:00:05.000Z',
       error_message: 'Executor heartbeat lost',
     });
@@ -211,6 +215,7 @@ describe('TasksService executor heartbeat helpers', () => {
       status: TaskStatus.RUNNING,
       created_at: '2026-01-01T00:00:00.000Z',
       started_at: '2026-01-01T00:00:00.000Z',
+      executor_attempt: { id: 'attempt-stop' },
     };
     const stoppedTask = {
       ...currentTask,
@@ -255,17 +260,10 @@ describe('TasksService executor heartbeat helpers', () => {
       },
     };
 
-    const result = await service.patch(
-      taskId,
-      {
-        status: TaskStatus.STOPPED,
-        completed_at: '2026-01-01T00:00:05.000Z',
-      },
-      {
-        suppressTerminalQueueProcessing: true,
-        suppressCompletionCallbacks: true,
-      }
-    );
+    const result = await service.patch(taskId, {
+      status: TaskStatus.STOPPED,
+      completed_at: '2026-01-01T00:00:05.000Z',
+    });
 
     expect(result).toMatchObject({ task_id: taskId, status: TaskStatus.STOPPED });
     expect(dispatchCompletionCallbacks).not.toHaveBeenCalled();

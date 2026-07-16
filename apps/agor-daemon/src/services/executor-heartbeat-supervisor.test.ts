@@ -36,14 +36,14 @@ describe('ExecutorHeartbeatSupervisor', () => {
       executor_attempt: { id: 'attempt-1' },
       last_executor_heartbeat_at: '2026-01-01T00:00:00.000Z',
     };
-    const failForLostHeartbeat = vi.fn().mockResolvedValue({});
+    const patch = vi.fn().mockResolvedValue({});
     const app = {
       service: (name: string) => {
         if (name === 'tasks') {
           return {
             getOrphaned: vi.fn().mockResolvedValue([staleTask]),
             get: vi.fn().mockResolvedValue(staleTask),
-            failForLostHeartbeat,
+            patch,
             finalizeExecutorTurn: vi.fn(),
           };
         }
@@ -59,7 +59,8 @@ describe('ExecutorHeartbeatSupervisor', () => {
 
     await supervisor.checkOnce();
 
-    expect(failForLostHeartbeat).toHaveBeenCalledWith(staleTask.task_id, {
+    expect(patch).toHaveBeenCalledWith(staleTask.task_id, {
+      status: 'failed',
       completed_at: '2026-01-01T00:00:05.000Z',
       error_message: EXECUTOR_HEARTBEAT_LOST_MESSAGE,
     });
@@ -73,7 +74,7 @@ describe('ExecutorHeartbeatSupervisor', () => {
       executor_attempt: { id: 'attempt-1' },
       last_executor_heartbeat_at: '2026-01-01T00:00:00.000Z',
     };
-    const failForLostHeartbeat = vi.fn();
+    const patch = vi.fn();
     const app = {
       service: (name: string) => ({
         getOrphaned: vi.fn().mockResolvedValue([task]),
@@ -81,7 +82,7 @@ describe('ExecutorHeartbeatSupervisor', () => {
           ...task,
           last_executor_heartbeat_at: '2026-01-01T00:00:04.500Z',
         }),
-        failForLostHeartbeat: name === 'tasks' ? failForLostHeartbeat : vi.fn(),
+        patch: name === 'tasks' ? patch : vi.fn(),
       }),
     } as any;
 
@@ -92,7 +93,7 @@ describe('ExecutorHeartbeatSupervisor', () => {
     });
 
     await supervisor.checkOnce();
-    expect(failForLostHeartbeat).not.toHaveBeenCalled();
+    expect(patch).not.toHaveBeenCalled();
   });
 
   it('fails and releases a dispatch that never connected', async () => {
@@ -104,13 +105,13 @@ describe('ExecutorHeartbeatSupervisor', () => {
       created_at: '2026-01-01T00:00:00.000Z',
       executor_attempt: { id: 'attempt-2' },
     };
-    const failForLostHeartbeat = vi.fn().mockResolvedValue({});
+    const patch = vi.fn().mockResolvedValue({});
     const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
     const app = {
       service: () => ({
         getOrphaned: vi.fn().mockResolvedValue([task]),
         get: vi.fn().mockResolvedValue(task),
-        failForLostHeartbeat,
+        patch,
         finalizeExecutorTurn,
       }),
     } as any;
@@ -122,9 +123,12 @@ describe('ExecutorHeartbeatSupervisor', () => {
 
     await supervisor.checkOnce();
 
-    expect(failForLostHeartbeat).toHaveBeenCalledWith(
+    expect(patch).toHaveBeenCalledWith(
       task.task_id,
-      expect.objectContaining({ error_message: EXECUTOR_DISPATCH_TIMEOUT_MESSAGE })
+      expect.objectContaining({
+        status: 'failed',
+        error_message: EXECUTOR_DISPATCH_TIMEOUT_MESSAGE,
+      })
     );
     expect(finalizeExecutorTurn).toHaveBeenCalledWith({
       task_id: task.task_id,
@@ -141,14 +145,12 @@ describe('ExecutorHeartbeatSupervisor', () => {
       executor_attempt: { id: 'attempt-4' },
     };
     const patch = vi.fn().mockResolvedValue({ ...task, status: 'stopped' });
-    const failForLostHeartbeat = vi.fn();
     const finalizeExecutorTurn = vi.fn().mockResolvedValue({});
     const app = {
       service: () => ({
         getOrphaned: vi.fn().mockResolvedValue([task]),
         get: vi.fn().mockResolvedValue(task),
         patch,
-        failForLostHeartbeat,
         finalizeExecutorTurn,
       }),
     } as any;
@@ -162,10 +164,8 @@ describe('ExecutorHeartbeatSupervisor', () => {
 
     expect(patch).toHaveBeenCalledWith(
       task.task_id,
-      expect.objectContaining({ status: 'stopped' }),
-      expect.objectContaining({ suppressTerminalQueueProcessing: true })
+      expect.objectContaining({ status: 'stopped' })
     );
-    expect(failForLostHeartbeat).not.toHaveBeenCalled();
     expect(finalizeExecutorTurn).toHaveBeenCalledWith({
       task_id: task.task_id,
       executor_attempt_id: 'attempt-4',

@@ -26,8 +26,7 @@ export interface StopSessionDeps {
  * Stop semantics, in one place:
  * - target only the active task for the session;
  * - preserve queued work so it can drain after Stop;
- * - suppress task-terminal side effects that would independently drain or
- *   dispatch callbacks for a user-stopped turn;
+ * - treat STOPPED as administrative cancellation, without completion callbacks;
  * - leave executor-backed turns blocked until process exit releases them.
  */
 export async function stopSessionPreserveQueue(
@@ -71,11 +70,7 @@ export async function stopSessionPreserveQueue(
         status: TaskStatus.STOPPED,
         completed_at: new Date().toISOString(),
       },
-      {
-        ...params,
-        ...(latestTask.executor_attempt ? { suppressTerminalQueueProcessing: true } : {}),
-        suppressCompletionCallbacks: true,
-      } as Params
+      params
     );
   }
 

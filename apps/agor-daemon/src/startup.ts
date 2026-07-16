@@ -164,30 +164,33 @@ async function cleanupOrphanStatusesInTenantScope(
 
   // Settle every interrupted executor turn through the same release kernel used at runtime.
   const orphanedTasks = await tasksService.getOrphaned(startupParams as never);
+  const sessionIdsWithOrphanedTasks = new Set<string>();
+  const sessionIdsWithExecutorTurns = new Set<string>();
 
-  if (orphanedTasks.length > 0) {
-    for (const task of orphanedTasks) {
-      if (!isTerminalTaskStatus(task.status)) {
-        await tasksService.patch(task.task_id, { status: TaskStatus.STOPPED }, {
-          ...startupParams,
-          suppressTerminalQueueProcessing: true,
-        } as never);
-      }
-      if (task.executor_attempt) {
-        try {
-          await tasksService.finalizeExecutorTurn(
-            { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
-            { ...startupParams, suppressTerminalQueueProcessing: true } as never
-          );
-          startupDebug(
-            `[startup] released orphaned task ${shortId(task.task_id)} (was: ${task.status})`
-          );
-        } catch (error) {
-          console.warn(
-            `[startup] Task ${shortId(task.task_id)} remains fenced for supervisor retry:`,
-            error
-          );
-        }
+  for (const task of orphanedTasks) {
+    sessionIdsWithOrphanedTasks.add(task.session_id as string);
+    if (task.executor_attempt) sessionIdsWithExecutorTurns.add(task.session_id as string);
+    if (!isTerminalTaskStatus(task.status)) {
+      await tasksService.patch(
+        task.task_id,
+        { status: TaskStatus.STOPPED },
+        startupParams as never
+      );
+    }
+    if (task.executor_attempt) {
+      try {
+        await tasksService.finalizeExecutorTurn(
+          { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
+          startupParams as never
+        );
+        startupDebug(
+          `[startup] released orphaned task ${shortId(task.task_id)} (was: ${task.status})`
+        );
+      } catch (error) {
+        console.warn(
+          `[startup] Task ${shortId(task.task_id)} remains fenced for supervisor retry:`,
+          error
+        );
       }
     }
   }
@@ -205,7 +208,11 @@ async function cleanupOrphanStatusesInTenantScope(
       query: { status, $limit: 1000 },
       ...startupParams,
     })) as unknown as Paginated<Session>;
-    orphanedSessions.push(...result.data);
+    orphanedSessions.push(
+      ...result.data.filter(
+        (session) => !sessionIdsWithExecutorTurns.has(session.session_id as string)
+      )
+    );
   }
 
   if (orphanedSessions.length > 0) {
@@ -225,11 +232,6 @@ async function cleanupOrphanStatusesInTenantScope(
       );
     }
   }
-
-  // Also check for sessions that had orphaned tasks (even if session wasn't in RUNNING/STOPPING)
-  const sessionIdsWithOrphanedTasks = new Set(
-    orphanedTasks.map((t: Task) => t.session_id as string)
-  );
 
   // Fix sessions that are IDLE but not promptable *because a kill interrupted
   // them* — the daemon died during the stop path after writing status=idle but
@@ -254,6 +256,10 @@ async function cleanupOrphanStatusesInTenantScope(
 
   const stuckIdleSessions: Session[] = [];
   for (const session of idleNotReadyResult.data) {
+    // Executor-backed turns remain owned by their finalizer. If cleanup failed,
+    // keep the session fenced instead of making it appear promptable.
+    if (sessionIdsWithExecutorTurns.has(session.session_id as string)) continue;
+
     // Sessions maintain an ordered task-ID list; the last entry is the most
     // recent task (same convention as injectRestartNotices below).
     const latestTaskId = session.tasks?.at(-1);
@@ -284,7 +290,7 @@ async function cleanupOrphanStatusesInTenantScope(
   }
 
   const cleanupParts: string[] = [
-    `${orphanedTasks.length} orphaned task(s) released`,
+    `${orphanedTasks.length} orphaned task(s) reconciled`,
     `${orphanedSessions.length} active session(s) reset`,
   ];
   if (stuckIdleSessions.length > 0) {
@@ -525,14 +531,11 @@ export async function startup(ctx: StartupContext): Promise<void> {
 
   runPostStartJob('health-monitor-initialize', () => healthMonitor.initialize());
   runPostStartJob('daemon-restart-recovery', async () => {
-    await injectRestartNotices(ctx, orphanCleanupResult);
-    await runStartupTenantDatabaseScope(ctx, () =>
-      Promise.all(
-        [...orphanCleanupResult.sessionIdsWithOrphanedTasks].map((sessionId) =>
-          sessionsService.triggerQueueProcessing(sessionId, startupTenantParams(config) as never)
-        )
-      )
-    );
+    try {
+      await injectRestartNotices(ctx, orphanCleanupResult);
+    } finally {
+      await runStartupTenantDatabaseScope(ctx, () => sessionsService.startQueueProcessing());
+    }
   });
 
   // Non-blocking credential spill repair. If an agent/user wrote a PAT into a

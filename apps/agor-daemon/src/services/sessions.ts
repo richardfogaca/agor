@@ -78,6 +78,7 @@ type SessionArchiveTarget = {
 
 const MANUAL_ARCHIVED_REASON = 'manual' satisfies SessionArchiveReason;
 const PARENT_ARCHIVED_REASON = 'parent_archived' satisfies SessionArchiveReason;
+const QUEUE_PROCESSOR_NOT_SET_ERROR = 'Queue processor not set';
 
 /**
  * Extract the inheritable runtime configuration from a parent session.
@@ -831,17 +832,31 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
    * NOTE: The actual implementation is provided by index.ts via setQueueProcessor
    */
   private queueProcessor?: (sessionId: string, params?: SessionParams) => Promise<void>;
+  private queueProcessingStarted = false;
+  private pendingQueueProcessing = new Map<string, SessionParams | undefined>();
 
   setQueueProcessor(processor: (sessionId: string, params?: SessionParams) => Promise<void>): void {
     this.queueProcessor = processor;
   }
 
+  async startQueueProcessing(): Promise<void> {
+    if (this.queueProcessingStarted) return;
+    const processor = this.queueProcessor;
+    if (!processor) throw new Error(QUEUE_PROCESSOR_NOT_SET_ERROR);
+
+    this.queueProcessingStarted = true;
+    const pending = [...this.pendingQueueProcessing];
+    this.pendingQueueProcessing.clear();
+    await Promise.all(pending.map(([id, params]) => processor(id, params)));
+  }
+
   async triggerQueueProcessing(id: string, params?: SessionParams): Promise<void> {
-    if (this.queueProcessor) {
-      await this.queueProcessor(id, params);
-    } else {
-      console.warn('⚠️  [SessionsService] Queue processor not set, cannot trigger queue processing');
+    if (!this.queueProcessingStarted) {
+      this.pendingQueueProcessing.set(id, params);
+      return;
     }
+    if (!this.queueProcessor) throw new Error(QUEUE_PROCESSOR_NOT_SET_ERROR);
+    await this.queueProcessor(id, params);
   }
 
   /**

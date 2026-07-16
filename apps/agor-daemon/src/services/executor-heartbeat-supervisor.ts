@@ -87,16 +87,13 @@ export class ExecutorHeartbeatSupervisor {
 
           if (!isTerminalTaskStatus(current.status)) {
             if (current.status === TaskStatus.STOPPING) {
-              await tasksService.patch(
-                task.task_id,
-                { status: TaskStatus.STOPPED, completed_at: this.now().toISOString() },
-                {
-                  suppressTerminalQueueProcessing: true,
-                  suppressCompletionCallbacks: true,
-                }
-              );
+              await tasksService.patch(task.task_id, {
+                status: TaskStatus.STOPPED,
+                completed_at: this.now().toISOString(),
+              });
             } else {
-              await tasksService.failForLostHeartbeat(task.task_id, {
+              await tasksService.patch(task.task_id, {
+                status: TaskStatus.FAILED,
                 completed_at: this.now().toISOString(),
                 error_message:
                   current.status === TaskStatus.DISPATCHING

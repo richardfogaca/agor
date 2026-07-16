@@ -141,10 +141,7 @@ import {
   validateScheduleConfig,
 } from './utils/schedule-hooks.js';
 import { deferWithSessionQueueTenantScope } from './utils/session-queue-tenant-scope.js';
-import {
-  isTerminalQueueProcessingSuppressed,
-  sessionCanStartTask,
-} from './utils/session-task-state.js';
+import { sessionCanStartTask } from './utils/session-task-state.js';
 import {
   createServiceToken,
   getDaemonUrl,
@@ -321,14 +318,9 @@ export function shouldRunSessionPostTurnHooks(
 }
 
 export function shouldDrainQueueAfterSessionPostTurnPatch(
-  session: Pick<Session, 'status' | 'ready_for_prompt'>,
-  params?: Params
+  session: Pick<Session, 'status' | 'ready_for_prompt'>
 ): boolean {
-  return (
-    shouldRunSessionPostTurnHooks(session) &&
-    session.ready_for_prompt === true &&
-    !isTerminalQueueProcessingSuppressed(params)
-  );
+  return shouldRunSessionPostTurnHooks(session) && session.ready_for_prompt === true;
 }
 
 export function getTrustedSessionTenantId(session: unknown): string | undefined {
@@ -2768,7 +2760,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               }
             });
 
-            if (shouldDrainQueueAfterSessionPostTurnPatch(session, context.params)) {
+            if (shouldDrainQueueAfterSessionPostTurnPatch(session)) {
               const sessionTenantId = getTrustedSessionTenantId(session);
               // Same fresh-scope pattern: queue processing must run outside the
               // outer transaction but still inside the session tenant for RLS.
@@ -2802,7 +2794,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               );
             } else {
               console.log(
-                `⏭️  [SessionsService.after.patch] Queue drain suppressed for session ${shortId(session.session_id)} (suppressTerminalQueueProcessing or not ready)`
+                `⏭️  [SessionsService.after.patch] Queue drain skipped for session ${shortId(session.session_id)} (not ready)`
               );
             }
           }
