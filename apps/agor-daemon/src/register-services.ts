@@ -35,12 +35,14 @@ import {
 import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import type {
   AuthenticatedParams,
+  ExecutorWorkloadRef,
   HookContext,
   MCPAuth,
   MCPServerID,
   MessageSource,
   Params,
   SessionID,
+  Task,
   UserID,
   UUID,
 } from '@agor/core/types';
@@ -59,7 +61,11 @@ import type {
   MessagesServiceImpl,
   SessionsServiceImpl,
 } from './declarations.js';
-import { EXECUTOR_ATTEMPT_ENV_VAR, trackExecutorProcess } from './executor-tracking.js';
+import {
+  EXECUTOR_ATTEMPT_ENV_VAR,
+  ensureExecutorWorkloadStopped,
+  trackExecutorProcess,
+} from './executor-tracking.js';
 import { runInOAuthTenantScope } from './oauth-auth-helpers.js';
 import {
   cacheOAuth21Token,
@@ -139,6 +145,9 @@ import {
 } from './utils/mcp-header-secrets.js';
 import { pullIfNeeded } from './utils/session-state-hooks.js';
 import { spawnExecutor } from './utils/spawn-executor.js';
+
+const EXECUTOR_LAUNCH_CANCELLED_MESSAGE = 'Executor launch was cancelled before payload delivery';
+const EXECUTOR_LAUNCH_CANCELLED_STATUS = 'cancelled';
 
 /**
  * Interface for dependencies needed by service registration.
@@ -816,6 +825,7 @@ function createExecuteHandler(
 
     // Determine Unix user for executor
     const {
+      getUidFromUsername,
       resolveUnixUserForImpersonation,
       validateResolvedUnixUser,
       UnixUserNotFoundError,
@@ -937,6 +947,25 @@ function createExecuteHandler(
     executorEnv.DAEMON_URL = daemonUrl;
     executorEnv[EXECUTOR_ATTEMPT_ENV_VAR] = data.executorAttemptId;
 
+    const ownsExecutorLaunch = async (): Promise<boolean> => {
+      const current = await taskRepo.findById(taskId);
+      return (
+        current?.status === TaskStatus.DISPATCHING &&
+        current.executor_attempt?.id === data.executorAttemptId &&
+        !current.executor_attempt.released_at
+      );
+    };
+    const cancelLaunch = () => {
+      appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+      return {
+        success: false,
+        taskId,
+        status: EXECUTOR_LAUNCH_CANCELLED_STATUS,
+        streaming: data.stream !== false,
+      };
+    };
+    if (!(await ownsExecutorLaunch())) return cancelLaunch();
+
     // Build executor payload
     const executorPayload = {
       command: 'prompt' as const,
@@ -984,9 +1013,18 @@ function createExecuteHandler(
       }
     }
 
+    if (!(await ownsExecutorLaunch())) return cancelLaunch();
+
     const logPrefix = `[Executor ${shortId(sessionId)}]`;
 
-    let workloadRegistration = Promise.resolve();
+    const workloadUnixUser = config.execution?.executor_command_template
+      ? undefined
+      : executorUnixUser || undefined;
+    const workloadUid = workloadUnixUser ? getUidFromUsername(workloadUnixUser) : undefined;
+    if (workloadUnixUser && workloadUid === undefined) {
+      throw new Error(`Could not resolve executor UID for ${workloadUnixUser}`);
+    }
+    let workloadRegistration: Promise<Task | null> = Promise.resolve(null);
     spawnExecutor(executorPayload, {
       cwd,
       asUser: executorUnixUser || undefined,
@@ -1000,26 +1038,37 @@ function createExecuteHandler(
         unix_user: executorUnixUser || undefined,
       },
       onSpawn: (child) => {
-        if (child.pid) {
-          trackExecutorProcess(data.executorAttemptId, child.pid);
-          workloadRegistration = taskRepo
-            .patchExecutorAttempt(taskId, data.executorAttemptId, {
-              workload: {
-                kind: config.execution?.executor_command_template
-                  ? ExecutorWorkloadKind.TEMPLATED
-                  : ExecutorWorkloadKind.LOCAL,
-                pid: child.pid,
-              },
-            })
-            .then(() => undefined);
-          console.log(`${logPrefix} PID: ${child.pid}`);
-          return workloadRegistration;
-        }
+        if (!child.pid) throw new Error('Executor workload has no PID');
+        const workload = {
+          kind: config.execution?.executor_command_template
+            ? ExecutorWorkloadKind.TEMPLATED
+            : ExecutorWorkloadKind.LOCAL,
+          pid: child.pid,
+          ...(workloadUnixUser ? { unix_user: workloadUnixUser, uid: workloadUid } : {}),
+        } satisfies ExecutorWorkloadRef;
+        trackExecutorProcess(data.executorAttemptId, child.pid);
+        workloadRegistration = taskRepo.patchExecutorAttempt(taskId, data.executorAttemptId, {
+          workload,
+        });
+        console.log(`${logPrefix} PID: ${child.pid}`);
+        return (async () => {
+          let registered: Task | null = null;
+          try {
+            registered = await workloadRegistration;
+          } finally {
+            if (!registered) {
+              await ensureExecutorWorkloadStopped(data.executorAttemptId, workload);
+            }
+          }
+          if (registered?.status !== TaskStatus.DISPATCHING) {
+            throw new Error(EXECUTOR_LAUNCH_CANCELLED_MESSAGE);
+          }
+        })();
       },
       onExit: async (code) => {
         console.log(`${logPrefix} Exited with code ${code}`);
         try {
-          await workloadRegistration;
+          await workloadRegistration.catch(() => null);
           const currentTask = await tasksService.get(taskId, params);
           if (isTaskExecuting(currentTask)) {
             const stopping = currentTask.status === TaskStatus.STOPPING;

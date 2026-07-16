@@ -1274,7 +1274,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           `🚀 [Daemon] Routing ${session.agentic_tool} to Feathers/WebSocket executor (task ${shortId(taskId)})`
         );
 
-        await sessionsService.executeTask(
+        const execution = await sessionsService.executeTask(
           sessionId,
           {
             taskId,
@@ -1286,6 +1286,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           },
           params
         );
+        if (!execution.success) {
+          console.log(`⏭️ [Daemon] Executor launch cancelled for task ${shortId(taskId)}`);
+          return;
+        }
 
         console.log(
           `✅ [Daemon] Executor spawned for session ${shortId(sessionId)}, waiting for task completion`

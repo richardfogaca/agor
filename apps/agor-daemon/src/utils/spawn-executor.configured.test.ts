@@ -149,6 +149,23 @@ describe('configured executor spawning', () => {
     expect(JSON.parse(proc.written)).toMatchObject({ command: 'prompt' });
   });
 
+  it('does not send work when workload registration is rejected', async () => {
+    const proc = createMockProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnExecutor } = await import('./spawn-executor');
+
+    spawnExecutor(
+      { command: 'prompt' },
+      {
+        executorCommandTemplate: 'echo {command}',
+        onSpawn: () => Promise.reject(new Error('cancelled')),
+      }
+    );
+
+    await vi.waitFor(() => expect(proc.kill).toHaveBeenCalledWith('SIGKILL'));
+    expect(proc.written).toBe('');
+  });
+
   it('keeps createConfiguredSpawner isolated from module-level defaults', async () => {
     const proc = createMockProcess();
     spawnMock.mockReturnValue(proc);

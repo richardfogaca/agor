@@ -55,7 +55,7 @@ export function createExecutorTurnFinalizer(options: {
           })
         );
       }
-      await ensureExecutorWorkloadStopped(attempt.id, attempt.workload?.pid);
+      await ensureExecutorWorkloadStopped(attempt.id, attempt.workload);
 
       if (options.config.execution?.stateless_fs_mode && task.executor_connected_at) {
         const session = await options.app.service('sessions').get(task.session_id, params);

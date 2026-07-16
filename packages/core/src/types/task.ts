@@ -182,6 +182,9 @@ export interface ExecutorWorkloadRef {
   kind: ExecutorWorkloadKind;
   /** PID and process-group ID of the attempt's local workload leader. */
   pid: number;
+  /** Actual local owner used to inspect and signal isolated Linux workloads. */
+  unix_user?: string;
+  uid?: number;
 }
 
 export interface ExecutorAttempt {

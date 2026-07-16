@@ -751,6 +751,14 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
               `terminal task status cannot be changed from ${current.status}`
             );
           }
+          if (
+            current.status === TaskStatus.STOPPING &&
+            updates.status !== undefined &&
+            updates.status !== TaskStatus.STOPPING &&
+            updates.status !== TaskStatus.STOPPED
+          ) {
+            throw new RepositoryError('stopping tasks can only transition to stopped');
+          }
           if (current.status === TaskStatus.DISPATCHING && updates.status === TaskStatus.RUNNING) {
             throw new RepositoryError('dispatching tasks must connect through connectExecutor');
           }

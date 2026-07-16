@@ -1408,10 +1408,18 @@ describe('TaskRepository executor turn transitions', () => {
     const reserved = await tasks.reserveExecutorStop(sessionId);
     expect(reserved.task?.status).toBe(TaskStatus.STOPPING);
     expect(reserved.transitioned).toBe(true);
+    expect(
+      await tasks.patchExecutorAttempt(task.task_id, attemptId, {
+        workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
+      })
+    ).toMatchObject({ status: TaskStatus.STOPPING });
     expect(await tasks.connectExecutor(task.task_id, attemptId)).toBeNull();
     expect(
       await tasks.transitionExecutorRuntime(task.task_id, attemptId, TaskStatus.AWAITING_PERMISSION)
     ).toBeNull();
+    await expect(tasks.update(task.task_id, { status: TaskStatus.COMPLETED })).rejects.toThrow(
+      /stopping tasks/
+    );
     expect((await sessions.findById(sessionId))?.status).toBe(SessionStatus.STOPPING);
   });
 
@@ -1499,6 +1507,11 @@ describe('TaskRepository executor turn transitions', () => {
       workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 4242 },
     });
     expect(released?.task.executor_attempt?.finalization_error).toBeUndefined();
+    expect(
+      await tasks.patchExecutorAttempt(first.task_id, attemptId, {
+        workload: { kind: ExecutorWorkloadKind.LOCAL, pid: 1 },
+      })
+    ).toBeNull();
 
     const nextAttempt = generateId();
     const admitted = await tasks.admitExecutorTurn({

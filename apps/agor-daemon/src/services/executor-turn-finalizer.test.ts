@@ -71,7 +71,10 @@ describe('executor turn finalizer', () => {
 
     await finalizer({ task_id: 'task-1', executor_attempt_id: 'attempt-1' });
 
-    expect(mocks.ensureStopped).toHaveBeenCalledWith('attempt-1', 4242);
+    expect(mocks.ensureStopped).toHaveBeenCalledWith('attempt-1', {
+      kind: 'local',
+      pid: 4242,
+    });
     expect(mocks.pushSessionState).toHaveBeenCalledTimes(1);
     expect(patch).toHaveBeenCalledWith('task-1', { session_md5: 'session-md5' }, undefined);
     expect(mocks.ensureStopped.mock.invocationCallOrder[0]).toBeLessThan(
