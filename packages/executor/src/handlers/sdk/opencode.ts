@@ -11,13 +11,14 @@
 
 import { generateId, shortId } from '@agor/core';
 import type { MessageID, PermissionMode, SessionID, TaskID } from '@agor/core/types';
-import { MessageRole } from '@agor/core/types';
+import { MessageRole, TaskStatus } from '@agor/core/types';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
 import type { ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
 import type { ResolvedConfigSlice } from '../../payload-types.js';
 import { OpenCodeTool } from '../../sdk-handlers/opencode/index.js';
 import type { AgorClient } from '../../services/feathers-client.js';
 import { createStreamingCallbacks } from './base-executor.js';
+import type { ToolExecutionOutcome } from './tool-registry.js';
 
 /**
  * Execute OpenCode task (Feathers/WebSocket architecture)
@@ -32,7 +33,7 @@ export async function executeOpenCodeTask(params: {
   permissionMode?: PermissionMode;
   abortController: AbortController;
   resolvedConfig?: ResolvedConfigSlice;
-}): Promise<void> {
+}): Promise<ToolExecutionOutcome> {
   const { client, sessionId, taskId, prompt } = params;
 
   console.log(`[opencode] Executing task ${shortId(taskId)}...`);
@@ -167,22 +168,13 @@ export async function executeOpenCodeTask(params: {
 
     console.log('[opencode] Setting task model:', modelIdentifier);
 
-    // Update task status to completed and set model
-    await client.service('tasks').patch(taskId, {
-      status: result?.status === 'completed' ? 'completed' : 'failed',
-      completed_at: new Date().toISOString(),
-      model: modelIdentifier, // Set the model identifier used for this task (provider/model format)
-    });
+    if (modelIdentifier) await client.service('tasks').patch(taskId, { model: modelIdentifier });
+    return {
+      status: result?.status === 'completed' ? TaskStatus.COMPLETED : TaskStatus.FAILED,
+    };
   } catch (error) {
     const err = error as Error;
     console.error('[opencode] Execution failed:', err);
-
-    // Update task status to failed
-    await client.service('tasks').patch(taskId, {
-      status: 'failed',
-      completed_at: new Date().toISOString(),
-    });
-
     throw err;
   }
 }

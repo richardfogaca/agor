@@ -1,6 +1,6 @@
 import { shortId, type TaskRepository } from '@agor/core/db';
 import type { Params, SessionID } from '@agor/core/types';
-import { isSessionExecuting, SessionStatus } from '@agor/core/types';
+import { SessionStatus } from '@agor/core/types';
 import type { SessionsServiceImpl, TasksServiceImpl } from '../declarations.js';
 
 export interface StopSessionResult {
@@ -30,14 +30,7 @@ export async function stopSessionPreserveQueue(
   params: Params = {},
   options: { reason?: string } = {}
 ): Promise<StopSessionResult> {
-  const session = await deps.sessionsService.get(sessionId, params);
-
-  if (!isSessionExecuting(session)) {
-    return {
-      success: false,
-      reason: `Session cannot be stopped (status: ${session.status})`,
-    };
-  }
+  await deps.sessionsService.get(sessionId, params);
 
   const queuedTasks = await deps.taskRepo.findQueued(sessionId);
   const latestTask = await deps.tasksService.reserveExecutorStop(sessionId, params);

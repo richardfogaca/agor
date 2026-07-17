@@ -1,7 +1,8 @@
 import { eq, type SQL, sql } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
-import { dateTruncUtc, lockRowForUpdate } from './database-wrapper';
+import { dateTruncUtc, lockRowForUpdate, runDatabaseTransaction } from './database-wrapper';
+import { RepositoryError } from './repositories/base';
 import { tasks } from './schema.postgres';
 
 describe('dateTruncUtc', () => {
@@ -25,4 +26,23 @@ it('uses a row lock compatible with earlier foreign-key checks', async () => {
   await lockRowForUpdate(transaction as never, {} as never, tasks, eq(tasks.task_id, 'task-1'));
 
   expect(new PgDialect().sqlToQuery(query!).sql).toContain('FOR NO KEY UPDATE');
+});
+
+it('retries wrapped SQLite busy errors', async () => {
+  let attempts = 0;
+  const db = {
+    run() {},
+    async transaction(work: (tx: unknown) => Promise<string>) {
+      attempts++;
+      if (attempts === 1) {
+        throw new RepositoryError('wrapped busy', { code: 'SQLITE_BUSY' });
+      }
+      return work({});
+    },
+  };
+
+  await expect(
+    runDatabaseTransaction(db as never, async () => 'done', { sqliteImmediate: true })
+  ).resolves.toBe('done');
+  expect(attempts).toBe(2);
 });

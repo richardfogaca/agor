@@ -73,6 +73,20 @@ describe('executorRuntimeScopeGuard', () => {
     await expect(executorRuntimeScopeGuard()(context)).rejects.toThrow(/daemon-owned/);
   });
 
+  it('rejects ownership fields in the executor final write', async () => {
+    const context = ctx({
+      method: 'finishExecutorAttempt',
+      data: {
+        task_id: 'task-1',
+        executor_attempt_id: 'attempt-1',
+        status: TaskStatus.COMPLETED,
+        executor_attempt: { released_at: new Date().toISOString() },
+      },
+    });
+
+    await expect(executorRuntimeScopeGuard()(context)).rejects.toThrow(/daemon-owned/);
+  });
+
   it('allows only explicit executor result fields', async () => {
     const context = ctx({
       method: 'patch',
@@ -84,6 +98,24 @@ describe('executorRuntimeScopeGuard', () => {
     await expect(
       executorRuntimeScopeGuard()(ctx({ method: 'patch', id: 'task-1', data: { metadata: {} } }))
     ).rejects.toThrow(/daemon-owned/);
+  });
+
+  it('limits executor session patches to runtime result references', async () => {
+    await expect(
+      executorRuntimeScopeGuard()(
+        ctx({
+          path: 'sessions',
+          method: 'patch',
+          id: 'session-1',
+          data: { sdk_session_id: 'sdk-1' },
+        })
+      )
+    ).resolves.toBeDefined();
+    await expect(
+      executorRuntimeScopeGuard()(
+        ctx({ path: 'sessions', method: 'patch', id: 'session-1', data: { model_config: {} } })
+      )
+    ).rejects.toThrow(/lifecycle or configuration/);
   });
 
   it('leaves pending-state removal enforcement to the repository transaction', async () => {

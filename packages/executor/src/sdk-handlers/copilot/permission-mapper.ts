@@ -18,7 +18,7 @@
 
 import { generateId, shortId } from '@agor/core';
 import type { Message, MessageID, SessionID, TaskID } from '@agor/core/types';
-import { MessageRole, PermissionStatus, SessionStatus, TaskStatus } from '@agor/core/types';
+import { MessageRole, PermissionStatus, TaskStatus } from '@agor/core/types';
 import type {
   PermissionHandler,
   PermissionRequest,
@@ -322,13 +322,6 @@ export function createPermissionHandler(
           completed_at: new Date().toISOString(),
         });
 
-        if (deps.sessionsService) {
-          await deps.sessionsService.patch(sessionId, {
-            status: SessionStatus.TIMED_OUT,
-            ready_for_prompt: true,
-          });
-        }
-
         return {
           kind: 'denied-interactively-by-user',
           feedback: `Permission request timed out for: ${toolName}`,
@@ -343,16 +336,6 @@ export function createPermissionHandler(
 
         // Cancel all pending permission requests for this session
         deps.permissionService.cancelPendingRequests(sessionId);
-
-        await deps.tasksService.patch(taskId, {
-          status: TaskStatus.FAILED,
-        });
-
-        if (deps.sessionsService) {
-          await deps.sessionsService.patch(sessionId, {
-            status: 'idle' as const,
-          });
-        }
 
         return {
           kind: 'denied-interactively-by-user',
@@ -369,15 +352,6 @@ export function createPermissionHandler(
       return approved;
     } catch (error) {
       console.error('[Copilot Permission] Error in permission flow:', error);
-
-      try {
-        await deps.tasksService.patch(taskId, {
-          status: TaskStatus.FAILED,
-          report: `Error: ${error instanceof Error ? error.message : String(error)}`,
-        });
-      } catch (updateError) {
-        console.error('[Copilot Permission] Failed to update task status:', updateError);
-      }
 
       return {
         kind: 'denied-interactively-by-user',

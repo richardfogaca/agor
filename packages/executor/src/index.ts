@@ -19,10 +19,10 @@ import type {
 import { ExecutorPulseKind, TaskStatus } from '@agor/core/types';
 import { patchConsole } from '@agor/core/utils/logger';
 import { type ExecutorRuntime, startExecutorRuntimeOverseer } from './executor-heartbeat.js';
+import type { ToolExecutionOutcome } from './handlers/sdk/tool-registry.js';
 import type { ResolvedConfigSlice } from './payload-types.js';
 import { globalPermissionManager } from './permissions/permission-manager.js';
 import { type AgorClient, createFeathersClient } from './services/feathers-client.js';
-import { tryMarkTaskTerminal } from './terminal-task.js';
 
 patchConsole();
 
@@ -62,15 +62,14 @@ export class AgorExecutor {
 
   /** Make terminal state the final executor write, then surrender the attempt. */
   private async finishExecutorAttempt(
-    status?: typeof TaskStatus.FAILED | typeof TaskStatus.STOPPED,
-    errorMessage?: string
+    outcome: ToolExecutionOutcome = { status: TaskStatus.COMPLETED }
   ): Promise<void> {
     if (!this.client) return;
-    if (status) await tryMarkTaskTerminal(this.client, this.config.taskId, status, errorMessage);
     try {
       await this.client.service('tasks').finishExecutorAttempt({
         task_id: this.config.taskId,
         executor_attempt_id: this.config.executorAttemptId,
+        ...outcome,
       });
     } catch (error) {
       console.error('[executor] Failed to finish executor attempt:', error);
@@ -105,18 +104,17 @@ export class AgorExecutor {
       this.setupShutdownHandlers();
 
       // Execute the task
-      await this.executeTask();
-      await this.finishExecutorAttempt();
+      await this.finishExecutorAttempt(await this.executeTask());
 
       // Exit successfully
       console.log('[executor] Task completed, exiting');
       process.exit(0);
     } catch (error) {
       console.error('[executor] Fatal error:', error);
-      await this.finishExecutorAttempt(
-        TaskStatus.FAILED,
-        error instanceof Error ? error.message : String(error)
-      );
+      await this.finishExecutorAttempt({
+        status: TaskStatus.FAILED,
+        error_message: error instanceof Error ? error.message : String(error),
+      });
       process.exit(1);
     }
   }
@@ -164,7 +162,7 @@ export class AgorExecutor {
   /**
    * Execute the task using the appropriate SDK
    */
-  private async executeTask(): Promise<void> {
+  private async executeTask(): Promise<ToolExecutionOutcome> {
     if (!this.client) {
       throw new Error('Feathers client not initialized');
     }
@@ -197,7 +195,7 @@ export class AgorExecutor {
       this.heartbeat.observe(ExecutorPulseKind.SDK_STARTED);
 
       // Execute using registry
-      await ToolRegistry.execute(this.config.tool, {
+      return await ToolRegistry.execute(this.config.tool, {
         client: this.client,
         sessionId: this.config.sessionId as SessionID,
         taskId: this.config.taskId as TaskID,
@@ -209,7 +207,7 @@ export class AgorExecutor {
         runtime: this.heartbeat,
       });
     } finally {
-      this.heartbeat?.stop();
+      await this.heartbeat?.finish();
       this.heartbeat = null;
       this.isRunning = false;
     }
@@ -232,7 +230,7 @@ export class AgorExecutor {
       // The daemon's stop route already patches the task to STOPPED before
       // sending the signal — this fallback only fires if we received an
       // out-of-band signal and the task is still active.
-      await this.finishExecutorAttempt(TaskStatus.STOPPED);
+      await this.finishExecutorAttempt({ status: TaskStatus.STOPPED });
 
       process.exit(0);
     };
@@ -242,19 +240,19 @@ export class AgorExecutor {
 
     process.on('uncaughtException', async (error) => {
       console.error('[executor] Uncaught exception:', error);
-      await this.finishExecutorAttempt(
-        TaskStatus.FAILED,
-        `uncaughtException: ${error instanceof Error ? error.message : String(error)}`
-      );
+      await this.finishExecutorAttempt({
+        status: TaskStatus.FAILED,
+        error_message: `uncaughtException: ${error instanceof Error ? error.message : String(error)}`,
+      });
       process.exit(1);
     });
 
     process.on('unhandledRejection', async (reason) => {
       console.error('[executor] Unhandled rejection:', reason);
-      await this.finishExecutorAttempt(
-        TaskStatus.FAILED,
-        `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`
-      );
+      await this.finishExecutorAttempt({
+        status: TaskStatus.FAILED,
+        error_message: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`,
+      });
       process.exit(1);
     });
   }

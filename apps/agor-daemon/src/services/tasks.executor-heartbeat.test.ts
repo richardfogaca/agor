@@ -6,7 +6,14 @@ import { TasksService } from './tasks';
 describe('TasksService executor heartbeat helpers', () => {
   it.each([
     ['connectExecutor', { task_id: 'task-1', executor_attempt_id: 'attempt-1' }],
-    ['finishExecutorAttempt', { task_id: 'task-1', executor_attempt_id: 'attempt-1' }],
+    [
+      'finishExecutorAttempt',
+      {
+        task_id: 'task-1',
+        executor_attempt_id: 'attempt-1',
+        status: TaskStatus.COMPLETED,
+      },
+    ],
     [
       'reportExecutorTelemetry',
       { task_id: 'task-1', executor_attempt_id: 'attempt-1', heartbeat: true },
@@ -36,8 +43,15 @@ describe('TasksService executor heartbeat helpers', () => {
     let finalized!: () => void;
     const finalization = new Promise<void>((resolve) => (finalized = resolve));
     const finalizeTurn = vi.fn(async () => finalized());
-    const service = new TasksService({} as never, {} as never, finalizeTurn);
-    service.get = vi.fn().mockResolvedValue(task);
+    const service = Object.create(TasksService.prototype) as TasksService;
+    Object.assign(service, {
+      taskRepo: {
+        finishExecutorAttempt: vi.fn().mockResolvedValue({ task, transitioned: true }),
+      },
+      finalizeTurn,
+      trackTaskCompleted: vi.fn(),
+      emit: vi.fn(),
+    });
     const params = {
       executorTaskId: 'task-1',
       executorAttemptId: 'attempt-1',
@@ -45,7 +59,14 @@ describe('TasksService executor heartbeat helpers', () => {
     };
 
     const result = await runWithTenantContext('tenant-1', () =>
-      service.finishExecutorAttempt({ task_id: 'task-1', executor_attempt_id: 'attempt-1' }, params)
+      service.finishExecutorAttempt(
+        {
+          task_id: 'task-1',
+          executor_attempt_id: 'attempt-1',
+          status: TaskStatus.COMPLETED,
+        },
+        params
+      )
     );
 
     expect(result).toBe(task);
@@ -59,19 +80,58 @@ describe('TasksService executor heartbeat helpers', () => {
 
   it('does not finish an attempt before its final write', async () => {
     const finalizeTurn = vi.fn();
-    const service = new TasksService({} as never, {} as never, finalizeTurn);
-    service.get = vi.fn().mockResolvedValue({
-      status: TaskStatus.RUNNING,
-      executor_attempt: { id: 'attempt-1' },
+    const service = Object.create(TasksService.prototype) as TasksService;
+    Object.assign(service, {
+      taskRepo: { finishExecutorAttempt: vi.fn().mockResolvedValue(null) },
+      finalizeTurn,
     });
 
     await expect(
       service.finishExecutorAttempt(
-        { task_id: 'task-1', executor_attempt_id: 'attempt-1' },
+        {
+          task_id: 'task-1',
+          executor_attempt_id: 'attempt-1',
+          status: TaskStatus.COMPLETED,
+        },
         { executorTaskId: 'task-1', executorAttemptId: 'attempt-1' }
       )
     ).rejects.toThrow(/not ready to finish/);
     expect(finalizeTurn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    TaskStatus.CREATED,
+    TaskStatus.QUEUED,
+    TaskStatus.DISPATCHING,
+    TaskStatus.STOPPING,
+  ])('rejects executor transitions into daemon-owned state %s', async (status) => {
+    const service = Object.create(TasksService.prototype) as TasksService;
+
+    await expect(
+      service.patch(
+        'task-1',
+        { status },
+        {
+          executorTaskId: 'task-1',
+          executorAttemptId: 'attempt-1',
+        }
+      )
+    ).rejects.toThrow(/cannot transition/);
+  });
+
+  it('rejects a non-terminal executor finish', async () => {
+    const service = Object.create(TasksService.prototype) as TasksService;
+
+    await expect(
+      service.finishExecutorAttempt(
+        {
+          task_id: 'task-1',
+          executor_attempt_id: 'attempt-1',
+          status: TaskStatus.QUEUED,
+        } as never,
+        { executorTaskId: 'task-1', executorAttemptId: 'attempt-1' }
+      )
+    ).rejects.toThrow(/Invalid executor finish/);
   });
 
   it('fails lost heartbeat tasks without releasing the executor turn', async () => {

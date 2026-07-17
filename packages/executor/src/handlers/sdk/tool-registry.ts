@@ -5,7 +5,13 @@
  * Makes it easier to add new tools and ensures consistency.
  */
 
-import type { MessageSource, PermissionMode, SessionID, TaskID } from '@agor/core/types';
+import type {
+  ExecutorFinishOutcome,
+  MessageSource,
+  PermissionMode,
+  SessionID,
+  TaskID,
+} from '@agor/core/types';
 import { TOOL_API_KEY_NAMES } from '@agor/core/types';
 import type { ExecutorRuntime } from '../../executor-heartbeat.js';
 import type { ResolvedConfigSlice } from '../../payload-types.js';
@@ -19,6 +25,8 @@ export type Tool = 'claude-code' | 'gemini' | 'codex' | 'opencode' | 'copilot' |
 /**
  * Tool runner function - executes via Feathers WebSocket
  */
+export type ToolExecutionOutcome = ExecutorFinishOutcome;
+
 export type ToolRunner = (params: {
   client: AgorClient;
   sessionId: SessionID;
@@ -30,7 +38,7 @@ export type ToolRunner = (params: {
   /** Daemon-resolved config slice. Undefined in legacy CLI mode. */
   resolvedConfig?: ResolvedConfigSlice;
   runtime?: ExecutorRuntime;
-}) => Promise<void>;
+}) => Promise<ToolExecutionOutcome>;
 
 /**
  * Tool configuration
@@ -108,7 +116,7 @@ export class ToolRegistry {
       resolvedConfig?: ResolvedConfigSlice;
       runtime?: ExecutorRuntime;
     }
-  ): Promise<void> {
+  ): Promise<ToolExecutionOutcome> {
     const config = ToolRegistry.get(tool);
     if (!config) {
       throw new Error(`Unknown tool: ${tool}`);

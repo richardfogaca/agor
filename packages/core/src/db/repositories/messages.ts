@@ -6,7 +6,7 @@
  */
 
 import type { Message, MessageID, SessionID, TaskID, UUID } from '@agor/core/types';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { Database } from '../client';
 import { deleteFrom, insert, select, update } from '../database-wrapper';
 import { type MessageInsert, type MessageRow, messages } from '../schema';
@@ -74,6 +74,15 @@ export class MessagesRepository {
     const rows = messageList.map((m) => this.messageToRow(m));
     const inserted = await insert(this.db, messages).values(rows).returning().all();
     return inserted.map((r: MessageRow) => this.rowToMessage(r));
+  }
+
+  /** Allocate the next session index while the caller holds the session lock. */
+  async nextIndex(sessionId: SessionID): Promise<number> {
+    const row = await select(this.db, { max: sql<number | null>`max(${messages.index})` })
+      .from(messages)
+      .where(eq(messages.session_id, sessionId))
+      .one();
+    return (row?.max ?? -1) + 1;
   }
 
   /**

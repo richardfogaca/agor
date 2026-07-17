@@ -15,6 +15,7 @@ import {
 } from '@agor/core/config';
 import {
   BranchRepository,
+  bindRepositoryToTenantUnitOfWork,
   getCurrentTenantId,
   runWithTenantDatabaseScope,
   SessionEnvSelectionRepository,
@@ -22,10 +23,17 @@ import {
   SessionRelationshipRepository,
   SessionRepository,
   type SessionWithLastMessage,
+  TaskRepository,
   type TenantScopeAwareDatabase,
   UsersRepository,
 } from '@agor/core/db';
-import { type Application, BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
+import {
+  type Application,
+  BadRequest,
+  Conflict,
+  Forbidden,
+  NotAuthenticated,
+} from '@agor/core/feathers';
 import {
   formatModelToolMismatchWarning,
   formatUnsupportedAgorCodexModelMessage,
@@ -118,6 +126,8 @@ export type SessionParams = QueryParams<{
     _agorSqlSessionAccessUserId?: UUID;
     /** Internal task-start reconciliation of a live preset. */
     _applyingAgenticToolPreset?: boolean;
+    executorAttemptId?: string;
+    executorTaskId?: string;
   };
 
 /**
@@ -175,6 +185,7 @@ export type ExecuteTaskData = {
   permissionMode?: import('@agor/core/types').PermissionMode;
   stream?: boolean;
   messageSource?: import('@agor/core/types').MessageSource;
+  initialMessage?: import('@agor/core/types').Message;
 };
 
 export type SessionArchiveOptions = {
@@ -192,6 +203,7 @@ export type SessionArchiveResult = {
  */
 export class SessionsService extends DrizzleService<Session, Partial<Session>, SessionParams> {
   private sessionRepo: SessionRepository;
+  private taskRepo: TaskRepository;
   private app: Application;
   private sessionMCPRepo: SessionMCPServerRepository;
   private sessionRelationshipRepo: SessionRelationshipRepository;
@@ -214,7 +226,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
   }
 
   constructor(db: TenantScopeAwareDatabase, app: Application) {
-    const sessionRepo = new SessionRepository(db);
+    const sessionRepo = bindRepositoryToTenantUnitOfWork(db, new SessionRepository(db));
     super(sessionRepo, {
       id: 'session_id',
       resourceType: 'Session',
@@ -226,6 +238,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
     });
 
     this.sessionRepo = sessionRepo;
+    this.taskRepo = bindRepositoryToTenantUnitOfWork(db, new TaskRepository(db));
     this.db = db;
     this.app = app;
     this.sessionMCPRepo = new SessionMCPServerRepository(db);
@@ -1111,23 +1124,33 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
     emitRemoved: boolean
   ): Promise<Session> {
     const session = await this.get(id, params);
-    const children = await this.sessionRepo.findChildren(id);
-
-    for (const child of children) {
-      await this.removeOne(child.session_id, params, true);
+    const descendants = await this.collectBranchLocalDescendants(session);
+    const targets = [session, ...descendants];
+    const deleted = await this.taskRepo.withUnheldSessions(
+      targets.map((candidate) => candidate.session_id),
+      async (db) => {
+        const repo = new SessionRepository(db);
+        for (const candidate of [...descendants].reverse()) {
+          await repo.delete(candidate.session_id);
+        }
+        await repo.delete(id);
+        return true;
+      }
+    );
+    if (!deleted) {
+      throw new Conflict('Stop and release active turns before deleting this session tree');
     }
-
-    await this.sessionRepo.delete(id);
-
-    if (emitRemoved) {
+    for (const candidate of [...descendants].reverse()) {
       emitServiceEvent(this.app, {
         path: 'sessions',
         event: 'removed',
-        data: session,
+        data: candidate,
         params,
-        id,
+        id: candidate.session_id,
       });
     }
+    if (emitRemoved)
+      emitServiceEvent(this.app, { path: 'sessions', event: 'removed', data: session, params, id });
 
     return session;
   }
@@ -1141,6 +1164,33 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
     data: Partial<Session>,
     params?: SessionParams
   ): Promise<Session | Session[]> {
+    const guardsRuntimeConfig =
+      id !== null &&
+      !Array.isArray(id) &&
+      !params?.executorAttemptId &&
+      [
+        'agentic_tool',
+        'agentic_tool_preset_id',
+        'model_config',
+        'permission_config',
+        'branch_id',
+        'unix_username',
+      ].some((field) => data[field as keyof Session] !== undefined);
+    if (params?.executorAttemptId) {
+      if (!params.executorTaskId || id === null || Array.isArray(id)) {
+        throw new Conflict('Executor session scope is incomplete');
+      }
+      const result = await this.taskRepo.withActiveExecutorAttempt(
+        params.executorTaskId,
+        params.executorAttemptId,
+        async (db, task) => {
+          if (task.session_id !== id) throw new Conflict('Executor does not own this session');
+          return new SessionRepository(db).update(String(id), data);
+        }
+      );
+      if (result === null) throw new Conflict('Executor attempt no longer owns session writes');
+      return result;
+    }
     let replaceAgenticConfig = false;
     if (
       (id === null || Array.isArray(id)) &&
@@ -1191,10 +1241,20 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
         );
       }
     }
+    const guardedResult = guardsRuntimeConfig
+      ? await this.taskRepo.withUnheldSessions([id as SessionID], (db) =>
+          new SessionRepository(db).update(String(id), data, { replaceAgenticConfig })
+        )
+      : undefined;
+    if (guardsRuntimeConfig && !guardedResult) {
+      throw new Conflict('Runtime configuration cannot change while a turn is active');
+    }
     const result = (
-      replaceAgenticConfig && id && !Array.isArray(id)
-        ? await this.sessionRepo.update(String(id), data, { replaceAgenticConfig: true })
-        : await super.patch(id, data, params)
+      guardsRuntimeConfig
+        ? guardedResult
+        : replaceAgenticConfig && id && !Array.isArray(id)
+          ? await this.sessionRepo.update(String(id), data, { replaceAgenticConfig: true })
+          : await super.patch(id, data, params)
     ) as Session | Session[];
 
     const callbackEnabled = data.callback_config?.enabled;

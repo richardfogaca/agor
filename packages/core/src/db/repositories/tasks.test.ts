@@ -7,16 +7,18 @@
 import type { HistoricalTaskImport, Task, UUID } from '@agor/core/types';
 import {
   ExecutorWorkloadKind,
+  MessageRole,
   SessionStatus,
   sanitizeExecutorPulse,
   TaskStatus,
 } from '@agor/core/types';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { generateId, toShortId } from '../../lib/ids';
 import type { Database } from '../client';
 import { dbTest } from '../test-helpers';
 import { AmbiguousIdError, EntityNotFoundError, RepositoryError } from './base';
 import { BranchRepository } from './branches';
+import { MessagesRepository } from './messages';
 import { RepoRepository } from './repos';
 import { SessionRepository } from './sessions';
 import { TaskRepository } from './tasks';
@@ -1308,6 +1310,110 @@ describe('TaskRepository sentinel invariants', () => {
 });
 
 describe('TaskRepository executor turn transitions', () => {
+  dbTest('atomically admits one direct CLI turn with its initial message', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const messages = new MessagesRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const message = {
+      message_id: generateId(),
+      session_id: sessionId,
+      type: 'user' as const,
+      role: MessageRole.USER,
+      index: 99,
+      timestamp: new Date().toISOString(),
+      content_preview: 'direct',
+      content: 'direct',
+    };
+
+    const admitted = await tasks.startCliTurn({ sessionId, fullPrompt: 'direct', message });
+
+    expect(admitted?.task).toMatchObject({
+      status: TaskStatus.RUNNING,
+      executor_attempt: { runtime_active: true },
+      message_range: { start_index: 0, end_index: 0 },
+    });
+    expect(await messages.findByTaskId(admitted!.task.task_id)).toHaveLength(1);
+    expect(await tasks.startCliTurn({ sessionId, fullPrompt: 'second', message })).toBeNull();
+  });
+
+  dbTest('rejects session mutations while a turn owns admission', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    await tasks.claimNextExecutorTurn({
+      sessionId,
+      patch: {
+        status: TaskStatus.DISPATCHING,
+        executor_attempt: { id: generateId(), preparing: true },
+      },
+    });
+    const mutation = vi.fn();
+
+    expect(await tasks.withUnheldSessions([sessionId], mutation)).toBeNull();
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
+  dbTest('cancels preparation without late writes when Stop wins', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const messages = new MessagesRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const queued = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    const attemptId = generateId();
+    await tasks.claimNextExecutorTurn({
+      sessionId,
+      patch: {
+        status: TaskStatus.DISPATCHING,
+        executor_attempt: { id: attemptId, preparing: true },
+      },
+    });
+
+    await tasks.reserveExecutorStop(sessionId);
+    const preparation = await tasks.completeExecutorPreparation(queued.task_id, attemptId, {
+      message_id: generateId(),
+      session_id: sessionId,
+      task_id: queued.task_id,
+      type: 'user',
+      role: MessageRole.USER,
+      index: 0,
+      timestamp: new Date().toISOString(),
+      content_preview: 'late',
+      content: 'late',
+    });
+
+    expect(preparation).toMatchObject({ prepared: false, task: { status: TaskStatus.STOPPED } });
+    expect(preparation?.task.executor_attempt?.preparing).toBe(false);
+    expect(await messages.findByTaskId(queued.task_id)).toEqual([]);
+  });
+
+  dbTest('atomically records the final outcome and its error message once', async ({ db }) => {
+    const tasks = new TaskRepository(db);
+    const messages = new MessagesRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const queued = await tasks.createPending(createPendingInput({ session_id: sessionId }));
+    const attemptId = generateId();
+    await tasks.claimNextExecutorTurn({
+      sessionId,
+      patch: { status: TaskStatus.DISPATCHING, executor_attempt: { id: attemptId } },
+    });
+    await tasks.connectExecutor(queued.task_id, attemptId);
+
+    const finish = {
+      task_id: queued.task_id,
+      executor_attempt_id: attemptId,
+      status: TaskStatus.FAILED,
+      error_message: 'expected failure',
+    } as const;
+    expect(
+      (await tasks.finishExecutorAttempt(queued.task_id, attemptId, finish))?.transitioned
+    ).toBe(true);
+    expect(
+      (await tasks.finishExecutorAttempt(queued.task_id, attemptId, finish))?.transitioned
+    ).toBe(false);
+    expect(await messages.findByTaskId(queued.task_id)).toEqual([
+      expect.objectContaining({ type: 'system', content: 'expected failure' }),
+    ]);
+  });
+
   dbTest('a later worker cannot bypass a slower FIFO head', async ({ db }) => {
     const tasks = new TaskRepository(db);
     const sessions = new SessionRepository(db);

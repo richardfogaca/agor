@@ -64,12 +64,11 @@ import type {
 import {
   AGENTIC_TOOL_CAPABILITIES,
   hasMinimumRole,
-  MessageRole,
+  isTerminalTaskStatus,
   ROLES,
   SessionStatus,
   TaskStatus,
 } from '@agor/core/types';
-import { NotFoundError } from '@agor/core/utils/errors';
 import type { Request } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import { createIssueBrowserTokensHook } from './auth/issue-browser-tokens-hook.js';
@@ -108,7 +107,6 @@ import type { TerminalsService } from './services/terminals.js';
 import { createUserApiKeysService } from './services/user-api-keys.js';
 import { markAuthenticationUserLookup, markLocalAuthenticationLookup } from './services/users.js';
 import { registerProxies } from './setup/proxies.js';
-import { appendSystemMessage } from './utils/append-system-message.js';
 import { buildAuthRateLimitKey } from './utils/auth-rate-limit-key.js';
 import {
   ensureMinimumRole,
@@ -269,7 +267,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     boardsService,
     branchRepository,
     usersRepository: _usersRepository,
-    sessionsRepository,
     sessionMCPServersService,
     sessionEnvSelectionsService,
     terminalsService: _terminalsService,
@@ -635,6 +632,18 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const _branchesRepo = new BranchRepository(db);
   const _reposRepo = new RepoRepository(db);
   const _tasksRepo = new TaskRepository(db);
+  const cliControl = new Map<string, Promise<unknown>>();
+
+  async function withCliControl<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+    const previous = cliControl.get(sessionId) ?? Promise.resolve();
+    const current = previous.then(work, work);
+    cliControl.set(sessionId, current);
+    try {
+      return await current;
+    } finally {
+      if (cliControl.get(sessionId) === current) cliControl.delete(sessionId);
+    }
+  }
 
   async function withExecutorMutation<T>(params: RouteParams, work: () => Promise<T>): Promise<T> {
     const scope = params as RouteParams & {
@@ -1009,65 +1018,18 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     requireAuth
   );
 
-  /**
-   * Helper: Safely patch an entity, returning false if it was deleted mid-execution
-   */
-  async function safePatch<T>(
-    serviceName: string,
-    id: string,
-    data: Partial<T>,
-    entityType: string,
-    params?: RouteParams
-  ): Promise<boolean> {
-    try {
-      await app.service(serviceName).patch(id, data, params || {});
-      return true;
-    } catch (error) {
-      if (
-        error instanceof NotFoundError ||
-        (error instanceof Error && error.message.includes('No record found'))
-      ) {
-        console.log(`⚠️  ${entityType} ${shortId(id)} was deleted mid-execution - skipping update`);
-        return false;
-      }
-      throw error;
-    }
-  }
-
   async function failClaimedTask(task: Task, error: unknown, params: RouteParams): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    await safePatch(
-      'tasks',
-      task.task_id,
-      { status: TaskStatus.FAILED, completed_at: new Date().toISOString(), error_message: message },
-      'Task',
+    await tasksService.failExecutorStart(
+      task,
+      new Error(`The agent failed to start.\n\n${message}`),
       params
     );
-    try {
-      await appendSystemMessage({
-        app,
-        db,
-        sessionId: task.session_id,
-        taskId: task.task_id,
-        content: `⚠️ The agent failed to start.\n\n${message}`,
-        role: MessageRole.ASSISTANT,
-        metadata: { is_meta: true },
-        params,
-      });
-    } catch (systemMessageError) {
-      console.warn('[Daemon] Failed to write system error message:', systemMessageError);
-    }
     app.service('tasks').emit('failed', {
       task_id: task.task_id,
       session_id: task.session_id,
       error_message: message,
     });
-    if (task.executor_attempt) {
-      await tasksService.finalizeExecutorTurn(
-        { task_id: task.task_id, executor_attempt_id: task.executor_attempt.id },
-        params
-      );
-    }
   }
 
   /**
@@ -1097,19 +1059,17 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   async function startClaimedTask(task: Task, params: RouteParams): Promise<Task> {
     const tenantId = getCurrentTenantId();
     if (!tenantId) throw new Error('Missing active tenant context for task executor startup');
-    const {
-      agenticToolEnabled,
-      messageStartIndex,
-      session: loadedSession,
-    } = await runWithTenantDatabaseScope(db, tenantId, async (tenantDb) => {
-      const session = await sessionsService.get(task.session_id, params);
-      return {
-        session,
-        agenticToolEnabled: await isTenantAgenticToolEnabled(session.agentic_tool, tenantDb),
-        // Recompute message_range.start_index against the live message count.
-        messageStartIndex: await sessionsRepository.countMessages(task.session_id),
-      };
-    });
+    const { agenticToolEnabled, session: loadedSession } = await runWithTenantDatabaseScope(
+      db,
+      tenantId,
+      async (tenantDb) => {
+        const session = await sessionsService.get(task.session_id, params);
+        return {
+          session,
+          agenticToolEnabled: await isTenantAgenticToolEnabled(session.agentic_tool, tenantDb),
+        };
+      }
+    );
     if (!agenticToolEnabled) {
       throw new Forbidden(`${loadedSession.agentic_tool} is disabled for this workspace`);
     }
@@ -1150,62 +1110,25 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       usersRepo: bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db)),
     });
 
-    const usesExecutor = session.agentic_tool !== 'claude-code-cli';
     const executorAttemptId = task.executor_attempt?.id;
-    if (usesExecutor && !executorAttemptId) throw new Error('Claimed task has no executor attempt');
-    const updatedTask = (await tasksService.patch(
-      task.task_id,
-      {
-        message_range: {
-          start_index: messageStartIndex,
-          end_index: messageStartIndex + 1,
-          start_timestamp: startTimestamp,
-          end_timestamp: startTimestamp,
-        },
-        git_state: { ref_at_start: 'unknown', sha_at_start: 'unknown' },
-      },
-      params
-    )) as Task;
-
-    // Alt D — write the user-message row before spawning. Gated by kill switch.
-    // The executor's createUserMessage has a skip-if-exists guard so a duplicate
-    // write is harmless if the daemon path is enabled.
-    if (config.execution?.daemon_writes_user_message !== false) {
-      try {
-        const isCallback = task.metadata?.is_agor_callback === true;
-        const messageMetadata: Message['metadata'] = {};
-        if (isCallback) {
-          messageMetadata.is_agor_callback = true;
-        }
-        // Prefer task.metadata.source (set when the task was queued) over
-        // the request's messageSource — the latter applies only to the
-        // current draining tick, the former to where the prompt originated.
-        const source = task.metadata?.source;
-        if (source) {
-          messageMetadata.source = source;
-        }
-
-        const userMessage = buildInitialUserMessage({
-          sessionId: task.session_id,
-          taskId: task.task_id,
-          index: messageStartIndex,
-          timestamp: startTimestamp,
-          content: task.full_prompt,
-          // Callback messages are typed `system` so the UI shows the special
-          // Agor-callback styling. Normal prompts stay `user`.
-          type: isCallback ? 'system' : 'user',
-          metadata: Object.keys(messageMetadata).length > 0 ? messageMetadata : undefined,
-        });
-        await app.service('messages').create(userMessage, params);
-      } catch (msgErr) {
-        // Don't fail the spawn — the executor's createUserMessage fallback
-        // (with skip-if-exists) will write the row when it connects.
-        console.warn(
-          `⚠️  [Daemon] Failed to write initial user-message row for task ${shortId(task.task_id)} (executor will retry):`,
-          msgErr
-        );
-      }
-    }
+    if (!executorAttemptId) throw new Error('Claimed task has no executor attempt');
+    const isCallback = task.metadata?.is_agor_callback === true;
+    const messageMetadata: Message['metadata'] = {
+      ...(isCallback ? { is_agor_callback: true } : {}),
+      ...(task.metadata?.source ? { source: task.metadata.source } : {}),
+    };
+    const initialMessage =
+      config.execution?.daemon_writes_user_message === false
+        ? undefined
+        : buildInitialUserMessage({
+            sessionId: task.session_id,
+            taskId: task.task_id,
+            index: 0,
+            timestamp: startTimestamp,
+            content: task.full_prompt,
+            type: isCallback ? 'system' : 'user',
+            metadata: Object.keys(messageMetadata).length ? messageMetadata : undefined,
+          });
 
     const useStreaming = task.metadata?.stream !== false;
     const sessionId = task.session_id;
@@ -1221,6 +1144,21 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     // this code path; for CLI sessions we short-circuit before
     // `executeTask` and emit `terminal:input` instead.
     if (session.agentic_tool === 'claude-code-cli') {
+      const prepared = await bindRepositoryToTenantUnitOfWork(
+        db,
+        new TaskRepository(db)
+      ).completeExecutorPreparation(task.task_id, executorAttemptId, initialMessage);
+      if (!prepared?.prepared) {
+        if (prepared?.task.executor_attempt && isTerminalTaskStatus(prepared.task.status)) {
+          await tasksService.finalizeExecutorTurn(
+            { task_id: task.task_id, executor_attempt_id: executorAttemptId },
+            params
+          );
+        }
+        return prepared?.task ?? task;
+      }
+      const updatedTask = prepared.task;
+      const messageStartIndex = updatedTask.message_range.start_index;
       // Hand the task off to the watcher BEFORE we PTY-inject. The watcher
       // claims this task on the next `user_message` JSONL line and links
       // every subsequent assistant/tool message to it — then closes it on
@@ -1231,72 +1169,71 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       // Import lazily to avoid pulling claude-cli-integration into the
       // hot-path of every non-CLI prompt.
       const { setPendingCliTask } = await import('./services/claude-cli-integration.js');
-      setPendingCliTask(sessionId as SessionID, taskId as TaskID, messageStartIndex);
+      setPendingCliTask(
+        sessionId as SessionID,
+        taskId as TaskID,
+        executorAttemptId,
+        messageStartIndex
+      );
 
       deferInFreshTenantScope(params, async () => {
         try {
-          const targetUserId = session.created_by;
-          if (!targetUserId) {
-            throw new Error('CLI session has no created_by — cannot route PTY injection');
-          }
-          const channel = `user/${targetUserId}/terminal`;
-          const tabName = `cli-${shortId(session.session_id)}`;
-          const io = (
-            app as unknown as {
-              io?: { to(r: string): { emit(ev: string, p: unknown): void } };
+          await withCliControl(sessionId, async () => {
+            const current = await new TaskRepository(db).findById(taskId);
+            if (
+              current?.status !== TaskStatus.RUNNING ||
+              current.executor_attempt?.id !== executorAttemptId
+            ) {
+              const { clearPendingCliTask } = await import('./services/claude-cli-integration.js');
+              clearPendingCliTask(sessionId as SessionID);
+              if (
+                current?.executor_attempt?.id === executorAttemptId &&
+                isTerminalTaskStatus(current.status)
+              ) {
+                await tasksService.finishDaemonAttempt(current, { status: current.status }, params);
+              }
+              return;
             }
-          ).io;
+            const targetUserId = session.created_by;
+            if (!targetUserId) {
+              throw new Error('CLI session has no created_by — cannot route PTY injection');
+            }
+            const channel = `user/${targetUserId}/terminal`;
+            const tabName = `cli-${shortId(session.session_id)}`;
+            const io = (
+              app as unknown as {
+                io?: { to(r: string): { emit(ev: string, p: unknown): void } };
+              }
+            ).io;
 
-          // Focus the session's tab BEFORE injecting input. Zellij sends
-          // terminal:input to whichever pane is currently focused, so
-          // without this step a prompt typed in the Agor textarea while
-          // the user happens to be viewing a sibling tab (e.g. the
-          // branch's `test-branch` bash) would land in bash and
-          // produce `bash: hello: command not found`. The 150ms delay
-          // gives Zellij time to process the focus before the input
-          // bytes arrive.
-          io?.to(channel).emit('terminal:tab', {
-            userId: targetUserId,
-            action: 'focus',
-            tabName,
+            io?.to(channel).emit('terminal:tab', {
+              userId: targetUserId,
+              action: 'focus',
+              tabName,
+            });
+            await new Promise((r) => setTimeout(r, 150));
+
+            io?.to(channel).emit('terminal:input', {
+              userId: targetUserId,
+              input: `${promptForExecutor}\r`,
+            });
+            console.log(
+              `[claude-cli] PTY-injected prompt into ${channel} → tab ${tabName} (task ${shortId(taskId)}, ${promptForExecutor.length} chars)`
+            );
           });
-          await new Promise((r) => setTimeout(r, 150));
-
-          // Append \r so the REPL submits. Zellij forwards raw bytes
-          // unchanged to claude's pseudo-tty. If the user is currently
-          // mid-typing into the REPL, the bytes interleave — documented
-          // race per the analysis doc § Blind spot #2.
-          const payload = `${promptForExecutor}\r`;
-          io?.to(channel).emit('terminal:input', { userId: targetUserId, input: payload });
-          console.log(
-            `[claude-cli] PTY-injected prompt into ${channel} → tab ${tabName} (task ${shortId(taskId)}, ${promptForExecutor.length} chars)`
-          );
-          // Task lifecycle is now owned by the watcher's sink: it closes
-          // the task and patches the session back to IDLE on `turn_end`.
+          // Task lifecycle is now owned by the watcher's sink: it finishes
+          // the attempt through the shared release tail on `turn_end`.
           // We deliberately do NOT pre-complete here.
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[claude-cli] PTY injection failed for task ${shortId(taskId)}: ${msg}`);
-          await safePatch(
-            'tasks',
-            taskId,
-            {
-              status: TaskStatus.FAILED,
-              completed_at: new Date().toISOString(),
-              error_message: `PTY injection failed: ${msg}`,
-            },
-            'Task',
+          const { clearPendingCliTask } = await import('./services/claude-cli-integration.js');
+          clearPendingCliTask(sessionId as SessionID);
+          await tasksService.failExecutorStart(
+            updatedTask,
+            new Error(`PTY injection failed: ${msg}`),
             params
           );
-          // Failure path: also flip the session back to IDLE so the user
-          // can retry. The success path lets the watcher handle this on
-          // turn_end.
-          await app
-            .service('sessions')
-            .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params)
-            .catch(() => {
-              /* best-effort */
-            });
         }
       });
       return updatedTask;
@@ -1322,6 +1259,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             permissionMode: task.metadata?.permission_mode,
             stream: useStreaming,
             messageSource: task.metadata?.source,
+            initialMessage,
           },
           params
         );
@@ -1340,14 +1278,14 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           error
         );
         try {
-          await failClaimedTask(updatedTask, error, params);
+          await failClaimedTask(task, error, params);
         } catch (finalizationError) {
           console.error(`❌ [Daemon] Failed to settle task ${shortId(taskId)}:`, finalizationError);
         }
       }
     });
 
-    return updatedTask;
+    return task;
   }
 
   // ============================================================================
@@ -2004,7 +1942,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         const sessionsServiceWithHooks = app.service('sessions') as unknown as SessionsServiceImpl;
 
-        return stopSessionPreserveQueue(
+        const session = await sessionsServiceWithHooks.get(id, params);
+        const result = await stopSessionPreserveQueue(
           {
             taskRepo: bindRepositoryToTenantUnitOfWork(db, new TaskRepository(db)),
             sessionsService: sessionsServiceWithHooks,
@@ -2014,6 +1953,26 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           params,
           { reason: stopReason }
         );
+        if (result.success && session.agentic_tool === 'claude-code-cli') {
+          await withCliControl(id, async () => {
+            const userId = session.created_by;
+            const io = (
+              app as unknown as {
+                io?: { to(room: string): { emit(event: string, payload: unknown): void } };
+              }
+            ).io;
+            io?.to(`user/${userId}/terminal`).emit('terminal:tab', {
+              userId,
+              action: 'focus',
+              tabName: `cli-${shortId(id)}`,
+            });
+            io?.to(`user/${userId}/terminal`).emit('terminal:input', {
+              userId,
+              input: '\u0003',
+            });
+          });
+        }
+        return result;
       },
     },
     {
@@ -2081,7 +2040,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       patch: {
         status: usesExecutor ? TaskStatus.DISPATCHING : TaskStatus.RUNNING,
         started_at: new Date().toISOString(),
-        ...(usesExecutor ? { executor_attempt: { id: generateId() } } : {}),
+        executor_attempt: {
+          id: generateId(),
+          preparing: true,
+          ...(!usesExecutor ? { runtime_active: true } : {}),
+        },
       },
     });
     if (!claimed) {

@@ -48,6 +48,7 @@ const EXECUTOR_TASK_FIELDS = new Set([
   'report',
   'permission_request',
 ]);
+const EXECUTOR_SESSION_FIELDS = new Set(['git_state', 'sdk_session_id']);
 const EXECUTOR_LIFECYCLE_METHODS = new Set([
   'connectExecutor',
   'finishExecutorAttempt',
@@ -259,6 +260,16 @@ export function executorRuntimeScopeGuard() {
         if (forbidden.length) {
           throw new Forbidden(`Task lifecycle fields are daemon-owned: ${forbidden.join(', ')}`);
         }
+      } else if (context.method === 'finishExecutorAttempt') {
+        const forbidden = Object.keys(data).filter(
+          (field) =>
+            field !== 'task_id' &&
+            field !== 'executor_attempt_id' &&
+            !EXECUTOR_TASK_FIELDS.has(field)
+        );
+        if (forbidden.length) {
+          throw new Forbidden(`Task lifecycle fields are daemon-owned: ${forbidden.join(', ')}`);
+        }
       } else if (context.method === 'remove') {
         if (payload) throw new Forbidden('Executors cannot remove tasks');
       }
@@ -296,11 +307,9 @@ export function executorRuntimeScopeGuard() {
       } else {
         if (
           context.method === 'patch' &&
-          (data.status === 'running' ||
-            data.status === 'awaiting_permission' ||
-            data.status === 'awaiting_input')
+          Object.keys(data).some((field) => !EXECUTOR_SESSION_FIELDS.has(field))
         ) {
-          throw new Forbidden('Executor task state owns session runtime status');
+          throw new Forbidden('Executor token cannot modify session lifecycle or configuration');
         }
         expectMatch(sessionId, id ?? data.session_id ?? query.session_id, 'session');
         if (!id && data.session_id === undefined && query.session_id === undefined) {

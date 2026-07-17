@@ -208,6 +208,7 @@ export const sessions = pgTable(
           zellij_tab_name?: string;
           active_turn?: {
             task_id: string;
+            executor_attempt_id?: string;
             user_message_index: number;
             started_at_ms: number;
           } | null;

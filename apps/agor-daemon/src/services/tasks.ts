@@ -23,6 +23,8 @@ import { type Application, BadRequest, Conflict, Forbidden, NotFound } from '@ag
 import type {
   ContentBlock,
   ExecutorClaim,
+  ExecutorFinish,
+  ExecutorFinishOutcome,
   ExecutorTelemetryReport,
   HistoricalTaskImport,
   NullableId,
@@ -265,7 +267,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
         const patchResult = await this.app.service('sessions').patch(
           result.session_id,
           {
-            status: 'running',
+            status: SessionStatus.RUNNING,
             ready_for_prompt: false,
           },
           params
@@ -481,24 +483,37 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
    */
   async patch(id: string, data: Partial<Task>, params?: TaskParams): Promise<Task | Task[]> {
     const nextStatus = data.status;
-    if (
-      params?.executorAttemptId &&
-      (nextStatus === TaskStatus.RUNNING ||
+    if (params?.executorAttemptId && nextStatus) {
+      if (
+        nextStatus === TaskStatus.RUNNING ||
         nextStatus === TaskStatus.AWAITING_PERMISSION ||
-        nextStatus === TaskStatus.AWAITING_INPUT)
-    ) {
-      const transitioned = await this.taskRepo.transitionExecutorRuntime(
-        id,
-        params.executorAttemptId,
-        nextStatus
-      );
-      if (!transitioned) throw new Conflict('Executor no longer owns this task state');
-      const { status: _status, ...rest } = data;
-      const result = Object.keys(rest).length
-        ? await this.patchStoredTask(id, rest, params)
-        : transitioned;
-      if (nextStatus === TaskStatus.RUNNING) this.trackTaskStarted(result as Task);
-      return result;
+        nextStatus === TaskStatus.AWAITING_INPUT
+      ) {
+        const transitioned = await this.taskRepo.transitionExecutorRuntime(
+          id,
+          params.executorAttemptId,
+          nextStatus
+        );
+        if (!transitioned) throw new Conflict('Executor no longer owns this task state');
+        const { status: _status, ...rest } = data;
+        const result = Object.keys(rest).length
+          ? await this.patchStoredTask(id, rest, params)
+          : transitioned;
+        if (nextStatus === TaskStatus.RUNNING) this.trackTaskStarted(result as Task);
+        return result;
+      }
+      if (isTerminalTaskStatus(nextStatus)) {
+        if (!params.executorTaskId) throw new Conflict('Executor task scope is incomplete');
+        const { status: _status, ...updates } = data;
+        const finish: ExecutorFinish = {
+          ...updates,
+          task_id: params.executorTaskId,
+          executor_attempt_id: params.executorAttemptId,
+          status: nextStatus,
+        };
+        return this.acceptExecutorFinish(finish, params, false);
+      }
+      throw new Conflict(`Executor cannot transition task to ${nextStatus}`);
     }
     const currentTask = nextStatus !== undefined ? await this.get(id, params) : undefined;
     if (currentTask && isTerminalTaskStatus(currentTask.status) && nextStatus !== undefined) {
@@ -1003,29 +1018,75 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     return task;
   }
 
-  /** Acknowledge the executor's final write, then reconcile through the canonical finalizer. */
-  async finishExecutorAttempt(data: ExecutorClaim, params?: TaskParams): Promise<Task> {
-    if (!data.task_id || !data.executor_attempt_id) throw new BadRequest('Invalid executor finish');
-    const claim = authenticatedExecutorClaim(data, params);
-    const task = await this.get(claim.task_id, params);
-    if (
-      task.executor_attempt?.id !== claim.executor_attempt_id ||
-      !isTerminalTaskStatus(task.status)
-    ) {
-      throw new Conflict('Executor attempt is not ready to finish');
+  private async acceptExecutorFinish(
+    data: ExecutorFinish,
+    params: TaskParams | undefined,
+    allowUnconnected: boolean
+  ): Promise<Task> {
+    const result = await this.taskRepo.finishExecutorAttempt(
+      data.task_id,
+      data.executor_attempt_id,
+      data,
+      allowUnconnected
+    );
+    if (!result) throw new Conflict('Executor attempt is not ready to finish');
+    if (result.transitioned) {
+      this.trackTaskCompleted(result.task);
+      this.emit?.('patched', result.task);
     }
-    if (task.executor_attempt.released_at) return task;
     if (!resolveTenantIdForDeferredScope(params))
       throw new Conflict('Missing executor tenant scope');
-
     deferWithTenantContext(
       params,
       async () => {
-        await this.finalizeTurn(claim, params);
+        await this.finalizeTurn(
+          { task_id: data.task_id, executor_attempt_id: data.executor_attempt_id },
+          params
+        );
       },
       (error) => console.warn('⚠️  [TasksService] Executor finalization failed:', error)
     );
-    return task;
+    return result.task;
+  }
+
+  /** Accept the executor's final outcome as its last write, then finalize asynchronously. */
+  async finishExecutorAttempt(data: ExecutorFinish, params?: TaskParams): Promise<Task> {
+    if (!data.task_id || !data.executor_attempt_id || !isTerminalTaskStatus(data.status)) {
+      throw new BadRequest('Invalid executor finish');
+    }
+    const claim = authenticatedExecutorClaim(data, params);
+    return this.acceptExecutorFinish({ ...data, ...claim }, params, false);
+  }
+
+  /** Daemon-owned failure before an executor can connect. */
+  failExecutorStart(task: Task, error: unknown, params?: TaskParams): Promise<Task> {
+    const attemptId = task.executor_attempt?.id;
+    if (!attemptId) throw new Conflict('Claimed task has no executor attempt');
+    const message = error instanceof Error ? error.message : String(error);
+    return this.acceptExecutorFinish(
+      {
+        task_id: task.task_id,
+        executor_attempt_id: attemptId,
+        status: TaskStatus.FAILED,
+        error_message: message,
+      },
+      params,
+      true
+    );
+  }
+
+  finishDaemonAttempt(
+    task: Task,
+    finish: ExecutorFinishOutcome,
+    params?: TaskParams
+  ): Promise<Task> {
+    const attemptId = task.executor_attempt?.id;
+    if (!attemptId) throw new Conflict('Task has no executor attempt');
+    return this.acceptExecutorFinish(
+      { task_id: task.task_id, executor_attempt_id: attemptId, ...finish },
+      params,
+      true
+    );
   }
 
   async releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task> {

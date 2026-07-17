@@ -37,6 +37,7 @@ import {
   stampGitStateAtTaskStart,
 } from './base-executor.js';
 import { configureSessionGitSafeDirectories } from './git-safe-directory.js';
+import type { ToolExecutionOutcome } from './tool-registry.js';
 
 type CursorKeyResolution = {
   apiKey?: string;
@@ -261,10 +262,6 @@ function getNextMessageIndexFrom(messages: ReadonlyArray<Message>): number {
   return messages.length;
 }
 
-async function getNextMessageIndex(client: AgorClient, sessionId: SessionID): Promise<number> {
-  return getNextMessageIndexFrom(await getSessionMessages(client, sessionId));
-}
-
 async function createUserMessage(args: {
   client: AgorClient;
   sessionId: SessionID;
@@ -403,26 +400,6 @@ async function updateToolMessage(args: {
   });
 }
 
-async function createSystemErrorMessage(args: {
-  client: AgorClient;
-  sessionId: SessionID;
-  taskId: TaskID;
-  message: string;
-}): Promise<void> {
-  const index = await getNextMessageIndex(args.client, args.sessionId);
-  await args.client.service('messages').create({
-    message_id: generateId() as MessageID,
-    session_id: args.sessionId,
-    task_id: args.taskId,
-    type: 'system',
-    role: MessageRole.SYSTEM,
-    index,
-    timestamp: new Date().toISOString(),
-    content: args.message,
-    content_preview: args.message.substring(0, 200),
-  });
-}
-
 /**
  * Execute Cursor task (Feathers/WebSocket architecture).
  */
@@ -435,7 +412,7 @@ export async function executeCursorTask(params: {
   abortController: AbortController;
   messageSource?: MessageSource;
   resolvedConfig?: ResolvedConfigSlice;
-}): Promise<void> {
+}): Promise<ToolExecutionOutcome> {
   const { client, sessionId, taskId, prompt } = params;
 
   console.log(`[cursor] Executing task ${shortId(taskId)}...`);
@@ -606,8 +583,6 @@ export async function executeCursorTask(params: {
       const stopped = runResult.status === 'cancelled' || params.abortController.signal.aborted;
       const shaAtEnd = await captureGitStateAtTaskEnd(client, sessionId);
       const taskPatch: Partial<Task> = {
-        status: stopped ? 'stopped' : failed ? 'failed' : 'completed',
-        completed_at: new Date().toISOString(),
         ...(recordedModel ? { model: recordedModel } : {}),
         raw_sdk_response: {
           run: runResult,
@@ -621,6 +596,7 @@ export async function executeCursorTask(params: {
         taskPatch.git_state = { sha_at_end: shaAtEnd };
       }
       await client.service('tasks').patch(taskId, taskPatch);
+      return { status: stopped ? 'stopped' : failed ? 'failed' : 'completed' };
     } finally {
       agent.close();
     }
@@ -628,17 +604,12 @@ export async function executeCursorTask(params: {
     const err = error instanceof Error ? error : new Error(String(error));
     console.error('[cursor] Execution failed:', err);
     const shaAtEnd = await captureGitStateAtTaskEnd(client, sessionId);
-    const taskPatch: Partial<Task> = {
-      status: 'failed',
-      completed_at: new Date().toISOString(),
-      error_message: err.message,
-    };
+    const taskPatch: Partial<Task> = {};
     if (shaAtEnd) {
       // @ts-expect-error - Partial update of nested git_state object is handled by repository deep merge
       taskPatch.git_state = { sha_at_end: shaAtEnd };
     }
-    await client.service('tasks').patch(taskId, taskPatch);
-    await createSystemErrorMessage({ client, sessionId, taskId, message: err.message });
+    if (Object.keys(taskPatch).length) await client.service('tasks').patch(taskId, taskPatch);
     throw err;
   } finally {
     params.abortController.signal.removeEventListener('abort', abortHandler);

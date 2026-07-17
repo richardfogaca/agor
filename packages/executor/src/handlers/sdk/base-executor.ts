@@ -10,7 +10,7 @@ import {
   type ApiKeyName,
   stripProviderCredentialEnvironment,
 } from '@agor/core/config';
-import { generateId, shortId } from '@agor/core/db';
+import { shortId } from '@agor/core/db';
 import type {
   AgenticToolName,
   ContextUsageSnapshot,
@@ -22,7 +22,7 @@ import type {
   Task,
   TaskID,
 } from '@agor/core/types';
-import { ExecutorPulseKind, MessageRole, PROVIDER_CREDENTIAL_FIELDS } from '@agor/core/types';
+import { ExecutorPulseKind, PROVIDER_CREDENTIAL_FIELDS, TaskStatus } from '@agor/core/types';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
 import type { ExecutorRuntime, ExecutorRuntimeObserver } from '../../executor-heartbeat.js';
 import { getCurrentBranch, getGitState } from '../../git/index.js';
@@ -30,6 +30,7 @@ import type { StreamingCallbacks } from '../../sdk-handlers/base/types.js';
 import { normalizeRawSdkResponse } from '../../sdk-handlers/normalizer-factory.js';
 import type { AgorClient } from '../../services/feathers-client.js';
 import { configureSessionGitSafeDirectories } from './git-safe-directory.js';
+import type { ToolExecutionOutcome } from './tool-registry.js';
 
 const DEBUG_SDK_EXECUTOR =
   process.env.AGOR_DEBUG_SDK_EXECUTOR === '1' || process.env.DEBUG?.includes('sdk-executor');
@@ -415,7 +416,7 @@ export async function executeToolTask(params: {
     apiKey: string,
     useNativeAuth: boolean
   ) => BaseTool;
-}): Promise<void> {
+}): Promise<ToolExecutionOutcome> {
   const { client, sessionId, taskId, prompt, permissionMode, apiKeyEnvVar, toolName, createTool } =
     params;
 
@@ -519,7 +520,11 @@ export async function executeToolTask(params: {
     // Determine task status based on SDK result
     // - wasStopped: user explicitly stopped the task
     // - hadError: SDK returned an error subtype (e.g., error_during_execution)
-    const taskStatus = result.wasStopped ? 'stopped' : result.hadError ? 'failed' : 'completed';
+    const taskStatus = result.wasStopped
+      ? TaskStatus.STOPPED
+      : result.hadError
+        ? TaskStatus.FAILED
+        : TaskStatus.COMPLETED;
 
     if (result.hadError) {
       console.error(
@@ -528,10 +533,7 @@ export async function executeToolTask(params: {
     }
 
     // Build patch data
-    const patchData: Partial<Task> = {
-      status: taskStatus,
-      completed_at: new Date().toISOString(),
-    };
+    const patchData: Partial<Task> = {};
 
     // Add git_state if we captured a SHA
     // Note: This will be deep-merged with existing git_state by the repository layer
@@ -613,11 +615,13 @@ export async function executeToolTask(params: {
       }
     }
 
-    // Update task status to completed/stopped with git SHA and SDK responses
-    // Note: The stop endpoint may have already patched task to STOPPED via process kill.
-    // The tasks.ts patch hook guards against double-updates (wasAlreadyTerminal check).
-    await runtime?.finish();
     await client.service('tasks').patch(taskId, patchData);
+    return {
+      status: taskStatus,
+      ...(result.hadError && result.errorDetails?.length
+        ? { error_message: result.errorDetails.join('; ') }
+        : {}),
+    };
   } catch (error) {
     const err = error as Error;
     console.error(`[${toolName}] Execution failed:`, err);
@@ -626,13 +630,7 @@ export async function executeToolTask(params: {
     const gitStateAtEnd = await captureGitStateForSession(client, sessionId, 'end');
 
     // Build patch data
-    const patchData: Partial<Task> = {
-      status: 'failed',
-      completed_at: new Date().toISOString(),
-      // Surface the actual failure reason so the UI / DB show what went wrong,
-      // instead of the task silently flipping to FAILED with no context.
-      error_message: err.message || String(err),
-    };
+    const patchData: Partial<Task> = {};
 
     // Add git_state if we captured a SHA
     // Note: This will be deep-merged with existing git_state by the repository layer
@@ -643,37 +641,7 @@ export async function executeToolTask(params: {
       };
     }
 
-    // Publish the user-visible failure before the terminal transition. Terminal
-    // status is the executor's final required write, after which the daemon may
-    // safely stop and finalize the workload.
-    try {
-      const existingMessages = await client.service('messages').find({
-        query: { session_id: sessionId, $limit: 0 },
-      });
-      const messageCount =
-        typeof existingMessages === 'object' && 'total' in existingMessages
-          ? existingMessages.total
-          : Array.isArray(existingMessages)
-            ? existingMessages.length
-            : 0;
-
-      await client.service('messages').create({
-        message_id: generateId() as MessageID,
-        session_id: sessionId,
-        task_id: taskId,
-        type: 'system',
-        role: MessageRole.SYSTEM,
-        index: messageCount,
-        timestamp: new Date().toISOString(),
-        content: err.message,
-        content_preview: err.message.substring(0, 200),
-      });
-    } catch (msgErr) {
-      console.error(`[${toolName}] Failed to create error message:`, msgErr);
-    }
-
-    await runtime?.finish();
-    await client.service('tasks').patch(taskId, patchData);
+    if (Object.keys(patchData).length) await client.service('tasks').patch(taskId, patchData);
 
     throw err;
   } finally {

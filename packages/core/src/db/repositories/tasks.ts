@@ -5,7 +5,9 @@
  */
 
 import type {
+  ExecutorFinish,
   HistoricalTaskImport,
+  Message,
   SessionID,
   Task,
   TaskID,
@@ -17,6 +19,7 @@ import {
   finalizeTerminalTaskPatch,
   isTaskTurnHolding,
   isTerminalTaskStatus,
+  MessageRole,
   SessionStatus,
   TaskStatus,
 } from '@agor/core/types';
@@ -44,6 +47,7 @@ import {
 } from './base';
 import { visibleSessionReferenceAccessExists } from './branch-access';
 import { deepMerge } from './merge-utils';
+import { MessagesRepository } from './messages';
 
 function taskTurnHoldingWhere(db: Database, sessionId?: SessionID) {
   const holding = or(
@@ -396,6 +400,27 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     }
   }
 
+  /** Serialize destructive/configuration writes against turn admission. */
+  async withUnheldSessions<T>(
+    sessionIds: SessionID[],
+    work: (db: Database) => Promise<T>
+  ): Promise<T | null> {
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        for (const sessionId of [...new Set(sessionIds)].sort())
+          await this.lockSession(db, sessionId);
+        const holding = await select(db, { task_id: tasks.task_id })
+          .from(tasks)
+          .where(and(inArray(tasks.session_id, sessionIds), taskTurnHoldingWhere(this.db)))
+          .limit(1)
+          .one();
+        return holding ? null : work(db);
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
   /**
    * Find tasks by status
    */
@@ -479,6 +504,72 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
     );
   }
 
+  /** Admit an already-started interactive CLI turn without bypassing ownership. */
+  async startCliTurn(input: {
+    sessionId: SessionID;
+    fullPrompt: string;
+    message: Message;
+  }): Promise<{ task: Task; message: Message } | null> {
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockSession(db, input.sessionId);
+        const session = await select(db)
+          .from(sessions)
+          .where(eq(sessions.session_id, input.sessionId))
+          .one();
+        const active = await select(db, { task_id: tasks.task_id })
+          .from(tasks)
+          .where(taskTurnHoldingWhere(this.db, input.sessionId))
+          .limit(1)
+          .one();
+        if (!session || session.status === SessionStatus.STOPPING || active) return null;
+
+        const messageRepo = new MessagesRepository(db);
+        const index = await messageRepo.nextIndex(input.sessionId);
+        const startedAt = input.message.timestamp;
+        const data = this.taskToInsert({
+          session_id: input.sessionId,
+          created_by: session.created_by,
+          full_prompt: input.fullPrompt,
+          status: TaskStatus.RUNNING,
+          started_at: startedAt,
+          executor_attempt: { id: generateId(), runtime_active: true },
+          message_range: {
+            start_index: index,
+            end_index: index,
+            start_timestamp: startedAt,
+            end_timestamp: startedAt,
+          },
+          git_state: {
+            ref_at_start: session.data.git_state?.ref ?? '',
+            sha_at_start: session.data.git_state?.current_sha ?? '',
+          },
+          tool_use_count: 0,
+          metadata: { source: 'cli-repl' },
+        });
+        await insert(db, tasks).values(data).run();
+        const message = await messageRepo.create({
+          ...input.message,
+          task_id: data.task_id as TaskID,
+          index,
+        });
+        await update(db, sessions)
+          .set({
+            status: SessionStatus.RUNNING,
+            ready_for_prompt: false,
+            updated_at: new Date(),
+            data: { ...session.data, tasks: [...session.data.tasks, data.task_id] },
+          })
+          .where(eq(sessions.session_id, input.sessionId))
+          .run();
+        const row = await select(db).from(tasks).where(eq(tasks.task_id, data.task_id)).one();
+        return row ? { task: this.rowToTask(row), message } : null;
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
   /** Run an executor-originated effect while its unreleased attempt owns the task. */
   async withActiveExecutorAttempt<T>(
     id: string,
@@ -491,9 +582,168 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       async (db) => {
         await this.lockSession(db, known.session_id);
         const current = await this.loadLockedTask(db, fullId, id);
-        if (current.executor_attempt?.id !== attemptId || current.executor_attempt.released_at)
+        if (
+          current.executor_attempt?.id !== attemptId ||
+          current.executor_attempt.released_at ||
+          !current.executor_connected_at ||
+          !EXECUTING_TASK_STATUSES.has(current.status) ||
+          current.status === TaskStatus.DISPATCHING
+        )
           return null;
         return work(db, current);
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
+  /** Commit all daemon preparation writes, or cancel them if Stop won. */
+  async completeExecutorPreparation(
+    id: string,
+    attemptId: string,
+    message?: Message
+  ): Promise<{ task: Task; prepared: boolean } | null> {
+    const { fullId, task: known } = await this.resolveExisting(id);
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockSession(db, known.session_id);
+        const current = await this.loadLockedTask(db, fullId, id);
+        const attempt = current.executor_attempt;
+        if (attempt?.id !== attemptId || attempt.released_at) return null;
+        if (!attempt.preparing)
+          return { task: current, prepared: !isTerminalTaskStatus(current.status) };
+
+        const executorAttempt = {
+          ...attempt,
+          preparing: false,
+          ...(current.status === TaskStatus.DISPATCHING ? { launching: true } : {}),
+          ...(isTerminalTaskStatus(current.status) ? { runtime_active: false } : {}),
+        };
+        if (current.status !== TaskStatus.DISPATCHING && current.status !== TaskStatus.RUNNING) {
+          const task = { ...current, executor_attempt: executorAttempt } satisfies Task;
+          await update(db, tasks)
+            .set({ data: this.taskToInsert(task).data })
+            .where(eq(tasks.task_id, fullId))
+            .run();
+          return { task, prepared: false };
+        }
+
+        const messageRepo = new MessagesRepository(db);
+        const index = await messageRepo.nextIndex(current.session_id);
+        const startedAt = current.started_at ?? new Date().toISOString();
+        const task = {
+          ...current,
+          executor_attempt: executorAttempt,
+          message_range: {
+            start_index: index,
+            end_index: index,
+            start_timestamp: startedAt,
+            end_timestamp: startedAt,
+          },
+          git_state: { ref_at_start: 'unknown', sha_at_start: 'unknown' },
+        } satisfies Task;
+        await update(db, tasks)
+          .set({ data: this.taskToInsert(task).data })
+          .where(eq(tasks.task_id, fullId))
+          .run();
+        if (message) {
+          await messageRepo.create({
+            ...message,
+            session_id: current.session_id,
+            task_id: current.task_id,
+            index,
+          });
+        }
+        return { task, prepared: true };
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
+  /** Atomically accept the executor's final result; Stop remains authoritative. */
+  async finishExecutorAttempt(
+    id: string,
+    attemptId: string,
+    finish: ExecutorFinish,
+    allowUnconnected = false
+  ): Promise<{ task: Task; transitioned: boolean } | null> {
+    const { fullId, task: known } = await this.resolveExisting(id);
+    return runDatabaseTransaction(
+      this.db,
+      async (db) => {
+        await this.lockSession(db, known.session_id);
+        const current = await this.loadLockedTask(db, fullId, id);
+        if (
+          current.executor_attempt?.id !== attemptId ||
+          current.executor_attempt.released_at ||
+          (!allowUnconnected && !current.executor_connected_at)
+        ) {
+          return null;
+        }
+        const clearsDaemonActivity =
+          allowUnconnected &&
+          (current.executor_attempt.preparing ||
+            current.executor_attempt.launching ||
+            current.executor_attempt.runtime_active);
+        const executorAttempt = clearsDaemonActivity
+          ? {
+              ...current.executor_attempt,
+              preparing: false,
+              launching: false,
+              runtime_active: false,
+            }
+          : current.executor_attempt;
+        if (isTerminalTaskStatus(current.status)) {
+          if (!clearsDaemonActivity) return { task: current, transitioned: false };
+          const task = { ...current, executor_attempt: executorAttempt } satisfies Task;
+          await update(db, tasks)
+            .set({ data: this.taskToInsert(task).data })
+            .where(eq(tasks.task_id, fullId))
+            .run();
+          return { task, transitioned: false };
+        }
+        if (
+          !EXECUTING_TASK_STATUSES.has(current.status) ||
+          (!allowUnconnected && current.status === TaskStatus.DISPATCHING)
+        ) {
+          return null;
+        }
+
+        const { task_id: _taskId, executor_attempt_id: _attemptId, ...updates } = finish;
+        let task = {
+          ...current,
+          ...finalizeTerminalTaskPatch(current, updates),
+          executor_attempt: executorAttempt,
+        } satisfies Task;
+
+        if (finish.status === TaskStatus.FAILED && finish.error_message) {
+          const messageRepo = new MessagesRepository(db);
+          const index = await messageRepo.nextIndex(current.session_id);
+          const at = finish.completed_at ?? new Date().toISOString();
+          await messageRepo.create({
+            message_id: generateId(),
+            session_id: current.session_id,
+            task_id: current.task_id,
+            type: 'system',
+            role: MessageRole.SYSTEM,
+            index,
+            timestamp: at,
+            content_preview: finish.error_message.slice(0, 200),
+            content: finish.error_message,
+            metadata: { is_meta: true, executor_finish_error: true },
+          });
+          task = {
+            ...task,
+            message_range: { ...task.message_range, end_index: index, end_timestamp: at },
+          };
+        }
+
+        const data = this.taskToInsert(task);
+        await update(db, tasks)
+          .set({ status: data.status, completed_at: data.completed_at, data: data.data })
+          .where(eq(tasks.task_id, fullId))
+          .run();
+        return { task, transitioned: true };
       },
       { sqliteImmediate: true }
     );
@@ -571,7 +821,9 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
           .one();
         if (
           session?.status === SessionStatus.STOPPING ||
-          current.executor_attempt?.id !== attemptId
+          current.executor_attempt?.id !== attemptId ||
+          current.executor_attempt.preparing ||
+          current.executor_attempt.launching
         )
           return null;
         if (current.status === TaskStatus.RUNNING && current.executor_connected_at) {

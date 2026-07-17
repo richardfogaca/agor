@@ -173,14 +173,11 @@ describe('createCanUseToolCallback', () => {
       expect(result.behavior).toBe('deny');
       expect(result.message).toContain('Bash');
       expect(deps.permissionService.cancelPendingRequests).toHaveBeenCalledWith(sessionId);
-      // Session driven back to idle so the user can re-prompt.
-      expect(deps.sessionsService.patch).toHaveBeenCalledWith(
-        sessionId,
-        expect.objectContaining({ status: 'idle' })
-      );
+      // The task's canonical finish/release tail projects the session state.
+      expect(deps.sessionsService.patch).not.toHaveBeenCalled();
     });
 
-    it('marks task and session timed_out when the permission request times out', async () => {
+    it('marks the task timed_out and leaves session projection to finalization', async () => {
       const deps = createBaseDeps();
       deps.permissionService.waitForDecision.mockResolvedValue({
         allow: false,
@@ -198,10 +195,7 @@ describe('createCanUseToolCallback', () => {
         taskId,
         expect.objectContaining({ status: 'timed_out' })
       );
-      expect(deps.sessionsService.patch).toHaveBeenCalledWith(
-        sessionId,
-        expect.objectContaining({ status: 'timed_out', ready_for_prompt: true })
-      );
+      expect(deps.sessionsService.patch).not.toHaveBeenCalled();
     });
 
     it('always releases the per-session permission lock, even on timeout', async () => {

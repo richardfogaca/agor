@@ -19,6 +19,8 @@ import type {
   CreateHookContext as CoreCreateHookContext,
   HookContext as CoreHookContext,
   ExecutorClaim,
+  ExecutorFinish,
+  ExecutorFinishOutcome,
   ExecutorTelemetryReport,
   Params as FeathersParams,
   Message,
@@ -127,7 +129,13 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
 export interface TasksServiceImpl extends Service<Task, Partial<Task>, TaskParams> {
   reserveExecutorStop(sessionId: SessionID, params?: TaskParams): Promise<Task | null>;
   connectExecutor(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
-  finishExecutorAttempt(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
+  finishExecutorAttempt(data: ExecutorFinish, params?: TaskParams): Promise<Task>;
+  failExecutorStart(task: Task, error: unknown, params?: TaskParams): Promise<Task>;
+  finishDaemonAttempt(
+    task: Task,
+    finish: ExecutorFinishOutcome,
+    params?: TaskParams
+  ): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: TaskParams): Promise<Task>;
   releaseExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;
   finalizeExecutorTurn(data: ExecutorClaim, params?: TaskParams): Promise<Task>;

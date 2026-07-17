@@ -12,6 +12,7 @@ import { globalPermissionManager } from '../../permissions/permission-manager.js
 import { PermissionService } from '../../permissions/permission-service.js';
 import { CopilotTool } from '../../sdk-handlers/copilot/index.js';
 import type { AgorClient } from '../../services/feathers-client.js';
+import type { ToolExecutionOutcome } from './tool-registry.js';
 
 /**
  * Execute Copilot task (Feathers/WebSocket architecture)
@@ -27,7 +28,7 @@ export async function executeCopilotTask(params: {
   abortController: AbortController;
   messageSource?: MessageSource;
   resolvedConfig?: ResolvedConfigSlice;
-}): Promise<void> {
+}): Promise<ToolExecutionOutcome> {
   const { client, sessionId } = params;
 
   // Import base executor helper
@@ -47,7 +48,7 @@ export async function executeCopilotTask(params: {
 
   try {
     // Execute using base helper with Copilot-specific factory
-    await executeToolTask({
+    return await executeToolTask({
       ...params,
       apiKeyEnvVar: TOOL_API_KEY_NAMES.copilot!,
       toolName: 'copilot',

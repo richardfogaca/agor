@@ -21,6 +21,7 @@ import type {
   ContextFileListItem,
   CreateAgenticToolPreset,
   ExecutorClaim,
+  ExecutorFinish,
   ExecutorTelemetryReport,
   Group,
   GroupMembership,
@@ -297,7 +298,7 @@ export interface SessionsService extends AgorService<Session> {
  */
 export interface TasksService extends AgorService<Task> {
   connectExecutor(data: ExecutorClaim, params?: Params): Promise<Task>;
-  finishExecutorAttempt(data: ExecutorClaim, params?: Params): Promise<Task>;
+  finishExecutorAttempt(data: ExecutorFinish, params?: Params): Promise<Task>;
   reportExecutorTelemetry(data: ExecutorTelemetryReport, params?: Params): Promise<Task>;
 }
 

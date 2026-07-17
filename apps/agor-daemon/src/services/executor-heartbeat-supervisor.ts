@@ -67,9 +67,10 @@ export class ExecutorHeartbeatSupervisor {
       for (const task of tasks) {
         const attempt = task.executor_attempt;
         if (!attempt || attempt.released_at) continue;
+        if (attempt.runtime_active) continue;
         const terminal = isTerminalTaskStatus(task.status);
         if (!terminal) {
-          if (!this.options.config.enabled) continue;
+          if (!this.options.config.enabled && task.status !== TaskStatus.DISPATCHING) continue;
           const ageMs = executorLeaseAgeMs(task, nowMs);
           if (ageMs === undefined || ageMs <= this.options.config.stale_after_ms) continue;
         }

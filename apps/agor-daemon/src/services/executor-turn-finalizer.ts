@@ -47,6 +47,9 @@ export function createExecutorTurnFinalizer(options: {
       throw new Error('Executor attempt no longer owns this turn');
     }
     if (attempt.released_at) return task;
+    if (attempt.preparing) throw new Error('Executor preparation is still active');
+    if (attempt.launching) throw new Error('Executor launch is still active');
+    if (attempt.runtime_active) throw new Error('Executor runtime is still active');
     if (!isTerminalTaskStatus(task.status)) throw new Error('Executor turn is not terminal');
 
     try {

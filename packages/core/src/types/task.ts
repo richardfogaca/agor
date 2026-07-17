@@ -89,7 +89,13 @@ export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatu
   TaskStatus.TIMED_OUT,
 ]);
 
-export function isTerminalTaskStatus(status: TaskStatus | undefined): boolean {
+export type TerminalTaskStatus =
+  | typeof TaskStatus.COMPLETED
+  | typeof TaskStatus.FAILED
+  | typeof TaskStatus.STOPPED
+  | typeof TaskStatus.TIMED_OUT;
+
+export function isTerminalTaskStatus(status: TaskStatus | undefined): status is TerminalTaskStatus {
   return status !== undefined && TERMINAL_TASK_STATUSES.has(status);
 }
 
@@ -204,6 +210,12 @@ export interface ExecutorProcessIdentity {
 
 export interface ExecutorAttempt {
   id: string;
+  /** Release stays fenced while daemon-side preparation can still create effects. */
+  preparing?: boolean;
+  /** Release stays fenced until launch is cancelled or its workload is registered. */
+  launching?: boolean;
+  /** Long-lived CLI turns clear this only after their watcher observes turn end. */
+  runtime_active?: boolean;
   workload?: ExecutorWorkloadRef;
   released_at?: string;
   finalization_error?: string;
@@ -376,6 +388,32 @@ export interface Task {
   latest_executor_pulse?: ExecutorPulse;
   completed_at?: string; // When task reached terminal status (UTC ISO string)
 }
+
+export type ExecutorFinishStatus = TerminalTaskStatus;
+
+/** Final executor-owned task data, submitted once after all runtime writes stop. */
+export type ExecutorFinishOutcome = Partial<
+  Pick<
+    Task,
+    | 'message_range'
+    | 'tool_use_count'
+    | 'git_state'
+    | 'duration_ms'
+    | 'agent_session_id'
+    | 'error_message'
+    | 'model'
+    | 'raw_sdk_response'
+    | 'normalized_sdk_response'
+    | 'computed_context_window'
+    | 'report'
+    | 'permission_request'
+  >
+> & {
+  status: ExecutorFinishStatus;
+  completed_at?: string;
+};
+
+export type ExecutorFinish = ExecutorClaim & ExecutorFinishOutcome;
 
 /** Historical transcript data that cannot manufacture a live executor turn. */
 export type HistoricalTaskImport = Pick<

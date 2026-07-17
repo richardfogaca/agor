@@ -159,7 +159,7 @@ describe('executeToolTask failure finalization', () => {
     Object.assign(process.env, savedEnv);
   });
 
-  it('publishes the user-visible error before making the task terminal', async () => {
+  it('leaves failure settlement to the shared executor finish tail', async () => {
     const calls: string[] = [];
     const client = {
       service(name: string) {
@@ -215,6 +215,6 @@ describe('executeToolTask failure finalization', () => {
       })
     ).rejects.toThrow('expected failure');
 
-    expect(calls).toEqual(['message', 'runtime-finished', 'terminal']);
+    expect(calls).toEqual([]);
   });
 });

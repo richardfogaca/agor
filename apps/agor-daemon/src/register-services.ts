@@ -21,7 +21,6 @@ import {
   inArray,
   isPostgresDatabase,
   MCPServerRepository,
-  runWithoutTenantDatabaseScope,
   runWithTenantDatabaseScope,
   SessionMCPServerRepository,
   type SessionMCPServerRow,
@@ -47,14 +46,7 @@ import type {
   UserID,
   UUID,
 } from '@agor/core/types';
-import {
-  AGENTIC_TOOL_CAPABILITIES,
-  ExecutorWorkloadKind,
-  isTaskExecuting,
-  isTerminalTaskStatus,
-  ROLES,
-  TaskStatus,
-} from '@agor/core/types';
+import { ExecutorWorkloadKind, isTerminalTaskStatus, ROLES, TaskStatus } from '@agor/core/types';
 import type { UnixUserMode } from '@agor/core/unix';
 import type express from 'express';
 import type {
@@ -94,7 +86,6 @@ import { createConfigService } from './services/config.js';
 import { createContextService } from './services/context.js';
 import { createCopilotModelsService } from './services/copilot-models.js';
 import { createCursorModelsService } from './services/cursor-models.js';
-import { prepareSessionForExecutorStart } from './services/executor-startup.js';
 import { createExecutorTurnFinalizer } from './services/executor-turn-finalizer.js';
 import { createFileService } from './services/file.js';
 import { createFilesService } from './services/files.js';
@@ -139,7 +130,6 @@ import { TerminalsService } from './services/terminals.js';
 import { createThreadSessionMapService } from './services/thread-session-map.js';
 import { createUsersService } from './services/users.js';
 import { userRoomName } from './setup/socketio.js';
-import { appendSystemMessage } from './utils/append-system-message.js';
 import { requireMinimumRole } from './utils/authorization.js';
 import { emitServiceEvent } from './utils/emit-service-event.js';
 import { escapeHtml } from './utils/html.js';
@@ -747,7 +737,7 @@ function createExecuteHandler(
   tasksService: TasksService,
   sessionTokenService: import('./services/session-token-service.js').SessionTokenService
 ) {
-  const { db, app, config, daemonUrl } = ctx;
+  const { db, config, daemonUrl } = ctx;
   const taskRepo = new TaskRepository(db);
 
   return async (
@@ -759,53 +749,13 @@ function createExecuteHandler(
       permissionMode?: import('@agor/core/types').PermissionMode;
       stream?: boolean;
       messageSource?: MessageSource;
+      initialMessage?: import('@agor/core/types').Message;
     },
     // biome-ignore lint/suspicious/noExplicitAny: FeathersJS params type varies by context
     params: any
   ) => {
     const tenantId = getCurrentTenantId();
-    const session = await prepareSessionForExecutorStart(db, sessionsService, sessionId, params);
-    if (
-      session.agentic_tool_preset_id &&
-      data.permissionMode !== undefined &&
-      data.permissionMode !== session.permission_config?.mode
-    ) {
-      throw new Error('Preset-backed sessions cannot override permission mode per task');
-    }
-
-    // Validate stateless_fs_mode compatibility with agentic tool
-    if (config.execution?.stateless_fs_mode) {
-      const toolName = session.agentic_tool as import('@agor/core/types').AgenticToolName;
-      const capabilities = AGENTIC_TOOL_CAPABILITIES[toolName];
-      if (capabilities && !capabilities.supportsStatelessFsMode) {
-        const supported = Object.entries(AGENTIC_TOOL_CAPABILITIES)
-          .filter(([, caps]) => caps.supportsStatelessFsMode)
-          .map(([name]) => name)
-          .join(', ');
-        throw new Error(
-          `stateless_fs_mode is enabled but tool '${toolName}' does not support it. ` +
-            `Supported tools: ${supported}`
-        );
-      }
-    }
-
-    // Generate session token for executor authentication
-    // Hook chain enforces auth before we get here.
-    const sessionToken = await sessionTokenService.generateToken(
-      sessionId,
-      (params as AuthenticatedParams).user!.user_id,
-      {
-        taskId: data.taskId,
-        executorAttemptId: data.executorAttemptId,
-        branchId: session.branch_id,
-        // Executor JWTs authenticate on every daemon API call over the runtime
-        // connection, so low per-call max-use limits make normal execution
-        // fail after startup. Keep expiry + in-memory revocation for these
-        // scoped runtime credentials; revisit max-use semantics once they can
-        // be counted per connection/task instead of per service method.
-        maxUses: -1,
-      }
-    );
+    const session = await sessionsService.get(sessionId, params);
 
     const taskId = data.taskId;
 
@@ -919,74 +869,14 @@ function createExecuteHandler(
       const missingVars = requiredUserEnvVars.filter((v: string) => !executorEnv[v]);
       if (missingVars.length > 0) {
         const missingList = missingVars.map((v: string) => `\`${v}\``).join(', ');
-        const errorContent = [
-          `**Missing required environment variables:** ${missingList}`,
-          '',
-          'Your administrator requires these variables to be set before running prompts.',
-          '',
-          `**To fix:** Click your user avatar (top-right) → **Settings** → **Environment Variables**, then add values for: ${missingList}`,
-          '',
-          'This is a one-time setup — once configured, this message will not appear again.',
-        ].join('\n');
-        await runWithTenantDatabaseScope(db, tenantId, (tenantDb) =>
-          appendSystemMessage({
-            app,
-            db,
-            sessionId,
-            taskId: data.taskId,
-            content: errorContent,
-            contentPreview: `Missing required env vars: ${missingVars.join(', ')}`,
-          })
+        throw new Error(
+          `Missing required environment variables: ${missingList}. Add them in Settings → Environment Variables.`
         );
-        throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
       }
     }
 
     executorEnv.DAEMON_URL = daemonUrl;
     executorEnv[EXECUTOR_ATTEMPT_ENV_VAR] = data.executorAttemptId;
-
-    const ownsExecutorLaunch = async (): Promise<boolean> => {
-      const current = await taskRepo.findById(taskId);
-      return (
-        current?.status === TaskStatus.DISPATCHING &&
-        current.executor_attempt?.id === data.executorAttemptId &&
-        !current.executor_attempt.released_at
-      );
-    };
-    const cancelLaunch = () => {
-      sessionTokenService.revokeToken(sessionToken);
-      return {
-        success: false,
-        taskId,
-        status: EXECUTOR_LAUNCH_CANCELLED_STATUS,
-        streaming: data.stream !== false,
-      };
-    };
-    if (!(await ownsExecutorLaunch())) return cancelLaunch();
-
-    // Build executor payload
-    const executorPayload = {
-      command: 'prompt' as const,
-      sessionToken,
-      daemonUrl,
-      env: executorEnv,
-      params: {
-        sessionId,
-        taskId,
-        executorAttemptId: data.executorAttemptId,
-        prompt: data.prompt,
-        tool: session.agentic_tool as
-          | 'claude-code'
-          | 'gemini'
-          | 'codex'
-          | 'opencode'
-          | 'copilot'
-          | 'cursor',
-        permissionMode: permissionModeForPayload as 'ask' | 'auto' | 'allow-all' | undefined,
-        cwd,
-        messageSource: data.messageSource,
-      },
-    };
 
     // Stateless FS mode: resolve executor home dir for session file path
     const executorHomeDir = executorUnixUser ? getHomedirFromUsername(executorUnixUser) : undefined;
@@ -1010,6 +900,86 @@ function createExecuteHandler(
         // Don't block the executor — proceed with potentially stale/missing session file
       }
     }
+
+    const prepared = await taskRepo.completeExecutorPreparation(
+      taskId,
+      data.executorAttemptId,
+      data.initialMessage
+    );
+    if (!prepared?.prepared) {
+      if (prepared?.task.executor_attempt && isTerminalTaskStatus(prepared.task.status)) {
+        await tasksService.finalizeExecutorTurn(
+          { task_id: taskId, executor_attempt_id: data.executorAttemptId },
+          params
+        );
+      }
+      return {
+        success: false,
+        taskId,
+        status: EXECUTOR_LAUNCH_CANCELLED_STATUS,
+        streaming: data.stream !== false,
+      };
+    }
+
+    const sessionToken = await sessionTokenService.generateToken(
+      sessionId,
+      (params as AuthenticatedParams).user!.user_id,
+      {
+        taskId,
+        executorAttemptId: data.executorAttemptId,
+        branchId: session.branch_id,
+        maxUses: -1,
+      }
+    );
+    const cancelLaunch = async () => {
+      sessionTokenService.revokeToken(sessionToken);
+      const current = await taskRepo.patchExecutorAttempt(taskId, data.executorAttemptId, {
+        launching: false,
+      });
+      if (current && isTerminalTaskStatus(current.status)) {
+        await tasksService.finalizeExecutorTurn(
+          { task_id: taskId, executor_attempt_id: data.executorAttemptId },
+          params
+        );
+      }
+      return {
+        success: false,
+        taskId,
+        status: EXECUTOR_LAUNCH_CANCELLED_STATUS,
+        streaming: data.stream !== false,
+      };
+    };
+    const ownsExecutorLaunch = async (): Promise<boolean> => {
+      const current = await taskRepo.findById(taskId);
+      return (
+        current?.status === TaskStatus.DISPATCHING &&
+        current.executor_attempt?.id === data.executorAttemptId &&
+        !current.executor_attempt.released_at
+      );
+    };
+
+    const executorPayload = {
+      command: 'prompt' as const,
+      sessionToken,
+      daemonUrl,
+      env: executorEnv,
+      params: {
+        sessionId,
+        taskId,
+        executorAttemptId: data.executorAttemptId,
+        prompt: data.prompt,
+        tool: session.agentic_tool as
+          | 'claude-code'
+          | 'gemini'
+          | 'codex'
+          | 'opencode'
+          | 'copilot'
+          | 'cursor',
+        permissionMode: permissionModeForPayload as 'ask' | 'auto' | 'allow-all' | undefined,
+        cwd,
+        messageSource: data.messageSource,
+      },
+    };
 
     if (!(await ownsExecutorLaunch())) return cancelLaunch();
 
@@ -1049,6 +1019,7 @@ function createExecuteHandler(
         } satisfies ExecutorWorkloadRef;
         workloadRegistration = taskRepo.patchExecutorAttempt(taskId, data.executorAttemptId, {
           workload,
+          launching: false,
         });
         console.log(`${logPrefix} PID: ${child.pid}`);
         return (async () => {
@@ -1061,6 +1032,12 @@ function createExecuteHandler(
             }
           }
           if (registered?.status !== TaskStatus.DISPATCHING) {
+            if (registered && isTerminalTaskStatus(registered.status)) {
+              await tasksService.finalizeExecutorTurn(
+                { task_id: taskId, executor_attempt_id: data.executorAttemptId },
+                params
+              );
+            }
             throw new Error(EXECUTOR_LAUNCH_CANCELLED_MESSAGE);
           }
         })();
@@ -1078,33 +1055,15 @@ function createExecuteHandler(
             !!currentTask.executor_connected_at
           );
           if (!authoritative) return;
-          if (isTaskExecuting(currentTask)) {
-            const stopping = currentTask.status === TaskStatus.STOPPING;
-            try {
-              await tasksService.patch(
-                taskId,
-                {
-                  status: stopping ? TaskStatus.STOPPED : TaskStatus.FAILED,
-                  ...(!stopping
-                    ? {
-                        error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
-                      }
-                    : {}),
+          await tasksService.finishDaemonAttempt(
+            currentTask,
+            currentTask.status === TaskStatus.STOPPING
+              ? { status: TaskStatus.STOPPED }
+              : {
+                  status: TaskStatus.FAILED,
+                  error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
                 },
-                params
-              );
-            } catch (error) {
-              // Stop may have committed after the read; repository fencing made it authoritative.
-              if (!isTerminalTaskStatus((await tasksService.get(taskId, params)).status)) {
-                throw error;
-              }
-            }
-          }
-          await runWithoutTenantDatabaseScope(() =>
-            tasksService.finalizeExecutorTurn(
-              { task_id: taskId, executor_attempt_id: data.executorAttemptId },
-              params
-            )
+            params
           );
         } catch (error) {
           console.error(`❌ [Executor] Failed to finalize task ${shortId(taskId)}:`, error);
@@ -1116,8 +1075,8 @@ function createExecuteHandler(
 
     return {
       success: true,
-      taskId: taskId,
-      status: 'running',
+      taskId,
+      status: TaskStatus.RUNNING,
       streaming: data.stream !== false,
     };
   };

@@ -11,6 +11,7 @@ import { globalPermissionManager } from '../../permissions/permission-manager.js
 import { PermissionService } from '../../permissions/permission-service.js';
 import { ClaudeTool } from '../../sdk-handlers/claude/claude-tool.js';
 import type { AgorClient } from '../../services/feathers-client.js';
+import type { ToolExecutionOutcome } from './tool-registry.js';
 
 /**
  * Execute Claude Code task (Feathers/WebSocket architecture)
@@ -26,7 +27,7 @@ export async function executeClaudeCodeTask(params: {
   abortController: AbortController;
   messageSource?: MessageSource;
   resolvedConfig?: ResolvedConfigSlice;
-}): Promise<void> {
+}): Promise<ToolExecutionOutcome> {
   const { client, sessionId } = params;
 
   // Import base executor helper
@@ -46,7 +47,7 @@ export async function executeClaudeCodeTask(params: {
 
   try {
     // Execute using base helper with Claude-specific factory
-    await executeToolTask({
+    return await executeToolTask({
       ...params,
       apiKeyEnvVar: TOOL_API_KEY_NAMES['claude-code']!,
       toolName: 'claude-code',

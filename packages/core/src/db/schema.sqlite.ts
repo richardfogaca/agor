@@ -207,6 +207,7 @@ export const sessions = sqliteTable(
           // Session['cli_state']['active_turn'] in types/session.ts.
           active_turn?: {
             task_id: string;
+            executor_attempt_id?: string;
             user_message_index: number;
             started_at_ms: number;
           } | null;

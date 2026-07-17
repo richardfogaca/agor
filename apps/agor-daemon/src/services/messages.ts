@@ -77,17 +77,31 @@ export class MessagesService extends DrizzleService<Message, Partial<Message>, M
     return result;
   }
 
+  private async createExecutorMessages(
+    data: Partial<Message> | Partial<Message>[],
+    params: MessageParams
+  ): Promise<Message | Message[]> {
+    return this.withExecutorAttempt(params, async (db) => {
+      const repo = new MessagesRepository(db);
+      const records = Array.isArray(data) ? data : [data];
+      const sessionId = records[0]?.session_id;
+      if (!sessionId || records.some((record) => record.session_id !== sessionId)) {
+        throw new Conflict('Executor messages must belong to one session');
+      }
+      const start = await repo.nextIndex(sessionId);
+      const created = await repo.createMany(
+        records.map((record, offset) => ({ ...record, index: start + offset })) as Message[]
+      );
+      return Array.isArray(data) ? created : created[0];
+    });
+  }
+
   override async create(
     data: Partial<Message> | Partial<Message>[],
     params?: MessageParams
   ): Promise<Message | Message[]> {
     if (!params?.executorAttemptId) return super.create(data, params);
-    return this.withExecutorAttempt(params, async (db) => {
-      const repo = new MessagesRepository(db);
-      return Array.isArray(data)
-        ? repo.createMany(data as Message[])
-        : repo.create(data as Message);
-    });
+    return this.createExecutorMessages(data, params);
   }
 
   override async patch(
@@ -238,9 +252,7 @@ export class MessagesService extends DrizzleService<Message, Partial<Message>, M
    */
   async createMany(messages: Message[], params?: MessageParams): Promise<Message[]> {
     if (!params?.executorAttemptId) return this.messagesRepo.createMany(messages);
-    return this.withExecutorAttempt(params, (db) =>
-      new MessagesRepository(db).createMany(messages)
-    );
+    return this.createExecutorMessages(messages, params) as Promise<Message[]>;
   }
 }
 

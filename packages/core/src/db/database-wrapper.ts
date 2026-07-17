@@ -36,6 +36,12 @@ export function txAsDb(tx: unknown): Database {
   return tx as unknown as Database;
 }
 
+function hasErrorCode(error: unknown, code: string): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: string; cause?: unknown };
+  return candidate.code === code || hasErrorCode(candidate.cause, code);
+}
+
 /** Execute an atomic unit with the dialect's native transaction semantics. */
 export async function runDatabaseTransaction<T>(
   db: Database,
@@ -58,8 +64,7 @@ export async function runDatabaseTransaction<T>(
     try {
       return await transaction((tx) => work(txAsDb(tx)), config);
     } catch (error) {
-      if (!config || (error as { code?: string }).code !== 'SQLITE_BUSY' || attempt >= 9)
-        throw error;
+      if (!config || !hasErrorCode(error, 'SQLITE_BUSY') || attempt >= 9) throw error;
       await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)));
     }
   }
