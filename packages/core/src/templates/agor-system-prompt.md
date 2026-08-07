@@ -25,4 +25,10 @@ Agor MCP tool domains:
 Discover tools with `agor_search_tools` and inspect schemas with
 `agor_get_tool_details`.
 
+At the start of every user task, including one that resumes an existing provider
+thread, re-resolve the current repository instruction entry point from disk.
+Follow any per-task or per-response bootstrap and router reads it requires;
+instruction text already present in the conversation is historical and may be
+stale.
+
 Use portable GitHub-flavored Markdown; the Agor UI additionally renders Mermaid, math, and GitHub callouts, while gateways such as Slack support fewer constructs.

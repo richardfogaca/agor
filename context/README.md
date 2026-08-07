@@ -62,6 +62,8 @@ Designs that are referenced from code or in flight. Anything here is either stil
 - [`kb-namespace-rbac-v1.md`](explorations/kb-namespace-rbac-v1.md) — directed V1 plan for Knowledge namespace RBAC and teammate home namespaces.
 - [`session-sharing.md`](explorations/session-sharing.md) — `dangerously_allow_session_sharing` security contract (referenced from `AGENTS.md` and `apps/agor-docs/pages/security.mdx`).
 - [`parent-session-callbacks.md`](explorations/parent-session-callbacks.md) — child-session completion notifications (referenced from `docs/never-lose-prompt-design.md`).
+- [`pocock-token-efficiency-overnight-plan.md`](explorations/pocock-token-efficiency-overnight-plan.md) — isolated, autonomous implementation and validation plan for Pocock context rollover and an optional deterministic callback reducer.
+- [`pocock-token-efficiency-workflow-portfolio-overnight-plan.md`](explorations/pocock-token-efficiency-workflow-portfolio-overnight-plan.md) — follow-on isolated experiment that ranks and validates token-efficiency opportunities across CI, implementation, QA, cross-repository, synthesis, and open-ended workflows.
 - [`frontend-hardcoded-colors.md`](explorations/frontend-hardcoded-colors.md) — Biome/GritQL color audit, classification, and enforcement rollout.
 
 ### Messaging & positioning (now in the Knowledge base)
