@@ -43,6 +43,13 @@ environment:
         auth-resolved multi-tenancy, per-user sandbox homes, and a development identity picker.
       health: http://localhost:{{add 3000 branch.unique_id}}/readyz
       app: http://{{host.ip_address}}:{{add 3000 branch.unique_id}}/dev-auth/
+    render-standard:
+      start: './scripts/managed-environments/render/render-env.sh start {{shellQuote repo.github_slug}} {{shellQuote branch.ref}}'
+      stop: './scripts/managed-environments/render/render-env.sh stop {{shellQuote repo.github_slug}} {{shellQuote branch.ref}}'
+      logs: './scripts/managed-environments/render/render-env.sh logs {{shellQuote repo.github_slug}} {{shellQuote branch.ref}}'
+      nuke: './scripts/managed-environments/render/render-env.sh nuke {{shellQuote repo.github_slug}} {{shellQuote branch.ref}}'
+      description: >-
+        Full Agor instance per branch on Render (Docker, Standard plan, persistent disk at /home/agor). Start pushes the branch to the repo's GitHub remote and deploys it; Stop suspends (disk kept); Nuke deletes the service and disk. Needs RENDER_API_KEY, RENDER_OWNER_ID and RENDER_AGOR_ADMIN_PASSWORD as Global env vars.
     docs:
       start: >-
         INSTANCE_LABEL={{branch.name}} PORT={{add 7000 branch.unique_id}} NEXT_PUBLIC_SITE_URL=http://{{host.ip_address}}:{{add
